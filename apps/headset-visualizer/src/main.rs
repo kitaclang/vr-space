@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,7 +9,7 @@ use log::{info, warn};
 
 use glam::{Mat4, Quat, Vec3};
 use wgpu::util::DeviceExt;
-use winit::event::{Event, WindowEvent};
+use winit::event::{ElementState, Event, KeyboardInput, MouseButton, VirtualKeyCode, WindowEvent};
 use winit::event_loop::EventLoop;
 use winit::window::Window;
 
@@ -19,7 +19,7 @@ use wgpu_glyph::{Section, Text, GlyphBrushBuilder, GlyphBrush};
 
 // On macOS, pull capture helpers into scope (now using screencapturekit crate under the hood)
 #[cfg(target_os = "macos")]
-use crate::macos_capture::{try_get_latest_bgra, start_stream};
+use crate::macos_capture::{take_latest_bgra, start_stream};
 
 // Headset fusion API (path dependency to headset-utils)
 use ar_drivers::any_fusion;
@@ -120,14 +120,6 @@ fn now_ns_from_start() -> u64 {
         let start = START_INSTANT.unwrap();
         (Instant::now() - start).as_nanos() as u64
     }
-}
-
-// ================= HUD/Calibration State =================
-
-#[derive(Debug, Clone, Copy)]
-struct HudState {
-    calibrate_pending: bool,
-    calibrated_offset: (f32, f32, f32), // (roll_off, pitch_off, yaw_off) in radians
 }
 
 // Just for convenience when building view/proj and printing
@@ -244,10 +236,60 @@ struct Gpu {
     quad_vb: wgpu::Buffer,
     quad_ib: wgpu::Buffer,
     quad_index_count: u32,
+    quad_bgl: wgpu::BindGroupLayout,
+    quad_sampler: wgpu::Sampler,
+    // Screen texture; recreated (rarely) when the captured frame size changes.
     tex: wgpu::Texture,
-    tex_view: wgpu::TextureView,
-    tex_sampler: wgpu::Sampler,
+    tex_size: (u32, u32),
     quad_bind_group: wgpu::BindGroup,
+    // CPU-side frame buffer swapped with the capture module (no per-frame copy or allocation).
+    frame_buf: Vec<u8>,
+    frame_seq: u64,
+}
+
+// Virtual monitor height in world units; width follows the captured screen's aspect ratio.
+const QUAD_HALF_HEIGHT: f32 = 0.7;
+
+fn quad_vertices(aspect: f32) -> [TVertex; 4] {
+    let hh = QUAD_HALF_HEIGHT;
+    let hw = hh * aspect;
+    [
+        TVertex { pos: [-hw,  hh, 0.0], uv: [0.0, 0.0] },
+        TVertex { pos: [ hw,  hh, 0.0], uv: [1.0, 0.0] },
+        TVertex { pos: [ hw, -hh, 0.0], uv: [1.0, 1.0] },
+        TVertex { pos: [-hw, -hh, 0.0], uv: [0.0, 1.0] },
+    ]
+}
+
+/// Create the BGRA screen texture and its bind group. BGRA8Unorm matches ScreenCaptureKit
+/// output, so no swizzle is needed.
+fn create_screen_texture(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::BindGroup) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("capture-texture"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Bgra8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("quad-bg"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+        ],
+    });
+    (tex, bind_group)
 }
 
 async fn init_gpu(window: &Window, vsync: bool, vertices: &[Vertex], hud_forced_off: bool, hud_size: f32) -> anyhow::Result<Gpu> {
@@ -276,11 +318,9 @@ async fn init_gpu(window: &Window, vsync: bool, vertices: &[Vertex], hud_forced_
                 label: Some("device"),
                 // Enable downlevel-friendly features only; avoid costly extras.
                 features: wgpu::Features::empty(),
-                // Relax limits a bit to allow better throughput on some GPUs.
-                limits: wgpu::Limits {
-                    max_bind_groups: 2,
-                    ..wgpu::Limits::downlevel_webgl2_defaults()
-                },
+                // Use the adapter's real limits: the screen texture must fit a full-resolution
+                // capture (e.g. 3024 px wide on a Retina display), beyond WebGL2's 2048 px.
+                limits: adapter.limits(),
             },
             None,
         )
@@ -473,43 +513,16 @@ fn fs_main_q(in: VsOut) -> @location(0) vec4<f32> {
         multiview: None,
     });
 
-    // Create capture texture (BGRA8Unorm) to match ScreenCaptureKit output without swizzle
-    let cap_w = 1280u32;
-    let cap_h = 720u32;
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("capture-texture"),
-        size: wgpu::Extent3d { width: cap_w, height: cap_h, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Bgra8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    let tex_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-    let quad_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("quad-bg"),
-        layout: &quad_bgl,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Sampler(&quad_sampler) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&tex_view) },
-        ],
-    });
+    // Placeholder 1x1 (black) screen texture until the first captured frame sets the real size.
+    let tex_size = (1u32, 1u32);
+    let (tex, quad_bind_group) = create_screen_texture(&device, &quad_bgl, &quad_sampler, tex_size.0, tex_size.1);
 
-    // Quad VB/IB (unit quad centered at origin, scaled later by world transform)
-    let hw = 1.2f32;
-    let hh = 0.7f32;
-    let quad_vertices = [
-        TVertex { pos: [-hw,  hh, 0.0], uv: [0.0, 0.0] },
-        TVertex { pos: [ hw,  hh, 0.0], uv: [1.0, 0.0] },
-        TVertex { pos: [ hw, -hh, 0.0], uv: [1.0, 1.0] },
-        TVertex { pos: [-hw, -hh, 0.0], uv: [0.0, 1.0] },
-    ];
+    // Quad VB/IB centered at origin. Starts at 16:10 and is resized to the capture's aspect ratio.
     let quad_indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
     let quad_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("quad-vb"),
-        contents: bytemuck::cast_slice(&quad_vertices),
-        usage: wgpu::BufferUsages::VERTEX,
+        contents: bytemuck::cast_slice(&quad_vertices(1.6)),
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
     });
     let quad_ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("quad-ib"),
@@ -590,10 +603,13 @@ fn fs_main_q(in: VsOut) -> @location(0) vec4<f32> {
         quad_vb,
         quad_ib,
         quad_index_count,
+        quad_bgl,
+        quad_sampler,
         tex,
-        tex_view,
-        tex_sampler: quad_sampler,
+        tex_size,
         quad_bind_group,
+        frame_buf: Vec::new(),
+        frame_seq: 0,
     })
 }
 
@@ -639,8 +655,8 @@ fn build_grid_vertices(size: i32, step: i32) -> Vec<Vertex> {
     verts
 }
 
-// Axis remapping and camera view
-fn camera_view_from_pose(pose: PoseCopy, invert: (bool, bool, bool)) -> Mat4 {
+// Axis remapping: headset pose -> camera orientation in the scene (before calibration).
+fn head_rotation_from_pose(pose: PoseCopy, invert: (bool, bool, bool)) -> Quat {
     // User mapping: y -> x, z -> y, x -> z
     let mapped_roll = pose.pitch; // new X = old Y
     let mapped_pitch = pose.yaw;  // new Y = old Z
@@ -656,10 +672,13 @@ fn camera_view_from_pose(pose: PoseCopy, invert: (bool, bool, bool)) -> Mat4 {
     if invert.2 { rz = -rz; }
 
     let q = Quat::from_euler(glam::EulerRot::XYZ, rx, ry, rz);
+    q.conjugate()
+}
 
+// Camera view matrix for a camera orientation (already calibrated).
+fn camera_view(rotation: Quat) -> Mat4 {
     let cam_pos = Vec3::new(0.0, 1.5, 4.0);
-    let view_rot = q.conjugate();
-    Mat4::from_rotation_translation(view_rot, cam_pos).inverse()
+    Mat4::from_rotation_translation(rotation, cam_pos).inverse()
 }
 
 fn make_proj(width: u32, height: u32) -> Mat4 {
@@ -721,16 +740,16 @@ fn main() -> anyhow::Result<()> {
     // Shared pose (atomic, lock-free)
     let pose_shared = Arc::new(PoseAtomic::new());
 
-    // HUD/calibration shared state (low-frequency, keep Mutex)
-    let hud_shared = Arc::new(Mutex::new(HudState {
-        calibrate_pending: false,
-        calibrated_offset: (0.0, 0.0, 0.0),
-    }));
+    // Calibration lives on the render thread only, so no shared state or lock is needed.
+    // `calib_inv` is the inverse of the head orientation at the last recenter; applying it as a
+    // rotation (not per-axis Euler subtraction) stays correct with pitch/roll and across ±180°.
+    let mut calibrate_pending = false;
+    let mut calib_inv = Quat::IDENTITY;
+    let mut cursor_px: (f32, f32) = (-1.0, -1.0);
 
     // Fusion thread (max cadence by default; optional rate limit via --poll-ms)
     {
         let pose_ref = pose_shared.clone();
-        let hud_ref = hud_shared.clone();
         let poll_interval = if cli.poll_ms == 0 {
             None
         } else {
@@ -748,18 +767,24 @@ fn main() -> anyhow::Result<()> {
                 let _ = pthread_set_qos_class_self_np(0x21, 0);
             }
 
-            // Connect to fusion
-            let fusion_result = any_fusion();
-            let mut fusion = match fusion_result {
-                Ok(f) => {
-                    pose_ref.write(0.0, 0.0, 0.0, true, now_ns_from_start());
-                    f
-                }
-                Err(e) => {
-                    warn!("No headset device found: {}", e);
-                    pose_ref.write(0.0, 0.0, 0.0, false, now_ns_from_start());
-                    // Exit thread if no device; renderer will keep running
-                    return;
+            // Connect to fusion, retrying until glasses are plugged in. The renderer keeps
+            // running meanwhile and the HUD shows "device: not-found".
+            let mut warned = false;
+            let mut fusion = loop {
+                match any_fusion() {
+                    Ok(f) => {
+                        info!("Headset connected");
+                        pose_ref.write(0.0, 0.0, 0.0, true, now_ns_from_start());
+                        break f;
+                    }
+                    Err(e) => {
+                        if !warned {
+                            warn!("No headset device found: {e}. Retrying every second.");
+                            warned = true;
+                        }
+                        pose_ref.write(0.0, 0.0, 0.0, false, now_ns_from_start());
+                        thread::sleep(Duration::from_secs(1));
+                    }
                 }
             };
 
@@ -768,19 +793,9 @@ fn main() -> anyhow::Result<()> {
                 fusion.update();
                 let frd = fusion.attitude_frd_rad();
 
-                // Read current calibration offset once per loop
-                let (off_x, off_y, off_z) = {
-                    let h = hud_ref.lock().unwrap();
-                    h.calibrated_offset
-                };
-
-                // Apply calibration in the reader thread for immediacy
-                let roll = frd[0] - off_x;
-                let pitch = frd[1] - off_y;
-                let yaw = frd[2] - off_z;
-
+                // Publish the raw pose; calibration is applied on the render thread.
                 let now_ns = now_ns_from_start();
-                pose_ref.write(roll, pitch, yaw, true, now_ns);
+                pose_ref.write(frd[0], frd[1], frd[2], true, now_ns);
 
                 if let Some(dt) = poll_interval {
                     let now = Instant::now();
@@ -845,15 +860,24 @@ fn main() -> anyhow::Result<()> {
                             gpu.surface.configure(&gpu.device, &gpu.config);
                         }
                     }
-                    WindowEvent::MouseInput { state, .. } => {
-                        use winit::event::ElementState;
-                        if state == ElementState::Pressed {
-                            let mut h = hud_shared.lock().unwrap();
-                            h.calibrate_pending = true;
+                    WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                        // Only a click on the Calibrate button recenters (both are in physical pixels).
+                        if gpu.hud_enabled && gpu.calibrate_btn.contains(cursor_px.0, cursor_px.1) {
+                            calibrate_pending = true;
                         }
                     }
+                    WindowEvent::KeyboardInput {
+                        input: KeyboardInput { state: ElementState::Pressed, virtual_keycode: Some(VirtualKeyCode::C), .. },
+                        ..
+                    } => {
+                        // Keyboard recenter; also works with --no-hud, where there is no button.
+                        calibrate_pending = true;
+                    }
                     WindowEvent::CursorMoved { position, .. } => {
-                        let _ = position;
+                        cursor_px = (position.x as f32, position.y as f32);
+                    }
+                    WindowEvent::CursorLeft { .. } => {
+                        cursor_px = (-1.0, -1.0);
                     }
                     _ => {}
                 }
@@ -892,39 +916,58 @@ fn main() -> anyhow::Result<()> {
                 // Read pose
                 let (r, p, y, has, t_ns) = pose_shared.read();
                 let pose_copy = PoseCopy { roll: r, pitch: p, yaw: y, has_device: has };
+                let head = head_rotation_from_pose(pose_copy, (cli.invert_x, cli.invert_y, cli.invert_z));
+
+                // Recenter: make the current head orientation the new "forward".
+                if calibrate_pending {
+                    calibrate_pending = false;
+                    calib_inv = head.inverse();
+                    gpu.show_calibrated_toast_until_ns = now_ns_from_start() + 1_000_000_000;
+                    gpu.cached_hud_text.clear(); // force HUD refresh so the toast shows now
+                }
+
                 let vp = {
-                    let view_m = camera_view_from_pose(pose_copy, (cli.invert_x, cli.invert_y, cli.invert_z));
+                    let view_m = camera_view(calib_inv * head);
                     let proj = make_proj(gpu.config.width, gpu.config.height);
                     proj * view_m
                 };
                 gpu.uniform.update(vp);
                 gpu.queue.write_buffer(&gpu.uniform_buffer, 0, bytemuck::bytes_of(&gpu.uniform));
 
-                // Upload latest screen frame into texture (macOS only)
+                // Upload the newest screen frame (macOS only). Skips entirely when no new frame
+                // has arrived; the frame buffer is swapped in, not copied.
                 #[cfg(target_os = "macos")]
                 {
-                    if let Some(frame) = try_get_latest_bgra() {
-                        let w = frame.width.max(1);
-                        let h = frame.height.max(1);
-                        // Respect bytes_per_row from ScreenCaptureKit
-                        let bpr = frame.bytes_per_row.max(4);
-                        let layout = wgpu::ImageDataLayout {
-                            offset: 0,
-                            bytes_per_row: Some(bpr),
-                            rows_per_image: Some(h),
-                        };
-                        let size3d = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
-                        gpu.queue.write_texture(
-                            wgpu::ImageCopyTexture {
-                                texture: &gpu.tex,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            frame.bytes.as_slice(),
-                            layout,
-                            size3d,
-                        );
+                    if let Some(info) = take_latest_bgra(&mut gpu.frame_buf, &mut gpu.frame_seq) {
+                        let (w, h, bpr) = (info.width, info.height, info.bytes_per_row);
+                        let max_dim = gpu.device.limits().max_texture_dimension_2d;
+                        let fits = w <= max_dim && h <= max_dim && gpu.frame_buf.len() >= (bpr as usize) * (h as usize);
+                        if fits {
+                            if gpu.tex_size != (w, h) {
+                                // Rare: first frame, or the display resolution changed.
+                                info!("Screen texture resized to {w}x{h}");
+                                let (tex, bg) = create_screen_texture(&gpu.device, &gpu.quad_bgl, &gpu.quad_sampler, w, h);
+                                gpu.tex = tex;
+                                gpu.quad_bind_group = bg;
+                                gpu.tex_size = (w, h);
+                                let verts = quad_vertices(w as f32 / h as f32);
+                                gpu.queue.write_buffer(&gpu.quad_vb, 0, bytemuck::cast_slice(&verts));
+                            }
+                            gpu.queue.write_texture(
+                                wgpu::ImageCopyTexture {
+                                    texture: &gpu.tex,
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d::ZERO,
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                &gpu.frame_buf[..(bpr as usize) * (h as usize)],
+                                wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) },
+                                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                            );
+                        } else if gpu.tex_size != (0, 0) {
+                            warn!("Captured frame {w}x{h} exceeds GPU texture limit {max_dim}; not displayed");
+                            gpu.tex_size = (0, 0); // log once until a frame fits again
+                        }
                     }
                 }
 
@@ -1070,24 +1113,6 @@ fn main() -> anyhow::Result<()> {
                 gpu.queue.submit(Some(encoder.finish()));
                 // Present the frame (present() does not return a Result on wgpu 0.17)
                 frame.present();
-
-                // Handle pending calibration here to make button actionable:
-                {
-                    let mut h = hud_shared.lock().unwrap();
-                    if h.calibrate_pending {
-                        let (r, p, y, _has, _t_ns) = pose_shared.read();
-                        let (ox, oy, oz) = h.calibrated_offset;
-                        let frd_raw = (r + ox, p + oy, y + oz);
-                        h.calibrated_offset = frd_raw;
-                        h.calibrate_pending = false;
-                        // show toast for ~1s
-                        let now_ns = now_ns_from_start();
-                        gpu.show_calibrated_toast_until_ns = now_ns + 1_000_000_000;
-                        // Force HUD refresh to show toast immediately
-                        gpu.cached_hud_text.clear();
-                    }
-                }
-
             }
             _ => {}
         }

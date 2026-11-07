@@ -33,7 +33,7 @@ Run the visualizer (release build recommended for lowest latency):
 cargo run --release -p headset-visualizer
 ```
 
-Put the glasses on, look straight ahead and click **Calibrate** in the HUD to set the forward direction.
+Put the glasses on, look straight ahead and click **Calibrate** in the HUD (or press `C`) to set the forward direction. If the glasses aren't connected yet, plug them in: the app keeps looking for them every second.
 
 Options:
 

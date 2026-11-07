@@ -14,7 +14,7 @@ Cargo workspace with two crates:
 
 - `apps/headset-visualizer/`: the main app.
   - `src/main.rs`: CLI (`clap`), head-tracking thread, wgpu setup, scene, HUD and event loop, all in one file.
-  - `src/macos_capture.rs`: ScreenCaptureKit stream (`start_stream`, `try_get_latest_bgra`, `stop_stream`). Keeps only the newest frame in a global `Mutex`.
+  - `src/macos_capture.rs`: ScreenCaptureKit stream (`start_stream`, `take_latest_bgra`, `stop_stream`). Captures at the display's native pixel size and keeps only the newest frame. The capture callback and renderer hand frames over by swapping buffers (no per-frame copy or allocation), and a sequence counter lets the renderer skip the upload when nothing new arrived.
   - `src/shader.wgsl`: shader for the grid scene. The textured screen quad's shader is inline in `main.rs`.
   - `assets/NotoSans-Regular.ttf`: HUD font, embedded with `include_bytes!`. Licensed SIL OFL 1.1 (`assets/OFL.txt`).
 - `capture-check/`: standalone tool that checks ScreenCaptureKit works and records raw BGRA frames (32-byte `BGR4` header, see `write_header`), with optional MP4 output through `ffmpeg`.
@@ -28,9 +28,9 @@ Libraries come from Cargo, not from this repo:
 
 ## How the visualizer works
 
-1. A reader thread calls `any_fusion()`, polls the fusion as fast as `--poll-ms` allows, applies the calibration offset and publishes roll/pitch/yaw into `PoseAtomic` (`f32` stored as `u32` bits in atomics), so the render loop never waits on a lock.
-2. The winit event loop reads the latest pose, builds the view matrix (`camera_view_from_pose`), uploads the newest captured frame to a texture with `queue.write_texture` when one is available, and draws the grid, screen quad and HUD.
-3. HUD and calibration state (`HudState`) is low-frequency and lives behind a `Mutex`. Clicking the HUD's Calibrate button sets `calibrate_pending`.
+1. A reader thread calls `any_fusion()` (retrying every second until glasses are found), polls the fusion as fast as `--poll-ms` allows and publishes the raw roll/pitch/yaw into `PoseAtomic` (`f32` stored as `u32` bits in atomics), so the render loop never waits on a lock.
+2. The winit event loop reads the latest pose, turns it into a head rotation (`head_rotation_from_pose`), applies the calibration and builds the view matrix (`camera_view`). When a new captured frame is available it uploads it with `queue.write_texture`, recreating the screen texture and resizing the quad if the frame size changed. Then it draws the grid, screen quad and HUD.
+3. Calibration lives on the render thread: clicking the HUD's Calibrate button (hit-tested in physical pixels) or pressing `C` sets `calibrate_pending`, and the next frame stores the inverse of the current head rotation as a quaternion (`calib_inv`).
 4. Present mode prefers Mailbox, then Immediate, then Fifo, unless `--vsync` is passed.
 
 When changing the hot path (pose reading, frame upload, rendering), don't add locks, allocations or blocking calls per frame.
@@ -51,7 +51,7 @@ cargo run --release -p capture-check -- --seconds 5 --out capture.bgra
 
 There are no automated tests yet. To verify a change, at minimum build the workspace and run each binary with `--help`. Real behaviour needs AR glasses over USB and Screen Recording permission for the terminal, which an agent usually can't provide. Say so rather than claiming a change works on hardware.
 
-The build currently shows about 16 dead-code warnings (unused CoreVideo FFI declarations in `macos_capture.rs` and similar). Don't introduce new warnings.
+The build currently shows 3 warnings (an unused `stop_stream`, an unread `has_device` field and an unused `render_bundle` initial value). Don't introduce new warnings.
 
 ## Dependency constraints
 
