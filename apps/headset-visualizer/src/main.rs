@@ -583,7 +583,7 @@ struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, };
 fn vs_main_q(in: VsIn) -> VsOut {
  var o: VsOut;
  o.pos = ubo.view_proj * vec4<f32>(in.pos, 1.0);
- o.uv = vec2<f32>(in.uv.x, 1.0 - in.uv.y);
+ o.uv = in.uv; // v = 0 is the top row, matching quad_vertices
  return o;
 }
 
