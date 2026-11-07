@@ -98,7 +98,6 @@ static BACK: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 // Incremented (while holding READY) each time a new frame is published. 0 = no frame yet.
 static FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
 
-static STARTED: OnceLock<()> = OnceLock::new();
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
 // Stream handle kept alive while running; stored behind a Mutex in OnceLock to avoid Sync on SCStream.
@@ -236,7 +235,7 @@ impl screencapturekit::stream::output_trait::SCStreamOutputTrait for ScreenOutpu
 
 // Start capture stream
 pub fn start_stream(display_id: u32, show_cursor: bool) -> anyhow::Result<()> {
-    if STARTED.get().is_some() {
+    if RUNNING.load(Ordering::SeqCst) {
         return Ok(());
     }
     let result = start_stream_inner(display_id, show_cursor);
@@ -296,10 +295,22 @@ fn start_stream_inner(display_id: u32, show_cursor: bool) -> anyhow::Result<()> 
     STREAM_HANDLE.get_or_init(|| Mutex::new(None))
         .lock().unwrap_or_else(|e| e.into_inner())
         .replace(stream);
-    STARTED.set(()).ok();
     info!("Screen capture stream started via screencapturekit.");
 
     Ok(())
+}
+
+/// Capture a different display: stop the current stream and start a new one.
+/// Blocks briefly while ScreenCaptureKit lists the displays, so don't call it per frame.
+pub fn switch_display(display_id: u32, show_cursor: bool) -> anyhow::Result<()> {
+    stop_stream();
+    STATUS.store(STATUS_STARTING, Ordering::Release);
+    start_stream(display_id, show_cursor)
+}
+
+/// Turn a display ID from the command line into a real one (0 means the main display).
+pub fn resolve_display_id(display_id: u32) -> u32 {
+    if display_id == 0 { CGDisplay::main().id } else { display_id }
 }
 
 /// Take the newest captured frame if one arrived since `last_seq`.
@@ -330,8 +341,11 @@ pub fn stop_stream() {
     if RUNNING.swap(false, Ordering::SeqCst) {
         if let Some(m) = STREAM_HANDLE.get() {
             if let Ok(mut guard) = m.lock() {
-                // Drop to stop the stream
-                let _ = guard.take();
+                if let Some(stream) = guard.take() {
+                    if let Err(e) = stream.stop_capture() {
+                        warn!("stop_capture failed: {e:?}");
+                    }
+                }
             }
         }
         info!("Screen capture stream stopped.");

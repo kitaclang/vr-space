@@ -33,7 +33,7 @@ Run the visualizer (release build recommended for lowest latency):
 cargo run --release -p headset-visualizer
 ```
 
-Put the glasses on, look straight ahead and click **Calibrate** in the HUD (or press `C`) to set the forward direction. If the glasses aren't connected yet, plug them in: the app keeps looking for them every second. Press `Esc` or close the window to quit.
+Put the glasses on, look straight ahead and click **Calibrate** in the HUD (or press `C`, or `⌃⌥C` from any app) to set the forward direction. If the glasses aren't connected yet, plug them in: the app keeps looking for them every second. Press `Esc` or close the window to quit.
 
 The HUD's `screen:` line shows whether screen capture is working. If Screen Recording permission is missing, the app asks macOS for it, shows a hint over the virtual screen, and adds a **Screen Recording settings** button. Press `P` (or click the button) to open System Settings at the right page. Allow your terminal app there, then quit and reopen the terminal: macOS only applies the permission after a restart.
 
@@ -54,19 +54,37 @@ The glasses show up on your Mac as an extra display. To get a virtual monitor th
    cargo run --release -p headset-visualizer -- --display <screen ID> --fullscreen <glasses ID>
    ```
 
-4. Put the glasses on, look straight ahead and press `C`.
+4. Put the glasses on, look straight ahead and press `⌃⌥C` (or choose **Recenter** from the menu bar icon).
+
+You can also start without `--fullscreen` and pick the glasses under **Fullscreen on** in the menu bar icon.
 
 The glasses only track rotation (3DoF), not position, so leaning or moving in your seat isn't tracked. The neck model (`--neck-model`, on by default) adds the small eye movement that comes from turning your head around your neck, which makes the screen feel more solidly placed.
 
-Keys (the app window needs focus):
+### Controls
+
+vr-space lives in the menu bar (it has no Dock icon). While it runs, its glasses icon has the controls: recenter, move and resize the screen, choose which display to show and which display to go fullscreen on (the glasses), show or hide the HUD, open Screen Recording settings, and quit. The display lists update when you plug in or remove a display.
+
+These shortcuts work from any app, so you can adjust the screen while you work:
+
+| Shortcut | Action |
+|---|---|
+| `⌃⌥C` | Recenter (look straight ahead first) |
+| `⌃⌥↑` / `⌃⌥↓` | Move the screen further away / closer (it keeps its size, so closer looks bigger) |
+| `⌃⌥=` / `⌃⌥-` | Make the screen bigger / smaller |
+| `⌃⌥R` | Reset distance and size to the `--screen-distance` and `--screen-height` values |
+
+If another app already uses one of these, the log says so and that shortcut is skipped.
+
+When the vr-space window has focus, plain keys work too:
 
 | Key | Action |
 |---|---|
-| `C` | Recenter (look straight ahead first) |
-| `↑` / `↓` | Move the screen further away / closer (it keeps its size, so closer looks bigger) |
-| `+` / `-` | Make the screen bigger / smaller |
-| `R` | Reset distance and size to the `--screen-distance` and `--screen-height` values |
+| `C` | Recenter |
+| `↑` / `↓` | Further away / closer |
+| `+` / `-` | Bigger / smaller |
+| `R` | Reset distance and size |
 | `F` | Toggle fullscreen |
+| `H` | Show or hide the HUD |
 | `P` | Open Screen Recording settings |
 | `Esc` | Quit |
 

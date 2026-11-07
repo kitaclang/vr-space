@@ -10,8 +10,11 @@ use log::{info, warn};
 use glam::{Mat4, Quat, Vec3};
 use wgpu::util::DeviceExt;
 use winit::event::{ElementState, Event, KeyboardInput, MouseButton, VirtualKeyCode, WindowEvent};
-use winit::event_loop::EventLoop;
-use winit::window::{Fullscreen, Window};
+use winit::event::StartCause;
+use winit::event_loop::{EventLoop, EventLoopBuilder};
+use winit::window::Window;
+#[cfg(not(target_os = "macos"))]
+use winit::window::Fullscreen;
 
 // Text overlay
 use ab_glyph::FontArc;
@@ -20,9 +23,11 @@ use wgpu_glyph::{GlyphBrush, GlyphBrushBuilder, HorizontalAlign, Layout, Section
 // On macOS, pull capture helpers into scope (now using screencapturekit crate under the hood)
 #[cfg(target_os = "macos")]
 use crate::macos_capture::{
-    capture_status, list_displays, open_screen_recording_settings, start_stream, stop_stream, take_latest_bgra,
-    CaptureStatus,
+    capture_status, list_displays, open_screen_recording_settings, resolve_display_id, start_stream, stop_stream,
+    switch_display, take_latest_bgra, CaptureStatus,
 };
+#[cfg(target_os = "macos")]
+use crate::menu_bar::MenuBar;
 
 // Headset fusion API (path dependency to headset-utils)
 use ar_drivers::{any_fusion, any_glasses};
@@ -30,6 +35,29 @@ use ar_drivers::{any_fusion, any_glasses};
 // macOS screen capture (virtual monitor)
 #[cfg(target_os = "macos")]
 mod macos_capture;
+
+// Menu bar icon and shortcuts that work from any app
+#[cfg(target_os = "macos")]
+mod menu_bar;
+
+/// Something the user asked for, from a key in the window, the menu bar or a global shortcut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Command {
+    Recenter,
+    Further,
+    Closer,
+    Bigger,
+    Smaller,
+    ResetScreen,
+    ToggleFullscreen,
+    /// Go fullscreen on this display, or back to a window with `None`.
+    FullscreenOn(Option<u32>),
+    /// Capture this display instead.
+    ShowDisplay(u32),
+    ToggleHud,
+    OpenScreenSettings,
+    Quit,
+}
 
 // ================= CLI =================
 
@@ -806,6 +834,91 @@ fn find_monitor(window: &Window, id: u32) -> Option<winit::monitor::MonitorHandl
     }
 }
 
+/// The display ID of a winit monitor (0 where it isn't known).
+fn monitor_id(monitor: &winit::monitor::MonitorHandle) -> u32 {
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::MonitorHandleExtMacOS;
+        monitor.native_id()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = monitor;
+        0
+    }
+}
+
+/// Fill display `id` with the window, or go back to a normal window with `None`.
+/// Returns the display the window now fills (unchanged if `id` wasn't found).
+///
+/// On macOS this doesn't use native fullscreen (winit's `Fullscreen`): that needs its own
+/// Space, which macOS doesn't reliably give a window on a secondary display such as the
+/// glasses, and never gives an app without a Dock icon. Instead the window loses its border,
+/// covers the display exactly, sits above the menu bar and stays on every Space.
+fn apply_fullscreen(window: &Window, current: Option<u32>, id: Option<u32>) -> Option<u32> {
+    match id {
+        None => {
+            #[cfg(target_os = "macos")]
+            {
+                set_above_menu_bar(window, false);
+                window.set_decorations(true);
+                window.set_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+            }
+            #[cfg(not(target_os = "macos"))]
+            window.set_fullscreen(None);
+            None
+        }
+        Some(id) => match find_monitor(window, id) {
+            Some(monitor) => {
+                let actual = monitor_id(&monitor);
+                #[cfg(target_os = "macos")]
+                {
+                    // Raise it first: macOS keeps normal-level windows below the menu bar.
+                    set_above_menu_bar(window, true);
+                    window.set_decorations(false);
+                    window.set_outer_position(monitor.position());
+                    window.set_inner_size(monitor.size());
+                }
+                #[cfg(not(target_os = "macos"))]
+                window.set_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
+                Some(actual)
+            }
+            None => {
+                warn!("Display {id} not found; staying as it is.");
+                current
+            }
+        },
+    }
+}
+
+/// Raise the window above the menu bar and keep it on every Space of its display, or put it
+/// back to a normal window.
+#[cfg(target_os = "macos")]
+fn set_above_menu_bar(window: &Window, on: bool) {
+    use objc2::runtime::AnyObject;
+    use objc2::msg_send;
+    use winit::platform::macos::WindowExtMacOS;
+
+    // NSStatusWindowLevel (25) + 1: above the menu bar and its status items, below pop-up menus.
+    const ABOVE_MENU_BAR: isize = 26;
+    const NORMAL_LEVEL: isize = 0;
+    // NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorStationary
+    const ALL_SPACES: usize = (1 << 0) | (1 << 4);
+
+    let ns_window = window.ns_window() as *const AnyObject;
+    if ns_window.is_null() {
+        return;
+    }
+    // SAFETY: ns_window is the live NSWindow behind `window`, used on the main thread.
+    unsafe {
+        let ns_window = &*ns_window;
+        let level = if on { ABOVE_MENU_BAR } else { NORMAL_LEVEL };
+        let _: () = msg_send![ns_window, setLevel: level];
+        let behavior: usize = if on { ALL_SPACES } else { 0 };
+        let _: () = msg_send![ns_window, setCollectionBehavior: behavior];
+    }
+}
+
 // HUD line describing the screen capture.
 fn screen_status_line(tex_size: (u32, u32)) -> String {
     #[cfg(target_os = "macos")]
@@ -905,11 +1018,21 @@ fn main() -> anyhow::Result<()> {
     );
 
     // Window and event loop (winit 0.28 API)
-    let event_loop = EventLoop::new();
+    let mut builder = EventLoopBuilder::<Command>::with_user_event();
+    // Live in the menu bar only: no Dock icon (and no Dock menu to quit from by accident).
+    // The window still takes keys when clicked, and fullscreen doesn't need a Dock icon
+    // (see apply_fullscreen).
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+        builder.with_activation_policy(ActivationPolicy::Accessory);
+    }
+    let event_loop = builder.build();
     let window = Window::new(&event_loop).expect("create window");
     window.set_title("Headset Visualizer");
 
     // Go fullscreen on the chosen display (normally the glasses).
+    let mut fullscreen_on: Option<u32> = None;
     if let Some(id) = cli.fullscreen {
         match find_monitor(&window, id) {
             Some(monitor) => {
@@ -926,6 +1049,9 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 info!("Fullscreen on display {id} ({})", monitor.name().unwrap_or_default());
+                // On macOS this is applied in StartCause::Init, once the app has finished launching.
+                fullscreen_on = Some(monitor_id(&monitor));
+                #[cfg(not(target_os = "macos"))]
                 window.set_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
             }
             None => warn!("Display {id} not found for --fullscreen; staying windowed. Run with --list-displays to see the IDs."),
@@ -1019,10 +1145,14 @@ fn main() -> anyhow::Result<()> {
     // GPU init
     let mut gpu = pollster::block_on(init_gpu(&window, &cli, &grid_vertices))?;
 
+    // The captured display, as a real ID (0 on the command line means the main display).
+    #[cfg(target_os = "macos")]
+    let mut shown_display = resolve_display_id(cli.display);
+
     // Start virtual monitor stream (macOS) via screencapturekit-rs
     #[cfg(target_os = "macos")]
     {
-        if let Err(e) = start_stream(cli.display, !cli.no_cursor) {
+        if let Err(e) = start_stream(shown_display, !cli.no_cursor) {
             warn!("Screen capture failed to start: {e}");
         }
     }
@@ -1030,9 +1160,17 @@ fn main() -> anyhow::Result<()> {
     // FPS meter
     let mut fps = FpsMeter::new();
 
+    // Menu bar icon: created once the event loop runs (macOS requires that). Its menu and the
+    // global shortcuts send Commands to this loop through the proxy.
+    let proxy = event_loop.create_proxy();
+    #[cfg(target_os = "macos")]
+    let mut menu_bar: Option<MenuBar> = None;
+    let mut last_display_check = Instant::now();
+
     // Event loop / render (winit 0.28 API)
     event_loop.run(move |event, _, control_flow| {
         use winit::event_loop::ControlFlow;
+        let mut command: Option<Command> = None;
         // Frame pacing: only apply WaitUntil when no-vsync. With vsync enabled, let OS/VBlank drive redraws via Wait and explicit request_redraw on events.
         if !cli.vsync && cli.max_fps > 0 {
             *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_micros((1_000_000u64 / cli.max_fps as u64).max(1)));
@@ -1045,15 +1183,25 @@ fn main() -> anyhow::Result<()> {
         match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => {
                 match event {
-                    WindowEvent::CloseRequested
-                    | WindowEvent::KeyboardInput {
-                        input: KeyboardInput { state: ElementState::Pressed, virtual_keycode: Some(VirtualKeyCode::Escape), .. },
+                    WindowEvent::CloseRequested => command = Some(Command::Quit),
+                    WindowEvent::KeyboardInput {
+                        input: KeyboardInput { state: ElementState::Pressed, virtual_keycode: Some(key), .. },
                         ..
                     } => {
-                        // Window closed or Escape pressed: stop ScreenCaptureKit cleanly, then exit.
-                        #[cfg(target_os = "macos")]
-                        stop_stream();
-                        *control_flow = ControlFlow::Exit;
+                        // Keys in the window. Held keys repeat, so the screen moves smoothly.
+                        command = match key {
+                            VirtualKeyCode::Escape => Some(Command::Quit),
+                            VirtualKeyCode::C => Some(Command::Recenter),
+                            VirtualKeyCode::F => Some(Command::ToggleFullscreen),
+                            VirtualKeyCode::H => Some(Command::ToggleHud),
+                            VirtualKeyCode::P => Some(Command::OpenScreenSettings),
+                            VirtualKeyCode::Up => Some(Command::Further),
+                            VirtualKeyCode::Down => Some(Command::Closer),
+                            VirtualKeyCode::Equals | VirtualKeyCode::Plus | VirtualKeyCode::NumpadAdd => Some(Command::Bigger),
+                            VirtualKeyCode::Minus | VirtualKeyCode::NumpadSubtract => Some(Command::Smaller),
+                            VirtualKeyCode::R => Some(Command::ResetScreen),
+                            _ => None,
+                        };
                     }
                     WindowEvent::Resized(new_size) => {
                         if new_size.width > 0 && new_size.height > 0 {
@@ -1074,57 +1222,11 @@ fn main() -> anyhow::Result<()> {
                     WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                         // Only a click on the Calibrate button recenters (both are in physical pixels).
                         if gpu.hud_enabled && gpu.calibrate_btn.contains(cursor_px.0, cursor_px.1) {
-                            calibrate_pending = true;
+                            command = Some(Command::Recenter);
                         }
-                        #[cfg(target_os = "macos")]
                         if gpu.settings_btn.is_some_and(|b| b.contains(cursor_px.0, cursor_px.1)) {
-                            open_screen_recording_settings();
+                            command = Some(Command::OpenScreenSettings);
                         }
-                    }
-                    WindowEvent::KeyboardInput {
-                        input: KeyboardInput { state: ElementState::Pressed, virtual_keycode: Some(VirtualKeyCode::C), .. },
-                        ..
-                    } => {
-                        // Keyboard recenter; also works with --no-hud, where there is no button.
-                        calibrate_pending = true;
-                    }
-                    WindowEvent::KeyboardInput {
-                        input: KeyboardInput { state: ElementState::Pressed, virtual_keycode: Some(VirtualKeyCode::F), .. },
-                        ..
-                    } => {
-                        // Toggle borderless fullscreen on whichever display the window is on.
-                        if window.fullscreen().is_some() {
-                            window.set_fullscreen(None);
-                        } else {
-                            window.set_fullscreen(Some(Fullscreen::Borderless(window.current_monitor())));
-                        }
-                    }
-                    WindowEvent::KeyboardInput {
-                        input: KeyboardInput { state: ElementState::Pressed, virtual_keycode: Some(key @ (
-                            VirtualKeyCode::Up | VirtualKeyCode::Down
-                            | VirtualKeyCode::Equals | VirtualKeyCode::Plus | VirtualKeyCode::NumpadAdd
-                            | VirtualKeyCode::Minus | VirtualKeyCode::NumpadSubtract
-                            | VirtualKeyCode::R
-                        )), .. },
-                        ..
-                    } => {
-                        // Move or resize the virtual screen. Held keys repeat, so it moves smoothly.
-                        match key {
-                            VirtualKeyCode::Up => gpu.screen.scale_distance(SCREEN_STEP),
-                            VirtualKeyCode::Down => gpu.screen.scale_distance(1.0 / SCREEN_STEP),
-                            VirtualKeyCode::Minus | VirtualKeyCode::NumpadSubtract => gpu.screen.scale_height(1.0 / SCREEN_STEP),
-                            VirtualKeyCode::R => gpu.screen = ScreenPlacement::from_cli(&cli),
-                            _ => gpu.screen.scale_height(SCREEN_STEP),
-                        }
-                        write_quad(&gpu);
-                        gpu.hud_text.clear(); // refresh the HUD's placement line now
-                    }
-                    #[cfg(target_os = "macos")]
-                    WindowEvent::KeyboardInput {
-                        input: KeyboardInput { state: ElementState::Pressed, virtual_keycode: Some(VirtualKeyCode::P), .. },
-                        ..
-                    } => {
-                        open_screen_recording_settings();
                     }
                     WindowEvent::CursorMoved { position, .. } => {
                         cursor_px = (position.x as f32, position.y as f32);
@@ -1140,6 +1242,39 @@ fn main() -> anyhow::Result<()> {
                 // - No vsync: drive redraw every loop to maximize FPS (Poll or WaitUntil pacing).
                 // - Vsync: request redraw here so the Window handles VBlank pacing without starving the event loop.
                 window.request_redraw();
+
+                // Pick up displays that were connected or removed (the glasses, say).
+                #[cfg(target_os = "macos")]
+                if last_display_check.elapsed() >= Duration::from_secs(2) {
+                    last_display_check = Instant::now();
+                    if let Some(bar) = menu_bar.as_mut() {
+                        bar.refresh_displays();
+                    }
+                }
+            }
+            Event::NewEvents(StartCause::Init) => {
+                #[cfg(target_os = "macos")]
+                match MenuBar::new(
+                    proxy.clone(),
+                    shown_display,
+                    fullscreen_on,
+                    gpu.hud_enabled,
+                    gpu.glyph_brush.is_some(),
+                ) {
+                    Ok(bar) => menu_bar = Some(bar),
+                    Err(e) => warn!("Menu bar icon unavailable: {e}"),
+                }
+                if fullscreen_on.is_some() {
+                    fullscreen_on = apply_fullscreen(&window, None, fullscreen_on);
+                }
+            }
+            Event::UserEvent(cmd) => command = Some(cmd),
+            Event::LoopDestroyed => {
+                // Every way of quitting ends here: the menu bar, Esc, closing the window, and a
+                // Quit from macOS itself (Cmd-Q, logout), which skips Command::Quit.
+                #[cfg(target_os = "macos")]
+                stop_stream();
+                info!("Quitting");
             }
             Event::RedrawRequested(id) if id == window.id() => {
                 // Acquire frame
@@ -1414,6 +1549,67 @@ fn main() -> anyhow::Result<()> {
                 frame.present();
             }
             _ => {}
+        }
+
+        // Carry out a command from a key, the menu bar or a global shortcut.
+        if let Some(cmd) = command {
+            match cmd {
+                Command::Quit => {
+                    // Stop ScreenCaptureKit cleanly, then exit.
+                    #[cfg(target_os = "macos")]
+                    stop_stream();
+                    *control_flow = ControlFlow::Exit;
+                }
+                Command::Recenter => calibrate_pending = true,
+                Command::Further => gpu.screen.scale_distance(SCREEN_STEP),
+                Command::Closer => gpu.screen.scale_distance(1.0 / SCREEN_STEP),
+                Command::Bigger => gpu.screen.scale_height(SCREEN_STEP),
+                Command::Smaller => gpu.screen.scale_height(1.0 / SCREEN_STEP),
+                Command::ResetScreen => gpu.screen = ScreenPlacement::from_cli(&cli),
+                Command::ToggleFullscreen => {
+                    // Fullscreen on whichever display the window is on, or back to a window.
+                    let target = if fullscreen_on.is_some() {
+                        None
+                    } else {
+                        window.current_monitor().map(|m| monitor_id(&m))
+                    };
+                    fullscreen_on = apply_fullscreen(&window, fullscreen_on, target);
+                }
+                Command::FullscreenOn(id) => fullscreen_on = apply_fullscreen(&window, fullscreen_on, id),
+                Command::ShowDisplay(id) => {
+                    #[cfg(target_os = "macos")]
+                    if id != shown_display {
+                        // Restarting the capture blocks briefly; fine for a menu click.
+                        match switch_display(id, !cli.no_cursor) {
+                            Ok(()) => shown_display = id,
+                            Err(e) => warn!("Couldn't switch to display {id}: {e}"),
+                        }
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = id;
+                }
+                Command::ToggleHud => {
+                    // Only possible when the HUD font was set up (not with --no-hud).
+                    if gpu.glyph_brush.is_some() {
+                        gpu.hud_enabled = !gpu.hud_enabled;
+                    }
+                }
+                Command::OpenScreenSettings => {
+                    #[cfg(target_os = "macos")]
+                    open_screen_recording_settings();
+                }
+            }
+            if matches!(
+                cmd,
+                Command::Further | Command::Closer | Command::Bigger | Command::Smaller | Command::ResetScreen
+            ) {
+                write_quad(&gpu);
+            }
+            gpu.hud_text.clear(); // refresh the HUD's text now
+            #[cfg(target_os = "macos")]
+            if let Some(bar) = menu_bar.as_mut() {
+                bar.set_state(shown_display, fullscreen_on, gpu.hud_enabled);
+            }
         }
     });
     // Unreachable with winit 0.28 run loop, but return Ok for signature completeness.
