@@ -51,7 +51,7 @@ cargo run --release -p capture-check -- --seconds 5 --out capture.bgra
 
 There are no automated tests yet. To verify a change, at minimum build the workspace and run each binary with `--help`. Real behaviour needs AR glasses over USB and Screen Recording permission for the terminal, which an agent usually can't provide. Say so rather than claiming a change works on hardware.
 
-The build currently shows 3 warnings (an unused `stop_stream`, an unread `has_device` field and an unused `render_bundle` initial value). Don't introduce new warnings.
+The workspace crates build with no warnings. Cargo still prints a future-incompatibility note for the `block` dependency, which comes from upstream. Don't introduce new warnings.
 
 ## Dependency constraints
 

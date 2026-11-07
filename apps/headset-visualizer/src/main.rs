@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,7 +19,7 @@ use wgpu_glyph::{Section, Text, GlyphBrushBuilder, GlyphBrush};
 
 // On macOS, pull capture helpers into scope (now using screencapturekit crate under the hood)
 #[cfg(target_os = "macos")]
-use crate::macos_capture::{take_latest_bgra, start_stream};
+use crate::macos_capture::{take_latest_bgra, start_stream, stop_stream};
 
 // Headset fusion API (path dependency to headset-utils)
 use ar_drivers::any_fusion;
@@ -112,23 +112,24 @@ impl PoseAtomic {
     }
 }
 
-// Monotonic app start Instant to derive cheap ns timestamps
-static mut START_INSTANT: Option<Instant> = None;
+// Monotonic app start Instant to derive cheap ns timestamps. Set at the top of main();
+// get_or_init makes any earlier call safe too.
+static START_INSTANT: OnceLock<Instant> = OnceLock::new();
 #[inline]
 fn now_ns_from_start() -> u64 {
-    unsafe {
-        let start = START_INSTANT.unwrap();
-        (Instant::now() - start).as_nanos() as u64
-    }
+    let start = *START_INSTANT.get_or_init(Instant::now);
+    (Instant::now() - start).as_nanos() as u64
 }
 
-// Just for convenience when building view/proj and printing
+// How often the HUD's text is re-formatted (it is still drawn every frame).
+const HUD_REFRESH_NS: u64 = 100_000_000;
+
+// Head orientation sample, as published by the tracking thread.
 #[derive(Debug, Clone, Copy)]
 struct PoseCopy {
     roll: f32,
     pitch: f32,
     yaw: f32,
-    has_device: bool,
 }
 
 // ================= GPU Types =================
@@ -228,8 +229,8 @@ struct Gpu {
     show_calibrated_toast_until_ns: u64,
 
     // HUD caching
-    cached_hud_text: Vec<String>,
-    cached_scale_factor: f32,
+    hud_text: Vec<String>,
+    hud_text_updated_ns: u64,
 
     // Virtual monitor: textured quad and texture/sampler
     quad_pipeline: wgpu::RenderPipeline,
@@ -560,8 +561,7 @@ fn fs_main_q(in: VsOut) -> @location(0) vec4<f32> {
     let show_calibrated_toast_until_ns = 0;
 
     // Record a render bundle for the static grid to reduce per-frame encoder work
-    let mut render_bundle: Option<wgpu::RenderBundle> = None;
-    {
+    let render_bundle: Option<wgpu::RenderBundle> = {
         let mut encoder = device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
             label: Some("grid-bundle-encoder"),
             color_formats: &[Some(format)],
@@ -573,10 +573,10 @@ fn fs_main_q(in: VsOut) -> @location(0) vec4<f32> {
         encoder.set_bind_group(0, &uniform_bind_group, &[]);
         encoder.set_vertex_buffer(0, vertex_buffer.slice(..));
         encoder.draw(0..vertices.len() as u32, 0..1);
-        render_bundle = Some(encoder.finish(&wgpu::RenderBundleDescriptor {
+        Some(encoder.finish(&wgpu::RenderBundleDescriptor {
             label: Some("grid-bundle"),
-        }));
-    }
+        }))
+    };
 
     Ok(Gpu {
         surface,
@@ -597,8 +597,8 @@ fn fs_main_q(in: VsOut) -> @location(0) vec4<f32> {
         hud_padding,
         calibrate_btn,
         show_calibrated_toast_until_ns,
-        cached_hud_text: Vec::new(),
-        cached_scale_factor: 0.0,
+        hud_text: Vec::new(),
+        hud_text_updated_ns: 0,
         quad_pipeline,
         quad_vb,
         quad_ib,
@@ -718,7 +718,7 @@ impl FpsMeter {
 
 fn main() -> anyhow::Result<()> {
     // Initialize start instant for latency metrics
-    unsafe { START_INSTANT = Some(Instant::now()); }
+    START_INSTANT.get_or_init(Instant::now);
 
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
@@ -842,6 +842,9 @@ fn main() -> anyhow::Result<()> {
             Event::WindowEvent { event, window_id } if window_id == window.id() => {
                 match event {
                     WindowEvent::CloseRequested => {
+                        // Stop ScreenCaptureKit cleanly before the process exits.
+                        #[cfg(target_os = "macos")]
+                        stop_stream();
                         *control_flow = ControlFlow::Exit;
                     }
                     WindowEvent::Resized(new_size) => {
@@ -915,7 +918,7 @@ fn main() -> anyhow::Result<()> {
 
                 // Read pose
                 let (r, p, y, has, t_ns) = pose_shared.read();
-                let pose_copy = PoseCopy { roll: r, pitch: p, yaw: y, has_device: has };
+                let pose_copy = PoseCopy { roll: r, pitch: p, yaw: y };
                 let head = head_rotation_from_pose(pose_copy, (cli.invert_x, cli.invert_y, cli.invert_z));
 
                 // Recenter: make the current head orientation the new "forward".
@@ -923,7 +926,6 @@ fn main() -> anyhow::Result<()> {
                     calibrate_pending = false;
                     calib_inv = head.inverse();
                     gpu.show_calibrated_toast_until_ns = now_ns_from_start() + 1_000_000_000;
-                    gpu.cached_hud_text.clear(); // force HUD refresh so the toast shows now
                 }
 
                 let vp = {
@@ -1021,25 +1023,30 @@ fn main() -> anyhow::Result<()> {
                 let now_ns = now_ns_from_start();
                 let latency_ms = ((now_ns.saturating_sub(t_ns)) as f64) / 1_000_000.0;
 
-                // Build HUD strings (prepare but only queue if changed to reduce CPU work)
-                let dev = if has { "connected" } else { "not-found" };
-                let hud_lines = vec![
-                    format!("device: {dev}"),
-                    format!("fps: {:.1}", fps.fps.max(0.0)),
-                    format!("latency: {:.2} ms", latency_ms),
-                    format!("euler(rad) r={:.3} p={:.3} y={:.3}", r, p, y),
-                    format!("invert=({},{},{}) vsync={}", cli.invert_x, cli.invert_y, cli.invert_z, cli.vsync),
-                ];
+                // Refresh the HUD strings at most every 100 ms: readable, and it avoids formatting
+                // (and allocating) strings every frame. Skipped entirely when the HUD is off.
+                if gpu.hud_enabled
+                    && (gpu.hud_text.is_empty() || now_ns.saturating_sub(gpu.hud_text_updated_ns) >= HUD_REFRESH_NS)
+                {
+                    let dev = if has { "connected" } else { "not-found" };
+                    gpu.hud_text = vec![
+                        format!("device: {dev}"),
+                        format!("fps: {:.1}", fps.fps.max(0.0)),
+                        format!("latency: {:.2} ms", latency_ms),
+                        format!("euler(rad) r={:.3} p={:.3} y={:.3}", r, p, y),
+                        format!("invert=({},{},{}) vsync={}", cli.invert_x, cli.invert_y, cli.invert_z, cli.vsync),
+                    ];
+                    gpu.hud_text_updated_ns = now_ns;
+                }
 
-                // Prepare glyph sections; only rebuild queue when text or scale factor changed
+                // Queue HUD text every frame: wgpu_glyph draws only what was queued for this frame,
+                // so skipping the queue makes the HUD disappear on that frame.
                 let scale = gpu.hud_font_size * window_scale_factor;
                 let pad = gpu.hud_padding * window_scale_factor;
                 let mut y_cursor = pad;
-                let hud_changed = gpu.cached_hud_text != hud_lines || (gpu.cached_scale_factor - scale).abs() > f32::EPSILON;
-                if gpu.hud_enabled && hud_changed {
+                if gpu.hud_enabled {
                     if let Some(gb) = gpu.glyph_brush.as_mut() {
-                        // Clear by rebuilding queue: wgpu_glyph queues are per-frame; we simply re-queue
-                        for line in &hud_lines {
+                        for line in &gpu.hud_text {
                             gb.queue(Section {
                                 screen_position: (pad, y_cursor),
                                 bounds: (gpu.config.width as f32, gpu.config.height as f32),
@@ -1053,11 +1060,6 @@ fn main() -> anyhow::Result<()> {
                             y_cursor += scale + 4.0;
                         }
                     }
-                    gpu.cached_hud_text = hud_lines.clone();
-                    gpu.cached_scale_factor = scale;
-                } else {
-                    // Keep y_cursor correct for later elements even if we didn't rebuild
-                    y_cursor += (scale + 4.0) * 5.0;
                 }
 
                 // Calibrate button
@@ -1068,7 +1070,7 @@ fn main() -> anyhow::Result<()> {
                 let btn_y = pad;
                 gpu.calibrate_btn = Rect { x: btn_x, y: btn_y, w: btn_w, h: btn_h };
 
-                if gpu.hud_enabled && hud_changed {
+                if gpu.hud_enabled {
                     if let Some(gb) = gpu.glyph_brush.as_mut() {
                         gb.queue(Section {
                             screen_position: (btn_x + 10.0, btn_y + btn_h * 0.25),
