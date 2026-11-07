@@ -10,7 +10,7 @@ What's planned for vr-space, grouped by priority rather than dates. vr-space is 
 
 ## Next
 
-- **Distance controls.** The default screen distance doesn't suit everyone. Add keys to move the virtual screen closer or further while the app runs, instead of restarting with `--screen-distance`.
+- **Adjust the screen while using another app.** The distance and size keys only work while the vr-space window has focus. Global shortcuts would let you adjust it while working on the captured display.
 - **Survive unplugged glasses.** Today the app waits for glasses that are missing at startup, but unplugging them mid-session quits the app: `ar-drivers` calls `exit(0)` on a USB read error. Fixing it needs `ar-drivers` to return errors from `Fusion::update()` instead of exiting, which means a change upstream in [headset-utils](https://github.com/3rl-io/headset-utils).
 - **Capture a single window** instead of a whole display, using ScreenCaptureKit's window filters.
 - **Recenter yaw only**, as an option. Recentering currently takes your full head orientation, so calibrating while tilted also tilts the scene's horizon.
@@ -20,7 +20,7 @@ What's planned for vr-space, grouped by priority rather than dates. vr-space is 
 - **Automated tests** for the parts that don't need hardware: the calibration maths, the axis mapping and the capture frame handoff.
 - **Reduce latency further.** Upload frames straight from the capture's IOSurface instead of copying them through the CPU, and measure real motion-to-photon latency rather than the age of the last sample.
 - **Curved or multiple virtual screens.**
-- **Settings saved between runs** (screen size, distance, display) instead of passing flags each time.
+- **Settings saved between runs** (screen size and distance as set with the keys, display) instead of passing flags each time.
 
 ## Known limitations
 

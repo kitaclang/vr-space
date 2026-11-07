@@ -316,29 +316,52 @@ struct Gpu {
 /// Its width follows the captured screen's aspect ratio.
 #[derive(Clone, Copy, Debug)]
 struct ScreenPlacement {
-    half_height: f32,
-    center: Vec3,
+    height: f32,
+    distance: f32,
 }
+
+/// Each press of a distance or size key changes it by this factor, so steps feel even
+/// whether the screen is near or far.
+const SCREEN_STEP: f32 = 1.1;
+const SCREEN_DISTANCE_RANGE: (f32, f32) = (0.5, 50.0);
+const SCREEN_HEIGHT_RANGE: (f32, f32) = (0.1, 30.0);
 
 impl ScreenPlacement {
     fn from_cli(cli: &Cli) -> Self {
-        Self {
-            half_height: cli.screen_height * 0.5,
-            center: CAM_POS - Vec3::Z * cli.screen_distance,
-        }
+        Self { height: cli.screen_height, distance: cli.screen_distance }
+    }
+
+    /// Scale the distance (`factor` > 1 moves the screen away). The size stays the same,
+    /// so a closer screen looks bigger, as a real one would.
+    fn scale_distance(&mut self, factor: f32) {
+        let (lo, hi) = SCREEN_DISTANCE_RANGE;
+        self.distance = (self.distance * factor).clamp(lo.min(self.distance), hi.max(self.distance));
+    }
+
+    fn scale_height(&mut self, factor: f32) {
+        let (lo, hi) = SCREEN_HEIGHT_RANGE;
+        self.height = (self.height * factor).clamp(lo.min(self.height), hi.max(self.height));
     }
 }
 
 fn quad_vertices(screen: ScreenPlacement, aspect: f32) -> [TVertex; 4] {
-    let hh = screen.half_height;
+    let hh = screen.height * 0.5;
     let hw = hh * aspect;
-    let c = screen.center;
+    let c = CAM_POS - Vec3::Z * screen.distance;
     [
         TVertex { pos: [c.x - hw, c.y + hh, c.z], uv: [0.0, 0.0] },
         TVertex { pos: [c.x + hw, c.y + hh, c.z], uv: [1.0, 0.0] },
         TVertex { pos: [c.x + hw, c.y - hh, c.z], uv: [1.0, 1.0] },
         TVertex { pos: [c.x - hw, c.y - hh, c.z], uv: [0.0, 1.0] },
     ]
+}
+
+/// Rewrite the screen quad after its placement or the captured frame's aspect ratio changed.
+fn write_quad(gpu: &Gpu) {
+    let (w, h) = gpu.tex_size;
+    let aspect = if w > 0 && h > 0 { w as f32 / h as f32 } else { 1.6 };
+    let verts = quad_vertices(gpu.screen, aspect);
+    gpu.queue.write_buffer(&gpu.quad_vb, 0, bytemuck::cast_slice(&verts));
 }
 
 /// Create the BGRA screen texture and its bind group. BGRA8Unorm matches ScreenCaptureKit
@@ -1076,6 +1099,26 @@ fn main() -> anyhow::Result<()> {
                             window.set_fullscreen(Some(Fullscreen::Borderless(window.current_monitor())));
                         }
                     }
+                    WindowEvent::KeyboardInput {
+                        input: KeyboardInput { state: ElementState::Pressed, virtual_keycode: Some(key @ (
+                            VirtualKeyCode::Up | VirtualKeyCode::Down
+                            | VirtualKeyCode::Equals | VirtualKeyCode::Plus | VirtualKeyCode::NumpadAdd
+                            | VirtualKeyCode::Minus | VirtualKeyCode::NumpadSubtract
+                            | VirtualKeyCode::R
+                        )), .. },
+                        ..
+                    } => {
+                        // Move or resize the virtual screen. Held keys repeat, so it moves smoothly.
+                        match key {
+                            VirtualKeyCode::Up => gpu.screen.scale_distance(SCREEN_STEP),
+                            VirtualKeyCode::Down => gpu.screen.scale_distance(1.0 / SCREEN_STEP),
+                            VirtualKeyCode::Minus | VirtualKeyCode::NumpadSubtract => gpu.screen.scale_height(1.0 / SCREEN_STEP),
+                            VirtualKeyCode::R => gpu.screen = ScreenPlacement::from_cli(&cli),
+                            _ => gpu.screen.scale_height(SCREEN_STEP),
+                        }
+                        write_quad(&gpu);
+                        gpu.hud_text.clear(); // refresh the HUD's placement line now
+                    }
                     #[cfg(target_os = "macos")]
                     WindowEvent::KeyboardInput {
                         input: KeyboardInput { state: ElementState::Pressed, virtual_keycode: Some(VirtualKeyCode::P), .. },
@@ -1159,8 +1202,7 @@ fn main() -> anyhow::Result<()> {
                                 gpu.tex = tex;
                                 gpu.quad_bind_group = bg;
                                 gpu.tex_size = (w, h);
-                                let verts = quad_vertices(gpu.screen, w as f32 / h as f32);
-                                gpu.queue.write_buffer(&gpu.quad_vb, 0, bytemuck::cast_slice(&verts));
+                                write_quad(&gpu);
                             }
                             gpu.queue.write_texture(
                                 wgpu::ImageCopyTexture {
@@ -1243,6 +1285,7 @@ fn main() -> anyhow::Result<()> {
                         format!("euler(rad) r={:.3} p={:.3} y={:.3}", r, p, y),
                         format!("invert=({},{},{}) vsync={}", cli.invert_x, cli.invert_y, cli.invert_z, cli.vsync),
                         screen_status_line(gpu.tex_size),
+                        format!("distance: {:.2}  height: {:.2}", gpu.screen.distance, gpu.screen.height),
                     ];
                     gpu.hud_text_updated_ns = now_ns;
                 }

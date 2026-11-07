@@ -58,7 +58,19 @@ The glasses show up on your Mac as an extra display. To get a virtual monitor th
 
 The glasses only track rotation (3DoF), not position, so leaning or moving in your seat isn't tracked. The neck model (`--neck-model`, on by default) adds the small eye movement that comes from turning your head around your neck, which makes the screen feel more solidly placed.
 
-Keys: `C` recenter, `F` toggle fullscreen, `P` open Screen Recording settings, `Esc` quit.
+Keys (the app window needs focus):
+
+| Key | Action |
+|---|---|
+| `C` | Recenter (look straight ahead first) |
+| `↑` / `↓` | Move the screen further away / closer (it keeps its size, so closer looks bigger) |
+| `+` / `-` | Make the screen bigger / smaller |
+| `R` | Reset distance and size to the `--screen-distance` and `--screen-height` values |
+| `F` | Toggle fullscreen |
+| `P` | Open Screen Recording settings |
+| `Esc` | Quit |
+
+The HUD shows the current distance and height. Once you've found values you like, pass them as `--screen-distance` and `--screen-height` next time.
 
 Options:
 
