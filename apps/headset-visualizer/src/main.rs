@@ -97,6 +97,10 @@ struct Cli {
     /// (1 = average head, 0 = off)
     #[arg(long, default_value_t = 1.0)]
     neck_model: f32,
+
+    /// Hide the mouse cursor on the virtual screen
+    #[arg(long)]
+    no_cursor: bool,
 }
 
 impl Cli {
@@ -995,7 +999,7 @@ fn main() -> anyhow::Result<()> {
     // Start virtual monitor stream (macOS) via screencapturekit-rs
     #[cfg(target_os = "macos")]
     {
-        if let Err(e) = start_stream(cli.display) {
+        if let Err(e) = start_stream(cli.display, !cli.no_cursor) {
             warn!("Screen capture failed to start: {e}");
         }
     }

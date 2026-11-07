@@ -235,11 +235,11 @@ impl screencapturekit::stream::output_trait::SCStreamOutputTrait for ScreenOutpu
 }
 
 // Start capture stream
-pub fn start_stream(display_id: u32) -> anyhow::Result<()> {
+pub fn start_stream(display_id: u32, show_cursor: bool) -> anyhow::Result<()> {
     if STARTED.get().is_some() {
         return Ok(());
     }
-    let result = start_stream_inner(display_id);
+    let result = start_stream_inner(display_id, show_cursor);
     let status = match &result {
         Ok(()) => STATUS_RUNNING,
         Err(_) if !has_screen_recording_permission() => STATUS_NO_PERMISSION,
@@ -249,7 +249,7 @@ pub fn start_stream(display_id: u32) -> anyhow::Result<()> {
     result
 }
 
-fn start_stream_inner(display_id: u32) -> anyhow::Result<()> {
+fn start_stream_inner(display_id: u32, show_cursor: bool) -> anyhow::Result<()> {
     // Check Screen Recording permission first. If it's missing, ask macOS to show its prompt
     // (it only does so once per app; after that the user has to use System Settings).
     if !has_screen_recording_permission() {
@@ -281,7 +281,7 @@ fn start_stream_inner(display_id: u32) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("set_pixel_format failed"))?
         .set_captures_audio(false)
         .map_err(|_| anyhow::anyhow!("set_captures_audio failed"))?
-        .set_shows_cursor(false)
+        .set_shows_cursor(show_cursor)
         .map_err(|_| anyhow::anyhow!("set_shows_cursor failed"))?;
 
     let filter = SCContentFilter::new().with_display_excluding_windows(&display, &[]);

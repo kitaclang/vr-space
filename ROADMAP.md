@@ -4,19 +4,16 @@ What's planned for vr-space, grouped by priority rather than dates. vr-space is 
 
 ## Now
 
-- **Finish testing on real glasses.** A first run with XREAL Air glasses confirmed that screen capture starts, frames arrive at the display's resolution and the glasses connect. Still to confirm:
-  - the screen shows up sharp and in the right proportions
-  - the Calibrate button and the `C` key both recenter, and the view turns the right way afterwards
+- **Finish testing on real glasses.** Runs with XREAL Air glasses confirmed that `--fullscreen` opens on the glasses, the screen is sharp and in the right proportions, recentering with `C` works, the screen stays in place as you turn your head, and the neck model feels natural at its default strength. Still to confirm:
   - glasses plugged in after launch are picked up
-  - `--display`, `--screen-height`, `--screen-distance` and `--fov` behave as described
-  - `--fullscreen` opens on the glasses, and the neck model feels natural at its default strength (it's on by default and was built without glasses)
+  - `--screen-height`, `--screen-distance` and `--fov` behave as described
 
 ## Next
 
+- **Distance controls.** The default screen distance doesn't suit everyone. Add keys to move the virtual screen closer or further while the app runs, instead of restarting with `--screen-distance`.
 - **Survive unplugged glasses.** Today the app waits for glasses that are missing at startup, but unplugging them mid-session quits the app: `ar-drivers` calls `exit(0)` on a USB read error. Fixing it needs `ar-drivers` to return errors from `Fusion::update()` instead of exiting, which means a change upstream in [headset-utils](https://github.com/3rl-io/headset-utils).
 - **Capture a single window** instead of a whole display, using ScreenCaptureKit's window filters.
 - **Recenter yaw only**, as an option. Recentering currently takes your full head orientation, so calibrating while tilted also tilts the scene's horizon.
-- **Show the cursor** on the virtual screen (ScreenCaptureKit can include it).
 
 ## Later
 
