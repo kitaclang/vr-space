@@ -1,0 +1,18 @@
+[workspace]
+members = [
+    "apps/headset-visualizer",
+    "capture-check",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["Kunanon Charoenpong"]
+repository = "https://github.com/kitaclang/vr-space"
+
+[workspace.dependencies]
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4.5", features = ["derive"] }

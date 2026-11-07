@@ -1,0 +1,49 @@
+[package]
+name = "headset-visualizer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Low-latency macOS-focused 3D visualization of headset pose using wgpu + winit (Metal)."
+
+[dependencies]
+# Windowing (align with wgpu 0.17.x raw-window-handle 0.5)
+winit = { version = "0.28" }
+
+# GPU (Metal on macOS via wgpu)
+# Align versions with wgpu_glyph 0.21 which depends on wgpu 0.17.x
+wgpu = { version = "0.17.2" }
+
+# Text rendering overlay pinned to wgpu 0.20-compatible release to avoid mixed wgpu versions
+# Pin to 0.21 which uses wgpu 0.17 API (StagingBelt signature)
+wgpu_glyph = "=0.21.0"
+ab_glyph = "0.2"
+
+# Math
+glam = { version = "0.27", features = ["fast-math"] }
+
+# Utilities
+bytemuck = { version = "1.16", features = ["derive"] }
+anyhow = "1.0"
+pollster = "0.3"
+
+# Time and CLI
+instant = "0.1"
+clap = { version = "4.5", features = ["derive"] }
+
+# Logging
+env_logger = "0.11"
+log = "0.4"
+
+# AR glasses drivers (MIT): 3rl-io fork of badicsalex/ar-drivers-rs, pinned to a known-good commit
+ar-drivers = { git = "https://github.com/3rl-io/headset-utils", rev = "1d14c9d529c1a3a85eb614805fca20f3b9028d0a" }
+
+# macOS-only screen capture stack (guarded with cfg(target_os = "macos"))
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = "0.3.5"
+core-graphics = "0.24"
+
+[features]
+# Default to no-vsync for lowest latency; user can override with CLI.
+default = []

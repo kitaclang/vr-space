@@ -1,0 +1,13 @@
+# Build output
+/target/
+
+# macOS
+.DS_Store
+
+# Capture output from capture-check
+*.bgra
+*.mp4
+
+# Local clones of upstream libraries (now fetched by Cargo instead)
+/headset-utils/
+/screencapturekit-rs/
