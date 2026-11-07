@@ -53,18 +53,44 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 // Stream handle kept alive while running; stored behind a Mutex in OnceLock to avoid Sync on SCStream.
 static STREAM_HANDLE: OnceLock<Mutex<Option<SCStream>>> = OnceLock::new();
 
+fn shareable_content() -> anyhow::Result<SCShareableContent> {
+    SCShareableContent::get().map_err(|e| anyhow::anyhow!(
+        "Can't list displays: {e:?}. If this is a permission error, grant Screen Recording to your \
+         terminal app in System Settings > Privacy & Security > Screen Recording, then restart it."
+    ))
+}
+
 fn find_display(display_id: u32) -> anyhow::Result<SCDisplay> {
-    // 0 means primary. For non-zero, try to match by CGDirectDisplayID.
-    let content = SCShareableContent::get()
-        .map_err(|e| anyhow::anyhow!("SCShareableContent::get failed: {e:?}"))?;
-    if display_id == 0 {
-        return content.displays().first().cloned()
-            .ok_or_else(|| anyhow::anyhow!("No displays found"));
+    // 0 means the main display (the one with the menu bar). Otherwise match by CGDirectDisplayID.
+    let content = shareable_content()?;
+    let displays = content.displays();
+    let needle: CGDirectDisplayID = if display_id == 0 { CGDisplay::main().id } else { display_id };
+    if let Some(d) = displays.iter().find(|d| d.display_id() == needle) {
+        return Ok(d.clone());
     }
-    let needle: CGDirectDisplayID = display_id as CGDirectDisplayID;
-    content.displays().into_iter()
-        .find(|d| d.display_id() == needle)
-        .ok_or_else(|| anyhow::anyhow!("Display id {} not found", display_id))
+    if display_id == 0 {
+        // Main display not in the shareable list (unexpected): fall back to the first one.
+        return displays.first().cloned().ok_or_else(|| anyhow::anyhow!("No displays found"));
+    }
+    anyhow::bail!("Display id {display_id} not found. Run with --list-displays to see the available IDs.")
+}
+
+/// A display that can be captured, as listed by `--list-displays`.
+#[derive(Clone, Copy, Debug)]
+pub struct DisplayInfo {
+    pub id: u32,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    pub is_main: bool,
+}
+
+pub fn list_displays() -> anyhow::Result<Vec<DisplayInfo>> {
+    let content = shareable_content()?;
+    let main_id = CGDisplay::main().id;
+    Ok(content.displays().iter().map(|d| {
+        let (pixel_width, pixel_height) = display_pixel_size(d);
+        DisplayInfo { id: d.display_id(), pixel_width, pixel_height, is_main: d.display_id() == main_id }
+    }).collect())
 }
 
 /// Native pixel size of a display. `SCDisplay::width/height` are in points, which is half

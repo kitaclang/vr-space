@@ -19,7 +19,7 @@ use wgpu_glyph::{Section, Text, GlyphBrushBuilder, GlyphBrush};
 
 // On macOS, pull capture helpers into scope (now using screencapturekit crate under the hood)
 #[cfg(target_os = "macos")]
-use crate::macos_capture::{take_latest_bgra, start_stream, stop_stream};
+use crate::macos_capture::{list_displays, take_latest_bgra, start_stream, stop_stream};
 
 // Headset fusion API (path dependency to headset-utils)
 use ar_drivers::any_fusion;
@@ -64,12 +64,47 @@ struct Cli {
     /// When vsync is off, target max FPS by pacing the CPU (0 = unlimited)
     #[arg(long, default_value_t = 0)]
     max_fps: u32,
+
+    /// Display to show on the virtual screen, by ID from --list-displays (0 = main display)
+    #[arg(long, default_value_t = 0)]
+    display: u32,
+
+    /// List the displays that can be captured, then exit
+    #[arg(long, default_value_t = false)]
+    list_displays: bool,
+
+    /// Height of the virtual screen in scene units (one grid square = 1 unit)
+    #[arg(long, default_value_t = 1.4)]
+    screen_height: f32,
+
+    /// Distance from your eyes to the virtual screen in scene units
+    #[arg(long, default_value_t = 4.0)]
+    screen_distance: f32,
+
+    /// Vertical field of view in degrees
+    #[arg(long, default_value_t = 60.0)]
+    fov: f32,
 }
 
-// ================= Low-latency Pose (Atomics) =================
+impl Cli {
+    fn validate(&self) -> anyhow::Result<()> {
+        if !(self.screen_height > 0.0 && self.screen_height.is_finite()) {
+            anyhow::bail!("--screen-height must be greater than 0");
+        }
+        if !(self.screen_distance > 0.0 && self.screen_distance.is_finite()) {
+            anyhow::bail!("--screen-distance must be greater than 0");
+        }
+        if !(self.fov > 1.0 && self.fov < 179.0) {
+            anyhow::bail!("--fov must be between 1 and 179 degrees");
+        }
+        Ok(())
+    }
+}
 
-#[cfg(target_os = "macos")]
-const DEFAULT_DISPLAY_ID: u32 = 0; // 0 = main display
+// Camera (eye) position in the scene. The grid floor is at y = 0.
+const CAM_POS: Vec3 = Vec3::new(0.0, 1.5, 4.0);
+
+// ================= Low-latency Pose (Atomics) =================
 
 #[inline]
 fn f32_to_u32(x: f32) -> u32 { x.to_bits() }
@@ -246,19 +281,35 @@ struct Gpu {
     // CPU-side frame buffer swapped with the capture module (no per-frame copy or allocation).
     frame_buf: Vec<u8>,
     frame_seq: u64,
+    screen: ScreenPlacement,
 }
 
-// Virtual monitor height in world units; width follows the captured screen's aspect ratio.
-const QUAD_HALF_HEIGHT: f32 = 0.7;
+/// Where the virtual screen sits: straight ahead of the eye at the calibrated "forward".
+/// Its width follows the captured screen's aspect ratio.
+#[derive(Clone, Copy, Debug)]
+struct ScreenPlacement {
+    half_height: f32,
+    center: Vec3,
+}
 
-fn quad_vertices(aspect: f32) -> [TVertex; 4] {
-    let hh = QUAD_HALF_HEIGHT;
+impl ScreenPlacement {
+    fn from_cli(cli: &Cli) -> Self {
+        Self {
+            half_height: cli.screen_height * 0.5,
+            center: CAM_POS - Vec3::Z * cli.screen_distance,
+        }
+    }
+}
+
+fn quad_vertices(screen: ScreenPlacement, aspect: f32) -> [TVertex; 4] {
+    let hh = screen.half_height;
     let hw = hh * aspect;
+    let c = screen.center;
     [
-        TVertex { pos: [-hw,  hh, 0.0], uv: [0.0, 0.0] },
-        TVertex { pos: [ hw,  hh, 0.0], uv: [1.0, 0.0] },
-        TVertex { pos: [ hw, -hh, 0.0], uv: [1.0, 1.0] },
-        TVertex { pos: [-hw, -hh, 0.0], uv: [0.0, 1.0] },
+        TVertex { pos: [c.x - hw, c.y + hh, c.z], uv: [0.0, 0.0] },
+        TVertex { pos: [c.x + hw, c.y + hh, c.z], uv: [1.0, 0.0] },
+        TVertex { pos: [c.x + hw, c.y - hh, c.z], uv: [1.0, 1.0] },
+        TVertex { pos: [c.x - hw, c.y - hh, c.z], uv: [0.0, 1.0] },
     ]
 }
 
@@ -293,7 +344,9 @@ fn create_screen_texture(
     (tex, bind_group)
 }
 
-async fn init_gpu(window: &Window, vsync: bool, vertices: &[Vertex], hud_forced_off: bool, hud_size: f32) -> anyhow::Result<Gpu> {
+async fn init_gpu(window: &Window, cli: &Cli, vertices: &[Vertex]) -> anyhow::Result<Gpu> {
+    let (vsync, hud_forced_off, hud_size) = (cli.vsync, cli.no_hud, cli.hud_size);
+    let screen = ScreenPlacement::from_cli(cli);
     let size = window.inner_size();
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -522,7 +575,7 @@ fn fs_main_q(in: VsOut) -> @location(0) vec4<f32> {
     let quad_indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
     let quad_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("quad-vb"),
-        contents: bytemuck::cast_slice(&quad_vertices(1.6)),
+        contents: bytemuck::cast_slice(&quad_vertices(screen, 1.6)),
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
     });
     let quad_ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -610,6 +663,7 @@ fn fs_main_q(in: VsOut) -> @location(0) vec4<f32> {
         quad_bind_group,
         frame_buf: Vec::new(),
         frame_seq: 0,
+        screen,
     })
 }
 
@@ -677,13 +731,12 @@ fn head_rotation_from_pose(pose: PoseCopy, invert: (bool, bool, bool)) -> Quat {
 
 // Camera view matrix for a camera orientation (already calibrated).
 fn camera_view(rotation: Quat) -> Mat4 {
-    let cam_pos = Vec3::new(0.0, 1.5, 4.0);
-    Mat4::from_rotation_translation(rotation, cam_pos).inverse()
+    Mat4::from_rotation_translation(rotation, CAM_POS).inverse()
 }
 
-fn make_proj(width: u32, height: u32) -> Mat4 {
+fn make_proj(width: u32, height: u32, fov_deg: f32) -> Mat4 {
     let aspect = (width.max(1) as f32) / (height.max(1) as f32);
-    let fovy = 60.0f32.to_radians();
+    let fovy = fov_deg.to_radians();
     let near = 0.01;
     let far = 1000.0;
     Mat4::perspective_rh(fovy, aspect, near, far)
@@ -723,6 +776,25 @@ fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
     let cli = Cli::parse();
+    cli.validate()?;
+
+    #[cfg(target_os = "macos")]
+    if cli.list_displays {
+        let displays = list_displays()?;
+        if displays.is_empty() {
+            println!("No displays found (is Screen Recording permission granted?)");
+        }
+        for d in displays {
+            println!(
+                "{:>10}  {}x{} px{}",
+                d.id, d.pixel_width, d.pixel_height,
+                if d.is_main { "  (main)" } else { "" }
+            );
+        }
+        println!("Pass an ID with --display <ID>.");
+        return Ok(());
+    }
+
     info!(
         "vsync={}, invert=({},{},{}), poll_ms={}, no_hud={}, hud_size={}, max_fps={}",
         cli.vsync, cli.invert_x, cli.invert_y, cli.invert_z, cli.poll_ms, cli.no_hud, cli.hud_size, cli.max_fps
@@ -813,12 +885,12 @@ fn main() -> anyhow::Result<()> {
     }
 
     // GPU init
-    let mut gpu = pollster::block_on(init_gpu(&window, cli.vsync, &grid_vertices, cli.no_hud, cli.hud_size))?;
+    let mut gpu = pollster::block_on(init_gpu(&window, &cli, &grid_vertices))?;
 
     // Start virtual monitor stream (macOS) via screencapturekit-rs
     #[cfg(target_os = "macos")]
     {
-        if let Err(e) = start_stream(DEFAULT_DISPLAY_ID) {
+        if let Err(e) = start_stream(cli.display) {
             warn!("virtual monitor stream failed to start: {e}. If this is a permission issue, grant Screen Recording in System Settings > Privacy & Security.");
         }
     }
@@ -841,8 +913,12 @@ fn main() -> anyhow::Result<()> {
         match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => {
                 match event {
-                    WindowEvent::CloseRequested => {
-                        // Stop ScreenCaptureKit cleanly before the process exits.
+                    WindowEvent::CloseRequested
+                    | WindowEvent::KeyboardInput {
+                        input: KeyboardInput { state: ElementState::Pressed, virtual_keycode: Some(VirtualKeyCode::Escape), .. },
+                        ..
+                    } => {
+                        // Window closed or Escape pressed: stop ScreenCaptureKit cleanly, then exit.
                         #[cfg(target_os = "macos")]
                         stop_stream();
                         *control_flow = ControlFlow::Exit;
@@ -930,7 +1006,7 @@ fn main() -> anyhow::Result<()> {
 
                 let vp = {
                     let view_m = camera_view(calib_inv * head);
-                    let proj = make_proj(gpu.config.width, gpu.config.height);
+                    let proj = make_proj(gpu.config.width, gpu.config.height, cli.fov);
                     proj * view_m
                 };
                 gpu.uniform.update(vp);
@@ -952,7 +1028,7 @@ fn main() -> anyhow::Result<()> {
                                 gpu.tex = tex;
                                 gpu.quad_bind_group = bg;
                                 gpu.tex_size = (w, h);
-                                let verts = quad_vertices(w as f32 / h as f32);
+                                let verts = quad_vertices(gpu.screen, w as f32 / h as f32);
                                 gpu.queue.write_buffer(&gpu.quad_vb, 0, bytemuck::cast_slice(&verts));
                             }
                             gpu.queue.write_texture(

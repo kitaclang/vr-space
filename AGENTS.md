@@ -72,4 +72,5 @@ The project is MIT (`LICENSE`). When adding anything:
 - Keep platform-specific code behind `cfg(target_os = "macos")`.
 - Never hard-code paths from a developer's machine (for example `/Users/...`). Use `env!("CARGO_MANIFEST_DIR")` or embed the file.
 - Keep CLI flags documented in the README's options table when you add or change one.
+- When you finish or add planned work, update [ROADMAP.md](ROADMAP.md) so it stays current.
 - Don't commit build output, `.DS_Store`, or capture files (`*.bgra`, `*.mp4`). `.gitignore` covers them.

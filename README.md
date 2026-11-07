@@ -4,7 +4,7 @@ A low-latency macOS app that turns 3DoF AR glasses into a head-tracked virtual m
 
 `headset-visualizer` reads head orientation from the glasses, captures your Mac's screen with ScreenCaptureKit, and renders it in a 3D scene with wgpu (Metal), so the screen stays fixed in space as you turn your head.
 
-> Status: experimental. Developed and tested only on macOS (Apple Silicon).
+> Status: experimental. Developed and tested only on macOS (Apple Silicon). See [ROADMAP.md](ROADMAP.md) for what's planned.
 
 ## What's in this repo
 
@@ -33,7 +33,17 @@ Run the visualizer (release build recommended for lowest latency):
 cargo run --release -p headset-visualizer
 ```
 
-Put the glasses on, look straight ahead and click **Calibrate** in the HUD (or press `C`) to set the forward direction. If the glasses aren't connected yet, plug them in: the app keeps looking for them every second.
+Put the glasses on, look straight ahead and click **Calibrate** in the HUD (or press `C`) to set the forward direction. If the glasses aren't connected yet, plug them in: the app keeps looking for them every second. Press `Esc` or close the window to quit.
+
+To show a display other than the main one, such as an external monitor or a virtual display, list the displays and pass an ID:
+
+```bash
+cargo run --release -p headset-visualizer -- --list-displays
+```
+
+```bash
+cargo run --release -p headset-visualizer -- --display <ID>
+```
 
 Options:
 
@@ -45,6 +55,11 @@ Options:
 | `--invert-x` / `--invert-y` / `--invert-z` | off | Flip roll / pitch / yaw |
 | `--no-hud` | off | Hide the text overlay |
 | `--hud-size <px>` | 16 | HUD font size |
+| `--display <id>` | 0 (main display) | Which display to show on the virtual screen |
+| `--list-displays` | | List display IDs and resolutions, then exit |
+| `--screen-height <units>` | 1.4 | Height of the virtual screen (one grid square = 1 unit) |
+| `--screen-distance <units>` | 4 | Distance from your eyes to the virtual screen |
+| `--fov <deg>` | 60 | Vertical field of view |
 
 Check screen capture on its own:
 
