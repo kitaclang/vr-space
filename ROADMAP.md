@@ -4,15 +4,16 @@ What's planned for vr-space, grouped by priority rather than dates. vr-space is 
 
 ## Now
 
-- **Test on real glasses.** The rewritten screen capture, frame upload and recentering have so far only been checked by building them. Confirm on hardware that:
+- **Finish testing on real glasses.** A first run with XREAL Air glasses confirmed that screen capture starts, frames arrive at the display's resolution and the glasses connect. Still to confirm:
   - the screen shows up sharp and in the right proportions
   - the Calibrate button and the `C` key both recenter, and the view turns the right way afterwards
   - glasses plugged in after launch are picked up
   - `--display`, `--screen-height`, `--screen-distance` and `--fov` behave as described
+  - `--fullscreen` opens on the glasses, and the neck model feels natural at its default strength (it's on by default and was built without glasses)
 
 ## Next
 
-- **Detect unplugged glasses.** Today the app only notices glasses that are missing at startup. Spotting a disconnect mid-session needs `ar-drivers` to report errors from `Fusion::update()`, which means a change upstream in [headset-utils](https://github.com/3rl-io/headset-utils).
+- **Survive unplugged glasses.** Today the app waits for glasses that are missing at startup, but unplugging them mid-session quits the app: `ar-drivers` calls `exit(0)` on a USB read error. Fixing it needs `ar-drivers` to return errors from `Fusion::update()` instead of exiting, which means a change upstream in [headset-utils](https://github.com/3rl-io/headset-utils).
 - **Capture a single window** instead of a whole display, using ScreenCaptureKit's window filters.
 - **Recenter yaw only**, as an option. Recentering currently takes your full head orientation, so calibrating while tilted also tilts the scene's horizon.
 - **Show the cursor** on the virtual screen (ScreenCaptureKit can include it).

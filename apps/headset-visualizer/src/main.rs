@@ -11,18 +11,21 @@ use glam::{Mat4, Quat, Vec3};
 use wgpu::util::DeviceExt;
 use winit::event::{ElementState, Event, KeyboardInput, MouseButton, VirtualKeyCode, WindowEvent};
 use winit::event_loop::EventLoop;
-use winit::window::Window;
+use winit::window::{Fullscreen, Window};
 
 // Text overlay
 use ab_glyph::FontArc;
-use wgpu_glyph::{Section, Text, GlyphBrushBuilder, GlyphBrush};
+use wgpu_glyph::{GlyphBrush, GlyphBrushBuilder, HorizontalAlign, Layout, Section, Text, VerticalAlign};
 
 // On macOS, pull capture helpers into scope (now using screencapturekit crate under the hood)
 #[cfg(target_os = "macos")]
-use crate::macos_capture::{list_displays, take_latest_bgra, start_stream, stop_stream};
+use crate::macos_capture::{
+    capture_status, list_displays, open_screen_recording_settings, start_stream, stop_stream, take_latest_bgra,
+    CaptureStatus,
+};
 
 // Headset fusion API (path dependency to headset-utils)
-use ar_drivers::any_fusion;
+use ar_drivers::{any_fusion, any_glasses};
 
 // macOS screen capture (virtual monitor)
 #[cfg(target_os = "macos")]
@@ -84,6 +87,16 @@ struct Cli {
     /// Vertical field of view in degrees
     #[arg(long, default_value_t = 60.0)]
     fov: f32,
+
+    /// Open fullscreen on this display, by ID from --list-displays (use the glasses' display).
+    /// 0 = main display. Press F in the app to toggle fullscreen.
+    #[arg(long, value_name = "ID")]
+    fullscreen: Option<u32>,
+
+    /// Neck model strength: moves the eyes as if the head turns around the neck
+    /// (1 = average head, 0 = off)
+    #[arg(long, default_value_t = 1.0)]
+    neck_model: f32,
 }
 
 impl Cli {
@@ -97,12 +110,21 @@ impl Cli {
         if !(self.fov > 1.0 && self.fov < 179.0) {
             anyhow::bail!("--fov must be between 1 and 179 degrees");
         }
+        if !(0.0..=3.0).contains(&self.neck_model) {
+            anyhow::bail!("--neck-model must be between 0 and 3");
+        }
         Ok(())
     }
 }
 
-// Camera (eye) position in the scene. The grid floor is at y = 0.
+// Camera (eye) position in the scene when looking straight ahead. Scene units are roughly
+// metres: the grid floor is at y = 0 and one grid square is 1 unit.
 const CAM_POS: Vec3 = Vec3::new(0.0, 1.5, 4.0);
+
+// Neck model: the eyes sit about 7.5 cm above and 8 cm in front of the point the head turns
+// around, so turning or tilting the head also moves the eyes a little. Recreating that adds
+// natural parallax, even though 3DoF glasses can't track position.
+const NECK_TO_EYES: Vec3 = Vec3::new(0.0, 0.075, -0.08);
 
 // ================= Low-latency Pose (Atomics) =================
 
@@ -261,6 +283,8 @@ struct Gpu {
     hud_font_size: f32,
     hud_padding: f32,
     calibrate_btn: Rect,
+    // "Screen Recording settings" button; only shown while capture has no permission or failed.
+    settings_btn: Option<Rect>,
     show_calibrated_toast_until_ns: u64,
 
     // HUD caching
@@ -649,6 +673,7 @@ fn fs_main_q(in: VsOut) -> @location(0) vec4<f32> {
         hud_font_size,
         hud_padding,
         calibrate_btn,
+        settings_btn: None,
         show_calibrated_toast_until_ns,
         hud_text: Vec::new(),
         hud_text_updated_ns: 0,
@@ -729,9 +754,48 @@ fn head_rotation_from_pose(pose: PoseCopy, invert: (bool, bool, bool)) -> Quat {
     q.conjugate()
 }
 
-// Camera view matrix for a camera orientation (already calibrated).
-fn camera_view(rotation: Quat) -> Mat4 {
-    Mat4::from_rotation_translation(rotation, CAM_POS).inverse()
+// Camera view matrix for a camera orientation (already calibrated). With the neck model on, the
+// eye swings around a pivot behind and below it; looking straight ahead it is exactly at CAM_POS.
+fn camera_view(rotation: Quat, neck_model: f32) -> Mat4 {
+    let eye_offset = NECK_TO_EYES * neck_model;
+    let pivot = CAM_POS - eye_offset;
+    let eye = pivot + rotation * eye_offset;
+    Mat4::from_rotation_translation(rotation, eye).inverse()
+}
+
+// Find a monitor by display ID (CGDirectDisplayID, as shown by --list-displays). 0 = main display.
+fn find_monitor(window: &Window, id: u32) -> Option<winit::monitor::MonitorHandle> {
+    if id == 0 {
+        return window.primary_monitor();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::MonitorHandleExtMacOS;
+        window.available_monitors().find(|m| m.native_id() == id)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+// HUD line describing the screen capture.
+fn screen_status_line(tex_size: (u32, u32)) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        match capture_status() {
+            CaptureStatus::Starting => "screen: starting".to_string(),
+            CaptureStatus::NoPermission => "screen: no Screen Recording permission".to_string(),
+            CaptureStatus::Failed => "screen: capture failed (see log)".to_string(),
+            CaptureStatus::WaitingForFrames => "screen: waiting for first frame".to_string(),
+            CaptureStatus::Capturing => format!("screen: capturing {}x{}", tex_size.0, tex_size.1),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = tex_size;
+        "screen: capture not supported on this platform".to_string()
+    }
 }
 
 fn make_proj(width: u32, height: u32, fov_deg: f32) -> Mat4 {
@@ -773,25 +837,38 @@ fn main() -> anyhow::Result<()> {
     // Initialize start instant for latency metrics
     START_INSTANT.get_or_init(Instant::now);
 
-    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+    // App logs at info; wgpu/naga logs at warn, since their info level logs every buffer it creates.
+    // RUST_LOG overrides this (for example RUST_LOG=debug).
+    env_logger::Builder::from_env(
+        Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn,wgpu=warn,naga=warn"),
+    )
+    .init();
 
     let cli = Cli::parse();
     cli.validate()?;
 
     #[cfg(target_os = "macos")]
     if cli.list_displays {
+        use winit::platform::macos::MonitorHandleExtMacOS;
         let displays = list_displays()?;
         if displays.is_empty() {
             println!("No displays found (is Screen Recording permission granted?)");
         }
+        // Display names (for example the glasses' model) come from the window system.
+        let event_loop = EventLoop::new();
+        let names: Vec<(u32, String)> = event_loop
+            .available_monitors()
+            .map(|m| (m.native_id(), m.name().unwrap_or_default()))
+            .collect();
         for d in displays {
+            let name = names.iter().find(|(id, _)| *id == d.id).map(|(_, n)| n.as_str()).unwrap_or("");
             println!(
-                "{:>10}  {}x{} px{}",
-                d.id, d.pixel_width, d.pixel_height,
+                "{:>10}  {:>4}x{:<4} px  {}{}",
+                d.id, d.pixel_width, d.pixel_height, name,
                 if d.is_main { "  (main)" } else { "" }
             );
         }
-        println!("Pass an ID with --display <ID>.");
+        println!("Show a display with --display <ID>; open fullscreen on the glasses with --fullscreen <ID>.");
         return Ok(());
     }
 
@@ -804,6 +881,29 @@ fn main() -> anyhow::Result<()> {
     let event_loop = EventLoop::new();
     let window = Window::new(&event_loop).expect("create window");
     window.set_title("Headset Visualizer");
+
+    // Go fullscreen on the chosen display (normally the glasses).
+    if let Some(id) = cli.fullscreen {
+        match find_monitor(&window, id) {
+            Some(monitor) => {
+                #[cfg(target_os = "macos")]
+                {
+                    use winit::platform::macos::MonitorHandleExtMacOS;
+                    let main_id = window.primary_monitor().map(|m| m.native_id());
+                    let resolve = |d: u32| if d == 0 { main_id } else { Some(d) };
+                    if resolve(id).is_some() && resolve(id) == resolve(cli.display) {
+                        warn!(
+                            "--fullscreen and --display are the same display, so the virtual screen will show \
+                             the app itself. Use --display for the screen you want to see and --fullscreen for the glasses."
+                        );
+                    }
+                }
+                info!("Fullscreen on display {id} ({})", monitor.name().unwrap_or_default());
+                window.set_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
+            }
+            None => warn!("Display {id} not found for --fullscreen; staying windowed. Run with --list-displays to see the IDs."),
+        }
+    }
     let mut window_scale_factor = window.scale_factor() as f32;
 
     // Scene vertices
@@ -843,7 +943,12 @@ fn main() -> anyhow::Result<()> {
             // running meanwhile and the HUD shows "device: not-found".
             let mut warned = false;
             let mut fusion = loop {
-                match any_fusion() {
+                // Probe with any_glasses() first: ar_drivers::any_fusion() calls
+                // any_glasses_or_fail(), which exits the whole process when no glasses are found.
+                // any_glasses() returns an error instead. Drop the probe to release the device,
+                // then let any_fusion() open it again.
+                let probe = any_glasses().map(drop);
+                match probe.and_then(|()| any_fusion()) {
                     Ok(f) => {
                         info!("Headset connected");
                         pose_ref.write(0.0, 0.0, 0.0, true, now_ns_from_start());
@@ -891,7 +996,7 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
         if let Err(e) = start_stream(cli.display) {
-            warn!("virtual monitor stream failed to start: {e}. If this is a permission issue, grant Screen Recording in System Settings > Privacy & Security.");
+            warn!("Screen capture failed to start: {e}");
         }
     }
 
@@ -944,6 +1049,10 @@ fn main() -> anyhow::Result<()> {
                         if gpu.hud_enabled && gpu.calibrate_btn.contains(cursor_px.0, cursor_px.1) {
                             calibrate_pending = true;
                         }
+                        #[cfg(target_os = "macos")]
+                        if gpu.settings_btn.is_some_and(|b| b.contains(cursor_px.0, cursor_px.1)) {
+                            open_screen_recording_settings();
+                        }
                     }
                     WindowEvent::KeyboardInput {
                         input: KeyboardInput { state: ElementState::Pressed, virtual_keycode: Some(VirtualKeyCode::C), .. },
@@ -951,6 +1060,24 @@ fn main() -> anyhow::Result<()> {
                     } => {
                         // Keyboard recenter; also works with --no-hud, where there is no button.
                         calibrate_pending = true;
+                    }
+                    WindowEvent::KeyboardInput {
+                        input: KeyboardInput { state: ElementState::Pressed, virtual_keycode: Some(VirtualKeyCode::F), .. },
+                        ..
+                    } => {
+                        // Toggle borderless fullscreen on whichever display the window is on.
+                        if window.fullscreen().is_some() {
+                            window.set_fullscreen(None);
+                        } else {
+                            window.set_fullscreen(Some(Fullscreen::Borderless(window.current_monitor())));
+                        }
+                    }
+                    #[cfg(target_os = "macos")]
+                    WindowEvent::KeyboardInput {
+                        input: KeyboardInput { state: ElementState::Pressed, virtual_keycode: Some(VirtualKeyCode::P), .. },
+                        ..
+                    } => {
+                        open_screen_recording_settings();
                     }
                     WindowEvent::CursorMoved { position, .. } => {
                         cursor_px = (position.x as f32, position.y as f32);
@@ -1005,7 +1132,7 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 let vp = {
-                    let view_m = camera_view(calib_inv * head);
+                    let view_m = camera_view(calib_inv * head, cli.neck_model);
                     let proj = make_proj(gpu.config.width, gpu.config.height, cli.fov);
                     proj * view_m
                 };
@@ -1111,6 +1238,7 @@ fn main() -> anyhow::Result<()> {
                         format!("latency: {:.2} ms", latency_ms),
                         format!("euler(rad) r={:.3} p={:.3} y={:.3}", r, p, y),
                         format!("invert=({},{},{}) vsync={}", cli.invert_x, cli.invert_y, cli.invert_z, cli.vsync),
+                        screen_status_line(gpu.tex_size),
                     ];
                     gpu.hud_text_updated_ns = now_ns;
                 }
@@ -1177,6 +1305,47 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
+                // Screen capture problems: a "Screen Recording settings" button under Calibrate,
+                // and a hint in the middle of the window (over the still-black virtual screen).
+                #[cfg(target_os = "macos")]
+                {
+                    let status = capture_status();
+                    let needs_settings = matches!(status, CaptureStatus::NoPermission | CaptureStatus::Failed);
+                    gpu.settings_btn = None;
+                    if gpu.hud_enabled && needs_settings {
+                        let label = "Screen Recording settings (P)";
+                        // Rough text width: wide enough to cover the label for click hit-testing.
+                        let w = label.len() as f32 * scale * 0.55 + 20.0 * window_scale_factor;
+                        let rect = Rect { x: (gpu.config.width as f32) - w - pad, y: btn_y + btn_h + 6.0 * window_scale_factor, w, h: btn_h };
+                        gpu.settings_btn = Some(rect);
+                        if let Some(gb) = gpu.glyph_brush.as_mut() {
+                            gb.queue(Section {
+                                screen_position: (rect.x + 10.0, rect.y + rect.h * 0.25),
+                                bounds: (gpu.config.width as f32, gpu.config.height as f32),
+                                text: vec![Text::new(label).with_color([0.4, 0.75, 1.0, 1.0]).with_scale(scale)],
+                                ..Section::default()
+                            });
+                        }
+                    }
+                    let hint: Option<&str> = match status {
+                        CaptureStatus::NoPermission => Some(
+                            "Screen Recording permission needed\n\n\
+                             Press P (or click the button at the top right) to open System Settings,\n\
+                             allow your terminal app under Screen Recording, then quit and reopen the terminal.",
+                        ),
+                        CaptureStatus::Failed => Some("Screen capture failed to start. See the terminal log for details."),
+                        _ => None,
+                    };
+                    if let (true, Some(hint), Some(gb)) = (gpu.hud_enabled, hint, gpu.glyph_brush.as_mut()) {
+                        gb.queue(Section {
+                            screen_position: (gpu.config.width as f32 * 0.5, gpu.config.height as f32 * 0.5),
+                            bounds: (gpu.config.width as f32 * 0.9, gpu.config.height as f32),
+                            text: vec![Text::new(hint).with_color([1.0, 0.85, 0.3, 1.0]).with_scale(scale * 1.1)],
+                            layout: Layout::default().h_align(HorizontalAlign::Center).v_align(VerticalAlign::Center),
+                        });
+                    }
+                }
+
                 // Draw glyphs only if HUD is enabled; this is cheap when nothing queued
                 if gpu.hud_enabled {
                     if let (Some(gb), Some(sb)) = (gpu.glyph_brush.as_mut(), gpu.staging_belt.as_mut()) {
@@ -1189,6 +1358,11 @@ fn main() -> anyhow::Result<()> {
                     sb.finish();
                 }
                 gpu.queue.submit(Some(encoder.finish()));
+                // Return the HUD's staging buffers for reuse once the GPU is done with them.
+                // Without this the belt creates a new buffer every frame and memory keeps growing.
+                if let Some(sb) = gpu.staging_belt.as_mut() {
+                    sb.recall();
+                }
                 // Present the frame (present() does not return a Result on wgpu 0.17)
                 frame.present();
             }

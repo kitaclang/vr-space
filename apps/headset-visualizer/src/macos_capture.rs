@@ -10,7 +10,7 @@
 // - The renderer's own buffer, passed to `take_latest_bgra`.
 // FRAME_SEQ lets the renderer see "nothing new" with a single atomic load and skip the upload.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, TryLockError};
 use log::{info, warn};
 
@@ -25,7 +25,58 @@ use screencapturekit::{
     },
 };
 
+use core_graphics::access::ScreenCaptureAccess;
 use core_graphics::display::{CGDirectDisplayID, CGDisplay};
+
+// ================= Screen Recording permission and capture status =================
+
+/// What the capture stream is doing, for the HUD.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureStatus {
+    /// `start_stream` hasn't finished yet.
+    Starting,
+    /// macOS hasn't granted Screen Recording to this process (in practice, to the terminal app).
+    NoPermission,
+    /// The stream failed to start for another reason; the log has details.
+    Failed,
+    /// The stream is running but no frame has arrived yet.
+    WaitingForFrames,
+    /// Frames are arriving.
+    Capturing,
+}
+
+const STATUS_STARTING: u8 = 0;
+const STATUS_NO_PERMISSION: u8 = 1;
+const STATUS_FAILED: u8 = 2;
+const STATUS_RUNNING: u8 = 3;
+static STATUS: AtomicU8 = AtomicU8::new(STATUS_STARTING);
+
+/// Current capture status. Cheap (two atomic loads), safe to call every frame.
+pub fn capture_status() -> CaptureStatus {
+    match STATUS.load(Ordering::Acquire) {
+        STATUS_NO_PERMISSION => CaptureStatus::NoPermission,
+        STATUS_FAILED => CaptureStatus::Failed,
+        STATUS_RUNNING if FRAME_SEQ.load(Ordering::Acquire) == 0 => CaptureStatus::WaitingForFrames,
+        STATUS_RUNNING => CaptureStatus::Capturing,
+        _ => CaptureStatus::Starting,
+    }
+}
+
+/// Whether macOS currently allows this process to record the screen. For a command-line app
+/// the permission belongs to the terminal it runs in, and a newly granted permission only
+/// takes effect after that terminal is restarted.
+pub fn has_screen_recording_permission() -> bool {
+    ScreenCaptureAccess.preflight()
+}
+
+/// Open System Settings at Privacy & Security > Screen Recording.
+pub fn open_screen_recording_settings() {
+    const URL: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
+    match std::process::Command::new("open").arg(URL).spawn() {
+        Ok(_) => info!("Opened System Settings > Privacy & Security > Screen Recording"),
+        Err(e) => warn!("Couldn't open System Settings: {e}"),
+    }
+}
 
 /// Size and stride of a frame returned by [`take_latest_bgra`].
 #[derive(Clone, Copy, Debug)]
@@ -188,8 +239,27 @@ pub fn start_stream(display_id: u32) -> anyhow::Result<()> {
     if STARTED.get().is_some() {
         return Ok(());
     }
+    let result = start_stream_inner(display_id);
+    let status = match &result {
+        Ok(()) => STATUS_RUNNING,
+        Err(_) if !has_screen_recording_permission() => STATUS_NO_PERMISSION,
+        Err(_) => STATUS_FAILED,
+    };
+    STATUS.store(status, Ordering::Release);
+    result
+}
 
-    // Permissions: this will implicitly trigger Screen Recording permission if missing
+fn start_stream_inner(display_id: u32) -> anyhow::Result<()> {
+    // Check Screen Recording permission first. If it's missing, ask macOS to show its prompt
+    // (it only does so once per app; after that the user has to use System Settings).
+    if !has_screen_recording_permission() {
+        ScreenCaptureAccess.request();
+        anyhow::bail!(
+            "Screen Recording permission is not granted. Allow your terminal app in System Settings > \
+             Privacy & Security > Screen Recording (press P in the app to open it), then restart the terminal."
+        );
+    }
+
     let display = find_display(display_id).map_err(|e| {
         warn!("ShareableContent/Display failed: {e}");
         e

@@ -35,15 +35,30 @@ cargo run --release -p headset-visualizer
 
 Put the glasses on, look straight ahead and click **Calibrate** in the HUD (or press `C`) to set the forward direction. If the glasses aren't connected yet, plug them in: the app keeps looking for them every second. Press `Esc` or close the window to quit.
 
-To show a display other than the main one, such as an external monitor or a virtual display, list the displays and pass an ID:
+The HUD's `screen:` line shows whether screen capture is working. If Screen Recording permission is missing, the app asks macOS for it, shows a hint over the virtual screen, and adds a **Screen Recording settings** button. Press `P` (or click the button) to open System Settings at the right page. Allow your terminal app there, then quit and reopen the terminal: macOS only applies the permission after a restart.
 
-```bash
-cargo run --release -p headset-visualizer -- --list-displays
-```
+### Using it with the glasses
 
-```bash
-cargo run --release -p headset-visualizer -- --display <ID>
-```
+The glasses show up on your Mac as an extra display. To get a virtual monitor that stays in place while you turn your head:
+
+1. In System Settings → Displays, set the glasses to **extend** your desktop, not mirror it.
+2. Find the display IDs. With the glasses plugged in, they appear as an extra display in the list:
+
+   ```bash
+   cargo run --release -p headset-visualizer -- --list-displays
+   ```
+
+3. Run the app with `--display` set to the screen you want to see and `--fullscreen` set to the glasses:
+
+   ```bash
+   cargo run --release -p headset-visualizer -- --display <screen ID> --fullscreen <glasses ID>
+   ```
+
+4. Put the glasses on, look straight ahead and press `C`.
+
+The glasses only track rotation (3DoF), not position, so leaning or moving in your seat isn't tracked. The neck model (`--neck-model`, on by default) adds the small eye movement that comes from turning your head around your neck, which makes the screen feel more solidly placed.
+
+Keys: `C` recenter, `F` toggle fullscreen, `P` open Screen Recording settings, `Esc` quit.
 
 Options:
 
@@ -60,6 +75,8 @@ Options:
 | `--screen-height <units>` | 1.4 | Height of the virtual screen (one grid square = 1 unit) |
 | `--screen-distance <units>` | 4 | Distance from your eyes to the virtual screen |
 | `--fov <deg>` | 60 | Vertical field of view |
+| `--fullscreen <id>` | off | Open fullscreen on this display (the glasses); 0 = main display |
+| `--neck-model <n>` | 1 | Neck model strength (0 = off, 1 = average head, up to 3) |
 
 Check screen capture on its own:
 

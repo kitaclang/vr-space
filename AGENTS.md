@@ -14,21 +14,21 @@ Cargo workspace with two crates:
 
 - `apps/headset-visualizer/`: the main app.
   - `src/main.rs`: CLI (`clap`), head-tracking thread, wgpu setup, scene, HUD and event loop, all in one file.
-  - `src/macos_capture.rs`: ScreenCaptureKit stream (`start_stream`, `take_latest_bgra`, `stop_stream`). Captures at the display's native pixel size and keeps only the newest frame. The capture callback and renderer hand frames over by swapping buffers (no per-frame copy or allocation), and a sequence counter lets the renderer skip the upload when nothing new arrived.
+  - `src/macos_capture.rs`: ScreenCaptureKit stream (`start_stream`, `take_latest_bgra`, `stop_stream`). Captures at the display's native pixel size and keeps only the newest frame. The capture callback and renderer hand frames over by swapping buffers (no per-frame copy or allocation), and a sequence counter lets the renderer skip the upload when nothing new arrived. It also checks Screen Recording permission (`has_screen_recording_permission`, `open_screen_recording_settings`) and exposes `capture_status()`, which the HUD reads every frame (atomics only).
   - `src/shader.wgsl`: shader for the grid scene. The textured screen quad's shader is inline in `main.rs`.
   - `assets/NotoSans-Regular.ttf`: HUD font, embedded with `include_bytes!`. Licensed SIL OFL 1.1 (`assets/OFL.txt`).
 - `capture-check/`: standalone tool that checks ScreenCaptureKit works and records raw BGRA frames (32-byte `BGR4` header, see `write_header`), with optional MP4 output through `ffmpeg`.
 
 Libraries come from Cargo, not from this repo:
 
-- `ar-drivers` (head tracking): git dependency on `github.com/3rl-io/headset-utils`, pinned to a commit `rev`. Entry point: `ar_drivers::any_fusion()`, then `fusion.update()` and `fusion.attitude_frd_rad()`.
+- `ar-drivers` (head tracking): git dependency on `github.com/3rl-io/headset-utils`, pinned to a commit `rev`. Entry point: `ar_drivers::any_fusion()`, then `fusion.update()` and `fusion.attitude_frd_rad()`. Careful: `any_fusion()` calls `std::process::exit(0)` when no glasses are found, so always probe with `ar_drivers::any_glasses()` first (it returns an error instead). A USB read error inside `update()` also exits the process; that's upstream behaviour.
 - `screencapturekit` 0.3.5 from crates.io.
 
 `headset-utils/` and `screencapturekit-rs/` may exist on disk as local clones of those upstream repos. They are git-ignored and not workspace members: don't edit them or reference them by path.
 
 ## How the visualizer works
 
-1. A reader thread calls `any_fusion()` (retrying every second until glasses are found), polls the fusion as fast as `--poll-ms` allows and publishes the raw roll/pitch/yaw into `PoseAtomic` (`f32` stored as `u32` bits in atomics), so the render loop never waits on a lock.
+1. A reader thread probes with `any_glasses()` every second until glasses are found, then calls `any_fusion()`, polls the fusion as fast as `--poll-ms` allows and publishes the raw roll/pitch/yaw into `PoseAtomic` (`f32` stored as `u32` bits in atomics), so the render loop never waits on a lock.
 2. The winit event loop reads the latest pose, turns it into a head rotation (`head_rotation_from_pose`), applies the calibration and builds the view matrix (`camera_view`). When a new captured frame is available it uploads it with `queue.write_texture`, recreating the screen texture and resizing the quad if the frame size changed. Then it draws the grid, screen quad and HUD.
 3. Calibration lives on the render thread: clicking the HUD's Calibrate button (hit-tested in physical pixels) or pressing `C` sets `calibrate_pending`, and the next frame stores the inverse of the current head rotation as a quaternion (`calib_inv`).
 4. Present mode prefers Mailbox, then Immediate, then Fifo, unless `--vsync` is passed.
