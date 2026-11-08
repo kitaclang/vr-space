@@ -75,6 +75,8 @@ The HUD shows where the time goes, as a mean with the 95th percentile and maximu
 
 These stop where the frame is handed to the GPU. The GPU's drawing time and the wait for the glasses to show the frame (up to one refresh) aren't included: wgpu 0.17 doesn't expose what would report them. To compare frame sharing with copying, run once with and once without `--copy-frames` and compare the log lines.
 
+`--predict-ms` hides some of this delay. The app estimates how fast your head is turning and draws it where it will be, the given number of milliseconds after the frame is drawn (plus the age of the head-tracking sample). Too little and the screen still trails behind when you turn; too much and it overshoots and springs back when you stop. A good starting point is `pose->submit` plus one refresh of the glasses (about 17 ms at 60 Hz). While it's on, the HUD shows how fast your head is turning.
+
 ### Using it with the glasses
 
 The glasses show up on your Mac as an extra display. To get a virtual monitor that stays in place while you turn your head:
@@ -171,6 +173,7 @@ Options:
 | `--fullscreen <id>` | off | Open fullscreen on this display (the glasses); 0 = main display |
 | `--neck-model <n>` | 1 | Neck model strength (0 = off, 1 = average head, up to 3) |
 | `--no-cursor` | off | Hide the mouse cursor on the virtual screen |
+| `--predict-ms <ms>` | 0 (off) | Predict head movement this far ahead of when a frame is drawn, so the screen doesn't trail behind when you turn your head (up to 100; try 10 to 30). See [Latency](#latency) |
 | `--copy-frames` | off | Copy each captured frame through the CPU instead of letting the GPU read it in place (slower; for comparison, or if the screen looks wrong). The HUD shows `frames=shared` or `frames=copied` |
 | `--recenter-yaw-only` | off | Recenter only left-right, so the horizon stays level even if your head is tilted |
 | `--ignore-settings` | off | Don't load or save [saved settings](#saved-settings) |

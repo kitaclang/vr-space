@@ -40,6 +40,9 @@ mod macos_capture;
 // Latency measurements for the HUD and the log
 mod latency;
 
+// Head-pose prediction (--predict-ms)
+mod prediction;
+
 // Captured frames shown in place on the GPU (IOSurface -> Metal texture)
 #[cfg(target_os = "macos")]
 mod iosurface;
@@ -166,6 +169,11 @@ struct Cli {
     #[arg(long)]
     no_cursor: bool,
 
+    /// Predict head movement this many milliseconds ahead of when a frame is drawn, to make
+    /// up for the time until it's on the glasses (0 = off; try 10 to 30)
+    #[arg(long, default_value_t = 0.0)]
+    predict_ms: f32,
+
     /// Copy each captured frame through the CPU instead of letting the GPU read it in place
     /// (slower; for comparison, or if the screen looks wrong)
     #[arg(long)]
@@ -265,6 +273,9 @@ impl Cli {
         }
         if !(0.0..=3.0).contains(&self.neck_model) {
             anyhow::bail!("--neck-model must be between 0 and 3");
+        }
+        if !(0.0..=100.0).contains(&self.predict_ms) {
+            anyhow::bail!("--predict-ms must be between 0 and 100");
         }
         Ok(())
     }
@@ -1103,6 +1114,8 @@ fn main() -> anyhow::Result<()> {
     // FPS meter
     let mut fps = FpsMeter::new();
     let mut latency_meter = latency::LatencyMeter::default();
+    let mut predictor = prediction::PosePredictor::new();
+    let predict_lead_ns = (f64::from(cli.predict_ms) * 1e6) as u64;
     let mut latency_logged_ns = 0u64;
 
     // Menu bar icon: created once the event loop runs (macOS requires that). Its menu and the
@@ -1305,8 +1318,20 @@ fn main() -> anyhow::Result<()> {
                     gpu.show_calibrated_toast_until_ns = now_ns_from_start() + 1_000_000_000;
                 }
 
+                // With --predict-ms, draw the head where it's expected to be when the frame is
+                // on the glasses. Recentering above uses the measured pose.
+                let shown_head = if predict_lead_ns == 0 {
+                    head
+                } else if has {
+                    predictor.observe(head, t_ns);
+                    predictor.predict(head, prediction::horizon_ns(t_ns, now_ns_from_start(), predict_lead_ns))
+                } else {
+                    predictor.reset();
+                    head
+                };
+
                 let vp = {
-                    let view_m = camera_view(calib_inv * head, cli.neck_model);
+                    let view_m = camera_view(calib_inv * shown_head, cli.neck_model);
                     let proj = make_proj(gpu.config.width, gpu.config.height, cli.fov);
                     proj * view_m
                 };
@@ -1361,6 +1386,13 @@ fn main() -> anyhow::Result<()> {
                         screen_line,
                         format!("distance: {:.2}  height: {:.2}", gpu.scene.screen.distance, gpu.scene.screen.height),
                     ];
+                    if predict_lead_ns > 0 {
+                        gpu.hud_text.push(format!(
+                            "predict: {:.0} ms ahead, head turning {:.0}°/s",
+                            cli.predict_ms,
+                            predictor.speed().to_degrees()
+                        ));
+                    }
                     gpu.hud_text_updated_ns = now_ns;
                 }
 
@@ -1898,8 +1930,11 @@ mod tests {
             &["--fov", "1"],
             &["--neck-model", "3.5"],
             &["--screen-height", "NaN"],
+            &["--predict-ms", "101"],
+            &["--predict-ms", "NaN"],
         ] {
             assert!(parse(args).is_err(), "accepted {args:?}");
         }
+        assert!(parse(&["--predict-ms", "20"]).is_ok());
     }
 }
