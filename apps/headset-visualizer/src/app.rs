@@ -31,6 +31,8 @@ use crate::scene::{ScreenPlacement, SCREEN_STEP};
 use crate::settings::{Settings, SettingsStore};
 use crate::tracking::{now_ns_from_start, PoseAtomic, PoseCopy};
 use crate::window_placement::{apply_fullscreen, find_monitor, monitor_id};
+#[cfg(target_os = "macos")]
+use crate::window_placement::warn_if_covering_capture;
 
 #[cfg(target_os = "macos")]
 use crate::gpu::show_captured_frame;
@@ -594,6 +596,15 @@ impl App {
         }
         if matches!(cmd, Command::Further | Command::Closer | Command::Bigger | Command::Smaller | Command::ResetScreen) {
             self.gpu.scene.write_quad(&self.gpu.queue);
+        }
+        #[cfg(target_os = "macos")]
+        if matches!(cmd, Command::ToggleFullscreen | Command::FullscreenOn(_) | Command::ShowDisplay(_)) {
+            let captured_display = match self.capture.shown {
+                CaptureSource::Display(id) => Some(id),
+                CaptureSource::Window(_) => None,
+            };
+            let main_id = self.window.primary_monitor().map(|m| monitor_id(&m));
+            warn_if_covering_capture(self.fullscreen_on, captured_display, main_id);
         }
     }
 

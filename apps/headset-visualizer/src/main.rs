@@ -200,17 +200,11 @@ fn main() -> anyhow::Result<()> {
         match find_monitor(&window, id) {
             Some(monitor) => {
                 #[cfg(target_os = "macos")]
-                {
-                    use winit::platform::macos::MonitorHandleExtMacOS;
-                    let main_id = window.primary_monitor().map(|m| m.native_id());
-                    let resolve = |d: u32| if d == 0 { main_id } else { Some(d) };
-                    if plan.window.is_none() && resolve(id).is_some() && resolve(id) == resolve(plan.display) {
-                        warn!(
-                            "--fullscreen and --display are the same display, so the virtual screen will show \
-                             the app itself. Use --display for the screen you want to see and --fullscreen for the glasses."
-                        );
-                    }
-                }
+                window_placement::warn_if_covering_capture(
+                    Some(id),
+                    plan.window.is_none().then_some(plan.display),
+                    window.primary_monitor().map(|m| monitor_id(&m)),
+                );
                 info!("Fullscreen on display {id} ({})", monitor.name().unwrap_or_default());
                 // On macOS this is applied in StartCause::Init, once the app has finished launching.
                 fullscreen_on = Some(monitor_id(&monitor));

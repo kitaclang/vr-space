@@ -105,3 +105,42 @@ pub fn set_above_menu_bar(window: &Window, on: bool) {
         let _: () = msg_send![ns_window, setCollectionBehavior: behavior];
     }
 }
+
+/// Whether going fullscreen on display `fullscreen` covers the display being captured, so the
+/// virtual screen would show the app itself. `captured_display` is `None` when a window is
+/// captured; 0 means the main display in either, `main_id` being its real ID.
+pub fn covers_captured_display(fullscreen: u32, captured_display: Option<u32>, main_id: Option<u32>) -> bool {
+    let resolve = |d: u32| if d == 0 { main_id } else { Some(d) };
+    match (resolve(fullscreen), captured_display.and_then(resolve)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Warn if fullscreen on `fullscreen` would hide the display being captured behind the app.
+pub fn warn_if_covering_capture(fullscreen: Option<u32>, captured_display: Option<u32>, main_id: Option<u32>) {
+    if fullscreen.is_some_and(|f| covers_captured_display(f, captured_display, main_id)) {
+        warn!(
+            "Fullscreen is on the display being shown, so the virtual screen shows the app itself. \
+             Show another display (--display or Show display) and go fullscreen on the glasses."
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fullscreen_on_the_captured_display_is_noticed() {
+        let main = Some(1);
+        assert!(covers_captured_display(5, Some(5), main), "same display");
+        assert!(!covers_captured_display(5, Some(1), main), "the glasses and the main display");
+        assert!(covers_captured_display(0, Some(1), main), "0 is the main display");
+        assert!(covers_captured_display(1, Some(0), main));
+        assert!(covers_captured_display(0, Some(0), main));
+        assert!(!covers_captured_display(0, Some(5), main));
+        assert!(!covers_captured_display(5, None, main), "a window is captured, not a display");
+        assert!(!covers_captured_display(0, Some(0), None), "main display unknown: don't guess");
+    }
+}
