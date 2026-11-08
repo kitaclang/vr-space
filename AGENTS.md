@@ -33,7 +33,7 @@ Libraries come from Cargo, not from this repo:
 
 1. A reader thread probes with `any_glasses()` every second until glasses are found, then calls `any_fusion()`, polls the fusion as fast as `--poll-ms` allows and publishes the raw roll/pitch/yaw into `PoseAtomic` (`f32` stored as `u32` bits in atomics), so the render loop never waits on a lock.
 2. The winit event loop reads the latest pose, turns it into a head rotation (`head_rotation_from_pose`), applies the calibration and builds the view matrix (`camera_view`). When a new captured frame is available it uploads it with `queue.write_texture`, recreating the screen texture and resizing the quad if the frame size changed. Then it draws the grid, screen quad and HUD.
-3. Calibration lives on the render thread: clicking the HUD's Calibrate button (hit-tested in physical pixels), pressing `C`, or the menu bar's Recenter or `⌃⌥C` sends `Command::Recenter`, which sets `calibrate_pending`, and the next frame stores the inverse of the current head rotation as a quaternion (`calib_inv`).
+3. Calibration lives on the render thread: clicking the HUD's Calibrate button (hit-tested in physical pixels), pressing `C`, or the menu bar's Recenter or `⌃⌥C` sends `Command::Recenter`, which sets `calibrate_pending`, and the next frame stores the inverse of the current head rotation as a quaternion (`calib_inv`), or with `--recenter-yaw-only` the inverse of just its heading (`recenter_calibration`).
 4. Present mode prefers Mailbox, then Immediate, then Fifo, unless `--vsync` is passed.
 
 When changing the hot path (pose reading, frame upload, rendering), don't add locks, allocations or blocking calls per frame.
@@ -45,6 +45,10 @@ cargo build --workspace
 ```
 
 ```bash
+cargo test --workspace
+```
+
+```bash
 cargo run --release -p headset-visualizer -- --help
 ```
 
@@ -52,7 +56,7 @@ cargo run --release -p headset-visualizer -- --help
 cargo run --release -p capture-check -- --seconds 5 --out capture.bgra
 ```
 
-There are no automated tests yet. To verify a change, at minimum build the workspace and run each binary with `--help`. Real behaviour needs AR glasses over USB and Screen Recording permission for the terminal, which an agent usually can't provide. Say so rather than claiming a change works on hardware.
+Unit tests (`#[cfg(test)]` modules at the end of `main.rs` and `macos_capture.rs`) cover what doesn't need hardware: the axis mapping, recentering, camera and neck model, screen placement, CLI validation, and the capture frame handoff (through `publish_frame`, the part of the capture callback that doesn't touch ScreenCaptureKit). To verify a change, at minimum build the workspace, run `cargo test --workspace` and run each binary with `--help`. Add or update tests when you change those parts. Real behaviour needs AR glasses over USB and Screen Recording permission for the terminal, which an agent usually can't provide. Say so rather than claiming a change works on hardware.
 
 The workspace crates build with no warnings. Cargo still prints a future-incompatibility note for the `block` dependency, which comes from upstream. Don't introduce new warnings.
 

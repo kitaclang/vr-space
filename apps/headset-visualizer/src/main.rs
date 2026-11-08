@@ -1640,3 +1640,236 @@ fn main() -> anyhow::Result<()> {
     // Unreachable with winit 0.28 run loop, but return Ok for signature completeness.
     // Ok(())
 }
+// ================= Tests =================
+// These cover the parts that don't need glasses or a display: the head-rotation maths, screen
+// placement and CLI checks. Run them with `cargo test --workspace`.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EPS: f32 = 1e-4;
+
+    fn assert_vec_eq(a: Vec3, b: Vec3) {
+        assert!(a.abs_diff_eq(b, EPS), "{a:?} != {b:?}");
+    }
+
+    fn assert_rot_eq(a: Quat, b: Quat) {
+        // q and -q are the same rotation.
+        assert!(a.abs_diff_eq(b, EPS) || a.abs_diff_eq(-b, EPS), "{a:?} != {b:?}");
+    }
+
+    fn pose(roll: f32, pitch: f32, yaw: f32) -> Quat {
+        head_rotation_from_pose(PoseCopy { roll, pitch, yaw }, (false, false, false))
+    }
+
+    /// A head turned by `yaw`, then tilted up by `pitch`, then rolled by `roll` (radians).
+    fn head(yaw: f32, pitch: f32, roll: f32) -> Quat {
+        Quat::from_rotation_y(yaw) * Quat::from_rotation_x(pitch) * Quat::from_rotation_z(roll)
+    }
+
+    // --- Axis mapping. The signs pin the behaviour confirmed on XREAL Air glasses. ---
+
+    #[test]
+    fn zero_pose_looks_straight_ahead() {
+        assert_rot_eq(pose(0.0, 0.0, 0.0), Quat::IDENTITY);
+    }
+
+    #[test]
+    fn pose_yaw_turns_around_the_vertical_axis() {
+        let q = pose(0.0, 0.0, 0.5);
+        assert_vec_eq(q * Vec3::Y, Vec3::Y);
+        assert_vec_eq(q * Vec3::NEG_Z, Vec3::new(0.5f32.sin(), 0.0, -0.5f32.cos()));
+    }
+
+    #[test]
+    fn pose_pitch_looks_up_and_down() {
+        let q = pose(0.0, 0.5, 0.0);
+        assert_vec_eq(q * Vec3::X, Vec3::X);
+        assert_vec_eq(q * Vec3::NEG_Z, Vec3::new(0.0, 0.5f32.sin(), -0.5f32.cos()));
+    }
+
+    #[test]
+    fn pose_roll_tilts_around_the_view_direction() {
+        let q = pose(0.5, 0.0, 0.0);
+        assert_vec_eq(q * Vec3::NEG_Z, Vec3::NEG_Z);
+        assert_vec_eq(q * Vec3::Y, Vec3::new(0.5f32.sin(), 0.5f32.cos(), 0.0));
+    }
+
+    #[test]
+    fn invert_flags_reverse_each_axis() {
+        let p = PoseCopy { roll: 0.3, pitch: 0.2, yaw: 0.1 };
+        let flipped = PoseCopy { roll: -0.3, pitch: -0.2, yaw: -0.1 };
+        assert_rot_eq(
+            head_rotation_from_pose(p, (true, true, true)),
+            head_rotation_from_pose(flipped, (false, false, false)),
+        );
+        // Each flag on its own changes exactly one axis.
+        for (flags, expect) in [
+            ((true, false, false), PoseCopy { pitch: -0.2, ..p }),
+            ((false, true, false), PoseCopy { yaw: -0.1, ..p }),
+            ((false, false, true), PoseCopy { roll: -0.3, ..p }),
+        ] {
+            assert_rot_eq(head_rotation_from_pose(p, flags), head_rotation_from_pose(expect, (false, false, false)));
+        }
+    }
+
+    // --- Recentering ---
+
+    #[test]
+    fn full_recenter_cancels_the_head_rotation() {
+        for h in [head(0.0, 0.0, 0.0), head(1.0, 0.3, -0.2), head(-2.9, -0.8, 0.6), head(3.1, 0.0, 0.0)] {
+            assert_rot_eq(recenter_calibration(h, false) * h, Quat::IDENTITY);
+        }
+    }
+
+    #[test]
+    fn yaw_only_recenter_without_tilt_matches_full_recenter() {
+        for yaw in [-3.0, -1.0, 0.0, 0.7, 2.5] {
+            let h = head(yaw, 0.0, 0.0);
+            assert_rot_eq(recenter_calibration(h, true), recenter_calibration(h, false));
+        }
+    }
+
+    #[test]
+    fn yaw_only_recenter_keeps_tilt_and_horizon() {
+        for (yaw, pitch, roll) in [(1.0, 0.4, 0.0), (-2.0, -0.6, 0.3), (3.0, 0.2, -0.5), (0.0, 1.2, 0.0)] {
+            let calib = recenter_calibration(head(yaw, pitch, roll), true);
+            // The correction only turns around the vertical axis, so the horizon stays level...
+            assert_vec_eq(calib * Vec3::Y, Vec3::Y);
+            // ...and what's left after recentering is exactly the tilt.
+            assert_rot_eq(calib * head(yaw, pitch, roll), head(0.0, pitch, roll));
+        }
+    }
+
+    #[test]
+    fn yaw_only_recenter_works_looking_straight_up_or_down() {
+        let half_pi = std::f32::consts::FRAC_PI_2;
+        for yaw in [-2.0, 0.0, 1.0] {
+            for pitch in [-half_pi, half_pi] {
+                let calib = recenter_calibration(head(yaw, pitch, 0.0), true);
+                assert_rot_eq(calib, Quat::from_rotation_y(-yaw));
+            }
+        }
+    }
+
+    // --- Camera ---
+
+    #[test]
+    fn camera_looking_ahead_is_at_cam_pos() {
+        for neck in [0.0, 1.0, 3.0] {
+            let eye = camera_view(Quat::IDENTITY, neck).inverse().transform_point3(Vec3::ZERO);
+            assert_vec_eq(eye, CAM_POS);
+        }
+    }
+
+    #[test]
+    fn neck_model_off_keeps_the_eye_still() {
+        let eye = camera_view(head(1.0, 0.5, 0.2), 0.0).inverse().transform_point3(Vec3::ZERO);
+        assert_vec_eq(eye, CAM_POS);
+    }
+
+    #[test]
+    fn neck_model_moves_the_eye_when_turning() {
+        let eye = camera_view(head(1.0, 0.0, 0.0), 1.0).inverse().transform_point3(Vec3::ZERO);
+        assert!(eye.distance(CAM_POS) > 0.01);
+        // The eye swings around the neck, so it stays at the same height when only turning.
+        assert!((eye.y - CAM_POS.y).abs() < EPS);
+    }
+
+    #[test]
+    fn screen_centre_is_straight_ahead_in_view_space() {
+        let screen = ScreenPlacement { height: 1.4, distance: 4.0 };
+        let centre = CAM_POS - Vec3::Z * screen.distance;
+        let v = camera_view(Quat::IDENTITY, 1.0).transform_point3(centre);
+        assert_vec_eq(v, Vec3::new(0.0, 0.0, -4.0));
+    }
+
+    #[test]
+    fn projection_handles_a_zero_sized_window() {
+        let m = make_proj(0, 0, 60.0);
+        assert!(m.to_cols_array().iter().all(|x| x.is_finite()));
+    }
+
+    // --- Screen placement ---
+
+    #[test]
+    fn screen_quad_has_the_right_size_and_place() {
+        let screen = ScreenPlacement { height: 2.0, distance: 3.0 };
+        let v = quad_vertices(screen, 16.0 / 9.0);
+        let width = v[1].pos[0] - v[0].pos[0];
+        let height = v[0].pos[1] - v[3].pos[1];
+        assert!((width - 2.0 * 16.0 / 9.0).abs() < EPS);
+        assert!((height - 2.0).abs() < EPS);
+        for t in &v {
+            assert!((t.pos[2] - (CAM_POS.z - 3.0)).abs() < EPS);
+        }
+        // Top-left of the image is at the top-left corner (the texture isn't flipped).
+        assert_eq!(v[0].uv, [0.0, 0.0]);
+        assert!(v[0].pos[0] < v[1].pos[0] && v[0].pos[1] > v[3].pos[1]);
+    }
+
+    #[test]
+    fn screen_keys_stay_within_their_ranges() {
+        let mut s = ScreenPlacement { height: 1.0, distance: 1.0 };
+        for _ in 0..200 {
+            s.scale_distance(SCREEN_STEP);
+            s.scale_height(SCREEN_STEP);
+        }
+        assert_eq!(s.distance, SCREEN_DISTANCE_RANGE.1);
+        assert_eq!(s.height, SCREEN_HEIGHT_RANGE.1);
+        for _ in 0..200 {
+            s.scale_distance(1.0 / SCREEN_STEP);
+            s.scale_height(1.0 / SCREEN_STEP);
+        }
+        assert_eq!(s.distance, SCREEN_DISTANCE_RANGE.0);
+        assert_eq!(s.height, SCREEN_HEIGHT_RANGE.0);
+    }
+
+    #[test]
+    fn screen_keys_dont_snap_a_flag_value_outside_the_range() {
+        // A distance set by flag beyond the keys' range isn't pulled in by a key press...
+        let mut s = ScreenPlacement { height: 1.0, distance: 100.0 };
+        s.scale_distance(SCREEN_STEP);
+        assert_eq!(s.distance, 100.0);
+        // ...but can still be moved back towards it.
+        s.scale_distance(1.0 / SCREEN_STEP);
+        assert!(s.distance < 100.0);
+    }
+
+    // --- Pose handoff and CLI ---
+
+    #[test]
+    fn pose_atomic_round_trips() {
+        let p = PoseAtomic::new();
+        assert_eq!(p.read(), (0.0, 0.0, 0.0, false, 0));
+        p.write(0.1, -0.2, 3.0, true, 42);
+        assert_eq!(p.read(), (0.1, -0.2, 3.0, true, 42));
+    }
+
+    fn parse(args: &[&str]) -> anyhow::Result<Cli> {
+        let cli = Cli::try_parse_from(std::iter::once("headset-visualizer").chain(args.iter().copied()))?;
+        cli.validate()?;
+        Ok(cli)
+    }
+
+    #[test]
+    fn default_flags_are_valid() {
+        let cli = parse(&[]).unwrap();
+        assert!(!cli.recenter_yaw_only);
+    }
+
+    #[test]
+    fn bad_flag_values_are_rejected() {
+        for args in [
+            &["--screen-height", "0"][..],
+            &["--screen-distance", "-1"],
+            &["--fov", "180"],
+            &["--fov", "1"],
+            &["--neck-model", "3.5"],
+            &["--screen-height", "NaN"],
+        ] {
+            assert!(parse(args).is_err(), "accepted {args:?}");
+        }
+    }
+}

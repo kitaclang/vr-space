@@ -204,33 +204,35 @@ impl screencapturekit::stream::output_trait::SCStreamOutputTrait for ScreenOutpu
             return;
         }
 
-        // Copy into the back buffer outside the READY lock. `clear` + `extend_from_slice`
-        // reuses the existing allocation once the buffers have reached frame size.
-        let mut back = BACK.lock().unwrap_or_else(|e| e.into_inner());
-        {
-            let guard = match pixel_buffer.lock() {
-                Ok(g) => g,
-                Err(e) => {
-                    log_limited(&NO_PIXELS, || warn!("CVPixelBuffer lock failed: {:?}", e));
-                    return;
-                }
-            };
-            back.clear();
-            back.extend_from_slice(guard.as_slice());
-        }
-
-        // Publish: O(1) swap under the lock.
-        {
-            let mut ready = READY.lock().unwrap_or_else(|e| e.into_inner());
-            std::mem::swap(&mut ready.bytes, &mut *back);
-            ready.width = width;
-            ready.height = height;
-            ready.stride = stride;
-            FRAME_SEQ.fetch_add(1, Ordering::Release);
-        }
+        let guard = match pixel_buffer.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                log_limited(&NO_PIXELS, || warn!("CVPixelBuffer lock failed: {:?}", e));
+                return;
+            }
+        };
+        publish_frame(guard.as_slice(), width, height, stride);
+        drop(guard);
 
         log_limited(&FRAMES, || info!("Captured BGRA frame: {}x{} stride={}", width, height, stride));
     }
+}
+
+/// Make `pixels` the newest frame: copy it into BACK outside the READY lock, then swap BACK
+/// into READY. `clear` + `extend_from_slice` reuses the existing allocation once the buffers
+/// have reached frame size, so steady-state capture doesn't allocate.
+fn publish_frame(pixels: &[u8], width: u32, height: u32, stride: u32) {
+    let mut back = BACK.lock().unwrap_or_else(|e| e.into_inner());
+    back.clear();
+    back.extend_from_slice(pixels);
+
+    // Publish: O(1) swap under the lock.
+    let mut ready = READY.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::swap(&mut ready.bytes, &mut *back);
+    ready.width = width;
+    ready.height = height;
+    ready.stride = stride;
+    FRAME_SEQ.fetch_add(1, Ordering::Release);
 }
 
 // Start capture stream
@@ -349,5 +351,47 @@ pub fn stop_stream() {
             }
         }
         info!("Screen capture stream stopped.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // One test, because the handoff state is global and tests run in parallel.
+    #[test]
+    fn frame_handoff_swaps_newest_frame_without_copies() {
+        let mut buf = Vec::new();
+        let mut seq = FRAME_SEQ.load(Ordering::Acquire);
+
+        // Nothing new yet.
+        assert!(take_latest_bgra(&mut buf, &mut seq).is_none());
+
+        // Only the newest of two frames is handed over.
+        publish_frame(&[1; 16], 2, 2, 8);
+        publish_frame(&[2; 32], 2, 4, 8);
+        let info = take_latest_bgra(&mut buf, &mut seq).expect("a new frame");
+        assert_eq!((info.width, info.height, info.bytes_per_row), (2, 4, 8));
+        assert_eq!(buf, vec![2; 32]);
+
+        // The same frame isn't handed over twice.
+        assert!(take_latest_bgra(&mut buf, &mut seq).is_none());
+
+        // Once the buffers have reached frame size, publishing and taking reuse them.
+        publish_frame(&[3; 32], 2, 4, 8);
+        let ptr_before = buf.as_ptr();
+        take_latest_bgra(&mut buf, &mut seq).expect("a new frame");
+        publish_frame(&[4; 32], 2, 4, 8);
+        take_latest_bgra(&mut buf, &mut seq).expect("a new frame");
+        publish_frame(&[5; 32], 2, 4, 8);
+        take_latest_bgra(&mut buf, &mut seq).expect("a new frame");
+        assert_eq!(buf, vec![5; 32]);
+        // Three buffers rotate, so after three handoffs the renderer has its first one back.
+        assert_eq!(buf.as_ptr(), ptr_before);
+
+        // An empty frame isn't handed over, but its sequence number is consumed.
+        publish_frame(&[], 0, 0, 0);
+        assert!(take_latest_bgra(&mut buf, &mut seq).is_none());
+        assert!(take_latest_bgra(&mut buf, &mut seq).is_none());
     }
 }

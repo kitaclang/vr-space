@@ -17,7 +17,7 @@ What's planned for vr-space, grouped by priority rather than dates. vr-space is 
 
 ## Later
 
-- **Automated tests** for the parts that don't need hardware: the calibration maths, the axis mapping and the capture frame handoff.
+- **More automated tests**, for example running the renderer on a headless GPU to check what it draws.
 - **Reduce latency further.** Upload frames straight from the capture's IOSurface instead of copying them through the CPU, and measure real motion-to-photon latency rather than the age of the last sample.
 - **Curved or multiple virtual screens.**
 - **Settings saved between runs** (screen size and distance as set with the keys, display) instead of passing flags each time.
