@@ -4,20 +4,23 @@
 // Captures BGRA frames from the selected display or window and hands the newest one to the
 // renderer.
 //
-// Frame handoff uses three rotating buffers so neither side allocates or holds a lock for long:
-// - BACK: written by the capture callback (only that thread touches it).
-// - READY: the newest complete frame. The capture callback swaps BACK into it; the renderer
-//   swaps its own buffer out of it. Both swaps are O(1), so the lock is held only briefly.
-// - The renderer's own buffer, passed to `take_latest_bgra`.
-// FRAME_SEQ lets the renderer see "nothing new" with a single atomic load and skip the upload.
+// Frames aren't copied here: the capture callback keeps a reference to the frame's pixel
+// buffer (an IOSurface the GPU can read in place, see `iosurface.rs`) and publishes it in
+// LATEST, replacing any frame the renderer hasn't taken. The renderer takes it with
+// `take_latest_frame`. Both sides only move a pointer under the lock, and its sequence counter
+// lets the renderer see "nothing new" with a single atomic load.
+//
+// Every frame the app holds keeps ScreenCaptureKit from reusing that surface, so the stream's
+// queue depth (QUEUE_DEPTH) leaves room for the ones the renderer keeps while the GPU draws.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, TryLockError};
+use core_foundation::base::TCFType;
 use std::time::Duration;
 use log::{info, warn};
 
 use screencapturekit::{
-    output::{CMSampleBuffer, LockTrait},
+    output::{CMSampleBuffer, CVPixelBuffer, LockTrait},
     shareable_content::{SCDisplay, SCShareableContent, SCWindow},
     stream::{
         configuration::{pixel_format::PixelFormat, SCStreamConfiguration},
@@ -59,7 +62,7 @@ pub fn capture_status() -> CaptureStatus {
     match STATUS.load(Ordering::Acquire) {
         STATUS_NO_PERMISSION => CaptureStatus::NoPermission,
         STATUS_FAILED => CaptureStatus::Failed,
-        STATUS_RUNNING if FRAME_SEQ.load(Ordering::Acquire) == 0 => CaptureStatus::WaitingForFrames,
+        STATUS_RUNNING if LATEST.seq() == 0 => CaptureStatus::WaitingForFrames,
         STATUS_RUNNING => CaptureStatus::Capturing,
         _ => CaptureStatus::Starting,
     }
@@ -81,25 +84,90 @@ pub fn open_screen_recording_settings() {
     }
 }
 
-/// Size and stride of a frame returned by [`take_latest_bgra`].
-#[derive(Clone, Copy, Debug)]
-pub struct FrameInfo {
+/// A captured BGRA frame. Holding it keeps its pixels (and its IOSurface) unchanged:
+/// ScreenCaptureKit only reuses the memory once every reference is dropped.
+pub struct CapturedFrame {
+    buffer: CVPixelBuffer,
     pub width: u32,
     pub height: u32,
     pub bytes_per_row: u32,
 }
 
-struct ReadyFrame {
-    bytes: Vec<u8>,
-    width: u32,
-    height: u32,
-    stride: u32,
+// SAFETY: a CVPixelBuffer is a reference-counted CoreFoundation object, safe to retain and
+// release from any thread. Its pixels are only read: in place by the GPU, or after a
+// read-only lock.
+unsafe impl Send for CapturedFrame {}
+
+impl CapturedFrame {
+    /// The IOSurface holding the pixels, valid while `self` is.
+    pub fn iosurface(&self) -> Option<crate::iosurface::IOSurfaceRef> {
+        // SAFETY: `self.buffer` is a live CVPixelBuffer.
+        unsafe { crate::iosurface::surface_of_pixel_buffer(self.buffer.as_CFTypeRef()) }
+    }
+
+    /// Run `f` on the pixels, rows `bytes_per_row` apart. `None` if they can't be read.
+    pub fn with_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        static FAILED: AtomicUsize = AtomicUsize::new(0);
+        match self.buffer.lock() {
+            Ok(guard) => Some(f(guard.as_slice())),
+            Err(e) => {
+                log_limited(&FAILED, || warn!("CVPixelBuffer lock failed: {:?}", e));
+                None
+            }
+        }
+    }
 }
 
-static READY: Mutex<ReadyFrame> = Mutex::new(ReadyFrame { bytes: Vec::new(), width: 0, height: 0, stride: 0 });
-static BACK: Mutex<Vec<u8>> = Mutex::new(Vec::new());
-// Incremented (while holding READY) each time a new frame is published. 0 = no frame yet.
-static FRAME_SEQ: AtomicU64 = AtomicU64::new(0);
+/// The newest value published, and a count of how many have been.
+struct Latest<T> {
+    slot: Mutex<Option<T>>,
+    // Incremented (while holding `slot`) on every publish. 0 = nothing yet.
+    seq: AtomicU64,
+}
+
+impl<T> Latest<T> {
+    const fn new() -> Self {
+        Self { slot: Mutex::new(None), seq: AtomicU64::new(0) }
+    }
+
+    fn seq(&self) -> u64 {
+        self.seq.load(Ordering::Acquire)
+    }
+
+    /// Make `value` the newest, dropping one that wasn't taken (outside the lock).
+    fn publish(&self, value: T) {
+        let replaced = {
+            let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+            let replaced = slot.replace(value);
+            self.seq.fetch_add(1, Ordering::Release);
+            replaced
+        };
+        drop(replaced);
+    }
+
+    /// Take the newest value if one was published since `last_seq`, updating it. Never
+    /// blocks: if the other side holds the lock at that instant, try again next time.
+    fn take(&self, last_seq: &mut u64) -> Option<T> {
+        if self.seq() == *last_seq {
+            return None;
+        }
+        let mut slot = match self.slot.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        // Read the sequence under the lock so it matches the value taken.
+        *last_seq = self.seq();
+        slot.take()
+    }
+}
+
+static LATEST: Latest<CapturedFrame> = Latest::new();
+
+/// Frames ScreenCaptureKit may have waiting for the app. The default, 3, would stall the
+/// stream: the app can hold one waiting here plus the few the renderer keeps until the GPU
+/// is done with them (see `main.rs`). 8 is the most ScreenCaptureKit allows.
+const QUEUE_DEPTH: u32 = 6;
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -465,35 +533,11 @@ impl screencapturekit::stream::output_trait::SCStreamOutputTrait for ScreenOutpu
             return;
         }
 
-        let guard = match pixel_buffer.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                log_limited(&NO_PIXELS, || warn!("CVPixelBuffer lock failed: {:?}", e));
-                return;
-            }
-        };
-        publish_frame(guard.as_slice(), width, height, stride);
-        drop(guard);
+        // Keep the pixel buffer (a retain, not a copy) and hand it over.
+        LATEST.publish(CapturedFrame { buffer: pixel_buffer, width, height, bytes_per_row: stride });
 
         log_limited(&FRAMES, || info!("Captured BGRA frame: {}x{} stride={}", width, height, stride));
     }
-}
-
-/// Make `pixels` the newest frame: copy it into BACK outside the READY lock, then swap BACK
-/// into READY. `clear` + `extend_from_slice` reuses the existing allocation once the buffers
-/// have reached frame size, so steady-state capture doesn't allocate.
-fn publish_frame(pixels: &[u8], width: u32, height: u32, stride: u32) {
-    let mut back = BACK.lock().unwrap_or_else(|e| e.into_inner());
-    back.clear();
-    back.extend_from_slice(pixels);
-
-    // Publish: O(1) swap under the lock.
-    let mut ready = READY.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::swap(&mut ready.bytes, &mut *back);
-    ready.width = width;
-    ready.height = height;
-    ready.stride = stride;
-    FRAME_SEQ.fetch_add(1, Ordering::Release);
 }
 
 /// Start capturing a display or window.
@@ -566,7 +610,9 @@ fn start_stream_inner(source: CaptureSource, show_cursor: bool) -> anyhow::Resul
         .set_captures_audio(false)
         .map_err(|_| anyhow::anyhow!("set_captures_audio failed"))?
         .set_shows_cursor(show_cursor)
-        .map_err(|_| anyhow::anyhow!("set_shows_cursor failed"))?;
+        .map_err(|_| anyhow::anyhow!("set_shows_cursor failed"))?
+        .set_queue_depth(QUEUE_DEPTH)
+        .map_err(|_| anyhow::anyhow!("set_queue_depth failed"))?;
 
     let mut stream = SCStream::new(&filter, &cfg);
     let _handler_id = stream.add_output_handler(ScreenOutput, SCStreamOutputType::Screen);
@@ -598,27 +644,12 @@ pub fn resolve_display_id(display_id: u32) -> u32 {
     if display_id == 0 { CGDisplay::main().id } else { display_id }
 }
 
-/// Take the newest captured frame if one arrived since `last_seq`.
+/// Take the newest captured frame if one arrived since `last_seq`, updating it.
 ///
-/// Swaps the frame into `buf` (no copy, no allocation) and updates `last_seq`. Returns `None`
-/// without locking when there is no new frame, and never blocks: if the capture thread is
-/// publishing at that instant, the frame is picked up on the next call instead.
-pub fn take_latest_bgra(buf: &mut Vec<u8>, last_seq: &mut u64) -> Option<FrameInfo> {
-    if FRAME_SEQ.load(Ordering::Acquire) == *last_seq {
-        return None;
-    }
-    let mut ready = match READY.try_lock() {
-        Ok(g) => g,
-        Err(TryLockError::Poisoned(p)) => p.into_inner(),
-        Err(TryLockError::WouldBlock) => return None,
-    };
-    // Read the sequence under the lock so it matches the frame we take.
-    *last_seq = FRAME_SEQ.load(Ordering::Acquire);
-    if ready.width == 0 || ready.height == 0 || ready.bytes.is_empty() {
-        return None;
-    }
-    std::mem::swap(&mut ready.bytes, buf);
-    Some(FrameInfo { width: ready.width, height: ready.height, bytes_per_row: ready.stride })
+/// Returns `None` without locking when there is no new frame, and never blocks: if the
+/// capture thread is publishing at that instant, the frame is picked up on the next call.
+pub fn take_latest_frame(last_seq: &mut u64) -> Option<CapturedFrame> {
+    LATEST.take(last_seq)
 }
 
 // Stop stream (optional)
@@ -689,40 +720,36 @@ mod tests {
         assert_eq!(scale_at((0.0, 0.0), &[]), 1.0);
     }
 
-    // One test, because the handoff state is global and tests run in parallel.
     #[test]
-    fn frame_handoff_swaps_newest_frame_without_copies() {
-        let mut buf = Vec::new();
-        let mut seq = FRAME_SEQ.load(Ordering::Acquire);
+    fn the_renderer_gets_only_the_newest_frame() {
+        let latest: Latest<u32> = Latest::new();
+        let mut seq = 0;
+        assert_eq!(latest.take(&mut seq), None, "nothing published yet");
 
-        // Nothing new yet.
-        assert!(take_latest_bgra(&mut buf, &mut seq).is_none());
+        latest.publish(1);
+        latest.publish(2);
+        assert_eq!(latest.take(&mut seq), Some(2), "only the newest of two");
+        assert_eq!(seq, 2);
+        assert_eq!(latest.take(&mut seq), None, "not handed over twice");
 
-        // Only the newest of two frames is handed over.
-        publish_frame(&[1; 16], 2, 2, 8);
-        publish_frame(&[2; 32], 2, 4, 8);
-        let info = take_latest_bgra(&mut buf, &mut seq).expect("a new frame");
-        assert_eq!((info.width, info.height, info.bytes_per_row), (2, 4, 8));
-        assert_eq!(buf, vec![2; 32]);
+        latest.publish(3);
+        assert_eq!(latest.take(&mut seq), Some(3));
+    }
 
-        // The same frame isn't handed over twice.
-        assert!(take_latest_bgra(&mut buf, &mut seq).is_none());
-
-        // Once the buffers have reached frame size, publishing and taking reuse them.
-        publish_frame(&[3; 32], 2, 4, 8);
-        let ptr_before = buf.as_ptr();
-        take_latest_bgra(&mut buf, &mut seq).expect("a new frame");
-        publish_frame(&[4; 32], 2, 4, 8);
-        take_latest_bgra(&mut buf, &mut seq).expect("a new frame");
-        publish_frame(&[5; 32], 2, 4, 8);
-        take_latest_bgra(&mut buf, &mut seq).expect("a new frame");
-        assert_eq!(buf, vec![5; 32]);
-        // Three buffers rotate, so after three handoffs the renderer has its first one back.
-        assert_eq!(buf.as_ptr(), ptr_before);
-
-        // An empty frame isn't handed over, but its sequence number is consumed.
-        publish_frame(&[], 0, 0, 0);
-        assert!(take_latest_bgra(&mut buf, &mut seq).is_none());
-        assert!(take_latest_bgra(&mut buf, &mut seq).is_none());
+    #[test]
+    fn frames_that_are_replaced_or_taken_are_not_kept() {
+        use std::sync::Arc;
+        // Each frame holds the capture's surface until dropped, so the handoff must not keep
+        // a replaced frame or a copy of a taken one.
+        let latest: Latest<Arc<()>> = Latest::new();
+        let (first, second) = (Arc::new(()), Arc::new(()));
+        latest.publish(first.clone());
+        latest.publish(second.clone());
+        assert_eq!(Arc::strong_count(&first), 1, "a replaced frame is released");
+        let mut seq = 0;
+        let taken = latest.take(&mut seq).expect("a frame");
+        assert!(Arc::ptr_eq(&taken, &second));
+        drop(taken);
+        assert_eq!(Arc::strong_count(&second), 1, "the handoff keeps nothing it handed over");
     }
 }

@@ -24,8 +24,8 @@ use wgpu_glyph::{GlyphBrush, GlyphBrushBuilder, HorizontalAlign, Layout, Section
 #[cfg(target_os = "macos")]
 use crate::macos_capture::{
     capture_status, find_window, list_displays, list_windows, match_saved_window, window_info, open_screen_recording_settings, resolve_display_id,
-    start_stream, start_window_watcher, stop_stream, switch_source, take_latest_bgra, take_window_event,
-    CaptureSource, CaptureStatus, CapturedWindowEvent,
+    start_stream, start_window_watcher, stop_stream, switch_source, take_latest_frame, take_window_event,
+    CaptureSource, CaptureStatus, CapturedFrame, CapturedWindowEvent,
 };
 #[cfg(target_os = "macos")]
 use crate::menu_bar::MenuBar;
@@ -36,6 +36,10 @@ use ar_drivers::{any_fusion, any_glasses};
 // macOS screen capture (virtual monitor)
 #[cfg(target_os = "macos")]
 mod macos_capture;
+
+// Captured frames shown in place on the GPU (IOSurface -> Metal texture)
+#[cfg(target_os = "macos")]
+mod iosurface;
 
 // Menu bar icon and shortcuts that work from any app
 #[cfg(target_os = "macos")]
@@ -158,6 +162,11 @@ struct Cli {
     /// Hide the mouse cursor on the virtual screen
     #[arg(long)]
     no_cursor: bool,
+
+    /// Copy each captured frame through the CPU instead of letting the GPU read it in place
+    /// (slower; for comparison, or if the screen looks wrong)
+    #[arg(long)]
+    copy_frames: bool,
 
     /// Recenter only the left-right direction (yaw), keeping the horizon level even if
     /// your head is tilted when you recenter
@@ -370,9 +379,15 @@ struct Gpu {
     hud_text: Vec<String>,
     hud_text_updated_ns: u64,
 
-    // CPU-side frame buffer swapped with the capture module (no per-frame copy or allocation).
-    frame_buf: Vec<u8>,
+    // Captured frames: the last one taken, whether the GPU reads them in place (else they're
+    // copied), and the newest few shown that way. Each holds its IOSurface, so the capture
+    // can't write into it while the GPU may still be drawing it: the CPU runs at most a
+    // couple of frames ahead of the GPU (Metal hands out three drawables), so keeping the
+    // current frame and the two before it is enough.
     frame_seq: u64,
+    zero_copy: bool,
+    #[cfg(target_os = "macos")]
+    shown_frames: [Option<CapturedFrame>; 3],
 }
 
 /// Where the virtual screen sits: straight ahead of the eye at the calibrated "forward".
@@ -509,6 +524,12 @@ async fn init_gpu(window: &Window, cli: &Cli, vertices: &[Vertex]) -> anyhow::Re
         (None, None, false)
     };
 
+    #[cfg(target_os = "macos")]
+    let zero_copy = !cli.copy_frames && iosurface::device_supports_import(&device);
+    #[cfg(not(target_os = "macos"))]
+    let zero_copy = false;
+    info!("Captured frames: {}", if zero_copy { "read in place by the GPU" } else { "copied through the CPU" });
+
     let hud_font_size = hud_size.max(8.0);
     let hud_padding = 10.0;
     let calibrate_btn = Rect { x: 0.0, y: 0.0, w: 110.0, h: 28.0 };
@@ -530,8 +551,10 @@ async fn init_gpu(window: &Window, cli: &Cli, vertices: &[Vertex]) -> anyhow::Re
         show_calibrated_toast_until_ns,
         hud_text: Vec::new(),
         hud_text_updated_ns: 0,
-        frame_buf: Vec::new(),
         frame_seq: 0,
+        zero_copy,
+        #[cfg(target_os = "macos")]
+        shown_frames: [None, None, None],
     })
 }
 
@@ -748,6 +771,33 @@ fn screen_status_line(tex_size: (u32, u32), #[cfg(target_os = "macos")] source: 
         let _ = tex_size;
         "screen: capture not supported on this platform".to_string()
     }
+}
+
+/// Put a captured frame on the virtual screen: in place from its IOSurface when the GPU can
+/// read it, else by copying its pixels. If sharing fails once, frames are copied from then on.
+#[cfg(target_os = "macos")]
+fn show_captured_frame(gpu: &mut Gpu, frame: CapturedFrame) {
+    let Gpu { device, queue, scene, zero_copy, shown_frames, .. } = gpu;
+    if *zero_copy {
+        if let Some(surface) = frame.iosurface() {
+            // SAFETY: `surface` belongs to `frame`, which is alive here and, once shown, kept
+            // in `shown_frames` while the GPU may draw it.
+            let key = u64::from(unsafe { iosurface::id(surface) });
+            let shown = scene.show_external(device, queue, key, frame.width, frame.height, || unsafe {
+                iosurface::import(device, surface, frame.width, frame.height)
+            });
+            if shown != scene::FrameUpload::NotImported {
+                shown_frames.rotate_right(1);
+                shown_frames[0] = Some(frame);
+                return;
+            }
+        }
+        warn!("Can't let the GPU read captured frames in place; copying them instead");
+        *zero_copy = false;
+    }
+    // Copied frames needn't be kept: `write_texture` takes its own copy.
+    *shown_frames = [None, None, None];
+    frame.with_bytes(|bytes| scene.upload_frame(device, queue, frame.width, frame.height, frame.bytes_per_row, bytes));
 }
 
 fn make_proj(width: u32, height: u32, fov_deg: f32) -> Mat4 {
@@ -1254,13 +1304,12 @@ fn main() -> anyhow::Result<()> {
                 };
                 gpu.scene.set_view_proj(&gpu.queue, vp);
 
-                // Upload the newest screen frame (macOS only). Skips entirely when no new frame
-                // has arrived; the frame buffer is swapped in, not copied.
+                // Show the newest screen frame (macOS only). Skips entirely when no new frame
+                // has arrived.
                 #[cfg(target_os = "macos")]
                 {
-                    if let Some(info) = take_latest_bgra(&mut gpu.frame_buf, &mut gpu.frame_seq) {
-                        let Gpu { device, queue, scene, frame_buf, .. } = &mut gpu;
-                        scene.upload_frame(device, queue, info.width, info.height, info.bytes_per_row, frame_buf);
+                    if let Some(frame) = take_latest_frame(&mut gpu.frame_seq) {
+                        show_captured_frame(&mut gpu, frame);
                     }
                 }
 
@@ -1288,7 +1337,14 @@ fn main() -> anyhow::Result<()> {
                         format!("fps: {:.1}", fps.fps.max(0.0)),
                         format!("latency: {:.2} ms", latency_ms),
                         format!("euler(rad) r={:.3} p={:.3} y={:.3}", r, p, y),
-                        format!("invert=({},{},{}) vsync={}", cli.invert_x, cli.invert_y, cli.invert_z, cli.vsync),
+                        format!(
+                            "invert=({},{},{}) vsync={} frames={}",
+                            cli.invert_x,
+                            cli.invert_y,
+                            cli.invert_z,
+                            cli.vsync,
+                            if gpu.zero_copy { "shared" } else { "copied" }
+                        ),
                         screen_line,
                         format!("distance: {:.2}  height: {:.2}", gpu.scene.screen.distance, gpu.scene.screen.height),
                     ];

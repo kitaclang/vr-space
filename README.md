@@ -159,6 +159,7 @@ Options:
 | `--fullscreen <id>` | off | Open fullscreen on this display (the glasses); 0 = main display |
 | `--neck-model <n>` | 1 | Neck model strength (0 = off, 1 = average head, up to 3) |
 | `--no-cursor` | off | Hide the mouse cursor on the virtual screen |
+| `--copy-frames` | off | Copy each captured frame through the CPU instead of letting the GPU read it in place (slower; for comparison, or if the screen looks wrong). The HUD shows `frames=shared` or `frames=copied` |
 | `--recenter-yaw-only` | off | Recenter only left-right, so the horizon stays level even if your head is tilted |
 | `--ignore-settings` | off | Don't load or save [saved settings](#saved-settings) |
 

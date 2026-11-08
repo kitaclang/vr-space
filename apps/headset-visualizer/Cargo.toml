@@ -56,6 +56,9 @@ tray-icon = { version = "0.26", default-features = false }
 global-hotkey = "0.9"
 # Window level for fullscreen on the glasses (MIT; already used by tray-icon)
 objc2 = "0.6"
+# Show captured IOSurfaces as wgpu textures without copying them. Same version wgpu-hal 0.17
+# uses (MIT OR Apache-2.0)
+metal = "0.26"
 
 [features]
 # Default to no-vsync for lowest latency; user can override with CLI.

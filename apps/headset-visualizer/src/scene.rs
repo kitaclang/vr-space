@@ -4,9 +4,11 @@
 //! the end of this file render it into an offscreen texture and check the pixels. The window,
 //! surface and HUD stay in `main.rs`.
 //!
-//! Per frame the render loop calls `set_view_proj`, `upload_frame` (when a new frame arrived)
-//! and `encode`. None of them allocate or block, apart from recreating the screen texture when
-//! the captured frame's size changes, which is rare.
+//! Per frame the render loop calls `set_view_proj`, then `show_external` or `upload_frame`
+//! when a new frame arrived, and `encode`. `show_external` shows a texture the GPU reads in
+//! place (an IOSurface on macOS, see `iosurface.rs`); `upload_frame` copies pixels from the
+//! CPU. None of them allocate or block once warmed up: textures are only created when the
+//! frame size changes, or the first time each of the capture's few surfaces is seen.
 
 use glam::Mat4;
 use log::{info, warn};
@@ -89,15 +91,42 @@ fn fs_main_q(in: VsOut) -> @location(0) vec4<f32> {
  return vec4<f32>(c.rgb, 1.0);
 }"#;
 
-/// What `upload_frame` did with a frame.
+/// What `upload_frame` or `show_external` did with a frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameUpload {
     /// Copied into the existing screen texture.
     Copied,
-    /// The frame size changed: the texture was recreated and the quad resized to match.
+    /// Shown in place from a texture imported earlier: nothing copied or created.
+    Shared,
+    /// Shown in place from a newly imported texture (the first time this surface was seen).
+    Imported,
+    /// The frame size changed: the texture was recreated (or imported) and the quad resized.
     Resized,
     /// Too large for the GPU, or the buffer is too short for its size: not shown.
     Rejected,
+    /// `show_external` couldn't import the texture; nothing changed. Copy the frame instead.
+    NotImported,
+}
+
+/// How many imported textures to keep. ScreenCaptureKit cycles through a few surfaces (about
+/// its queue depth), so this holds them all; going over it means the surfaces changed (a new
+/// stream), and the old ones are dropped.
+const MAX_EXTERNAL: usize = 8;
+
+/// A texture the GPU reads in place, with the bind group that draws it.
+struct External {
+    key: u64,
+    _texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+}
+
+/// Which texture the screen quad draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bound {
+    /// `Scene::tex`, filled by `upload_frame`.
+    Own,
+    /// `Scene::external[i]`.
+    External(usize),
 }
 
 pub struct Scene {
@@ -116,9 +145,13 @@ pub struct Scene {
     quad_index_count: u32,
     quad_bgl: wgpu::BindGroupLayout,
     quad_sampler: wgpu::Sampler,
-    // Screen texture; recreated (rarely) when the captured frame size changes.
+    // Screen texture for copied frames; recreated (rarely) when the frame size changes.
     tex: wgpu::Texture,
+    tex_own_size: (u32, u32),
     quad_bind_group: wgpu::BindGroup,
+    // Imported textures, by key, all of size `tex_size`; and which texture is drawn.
+    external: Vec<External>,
+    bound: Bound,
     /// Size of the last frame shown, `(1, 1)` before the first, `(0, 0)` after one was rejected.
     pub tex_size: (u32, u32),
     pub screen: ScreenPlacement,
@@ -290,7 +323,10 @@ impl Scene {
             quad_bgl,
             quad_sampler,
             tex,
+            tex_own_size: tex_size,
             quad_bind_group,
+            external: Vec::with_capacity(MAX_EXTERNAL),
+            bound: Bound::Own,
             tex_size,
             screen,
         }
@@ -321,31 +357,20 @@ impl Scene {
         bytes_per_row: u32,
         data: &[u8],
     ) -> FrameUpload {
-        let max_dim = device.limits().max_texture_dimension_2d;
         let len = bytes_per_row as usize * height as usize;
-        let fits = width > 0
-            && height > 0
-            && width <= max_dim
-            && height <= max_dim
-            && bytes_per_row as u64 >= width as u64 * 4
-            && data.len() >= len;
-        if !fits {
-            if self.tex_size != (0, 0) {
-                warn!("Captured frame {width}x{height} doesn't fit the GPU texture limit {max_dim} or its buffer; not displayed");
-                self.tex_size = (0, 0); // log once until a frame fits again
-            }
+        let buffer_ok = bytes_per_row as u64 >= width as u64 * 4 && data.len() >= len;
+        if !self.check_fits(device, width, height, buffer_ok) {
             return FrameUpload::Rejected;
         }
-        let resized = self.tex_size != (width, height);
-        if resized {
+        if self.tex_own_size != (width, height) {
             // Rare: first frame, or the display or window size changed.
-            info!("Screen texture resized to {width}x{height}");
             let (tex, bg) = create_screen_texture(device, &self.quad_bgl, &self.quad_sampler, width, height);
             self.tex = tex;
             self.quad_bind_group = bg;
-            self.tex_size = (width, height);
-            self.write_quad(queue);
+            self.tex_own_size = (width, height);
         }
+        self.bound = Bound::Own;
+        let resized = self.set_shown_size(queue, width, height);
         queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &self.tex,
@@ -364,6 +389,76 @@ impl Scene {
         }
     }
 
+    /// Show a `width` x `height` BGRA texture that the GPU reads in place, identified by `key`.
+    /// The first time a key is seen (at this size), `import` makes its texture, which is then
+    /// kept, so later frames from the same surface just switch to it. If `import` fails,
+    /// nothing changes and `NotImported` says to copy the frame instead.
+    ///
+    /// The texture must stay valid to sample, and its contents unchanged, until the GPU has
+    /// drawn the frame: that's the caller's job (on macOS, keeping the frame's pixel buffer).
+    pub fn show_external(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        key: u64,
+        width: u32,
+        height: u32,
+        import: impl FnOnce() -> Option<wgpu::Texture>,
+    ) -> FrameUpload {
+        if !self.check_fits(device, width, height, true) {
+            return FrameUpload::Rejected;
+        }
+        let same_size = self.tex_size == (width, height);
+        let cached = if same_size { self.external.iter().position(|e| e.key == key) } else { None };
+        let (index, imported) = match cached {
+            Some(i) => (i, false),
+            None => {
+                let Some(texture) = import() else { return FrameUpload::NotImported };
+                if !same_size || self.external.len() >= MAX_EXTERNAL {
+                    self.external.clear();
+                }
+                let bind_group = create_bind_group(device, &self.quad_bgl, &self.quad_sampler, &texture);
+                self.external.push(External { key, _texture: texture, bind_group });
+                (self.external.len() - 1, true)
+            }
+        };
+        self.bound = Bound::External(index);
+        if self.set_shown_size(queue, width, height) {
+            FrameUpload::Resized
+        } else if imported {
+            FrameUpload::Imported
+        } else {
+            FrameUpload::Shared
+        }
+    }
+
+    /// Whether a frame fits the GPU's texture limit (and its buffer is long enough). Logs once
+    /// when one doesn't, until one fits again.
+    fn check_fits(&mut self, device: &wgpu::Device, width: u32, height: u32, buffer_ok: bool) -> bool {
+        let max_dim = device.limits().max_texture_dimension_2d;
+        let fits = width > 0 && height > 0 && width <= max_dim && height <= max_dim && buffer_ok;
+        if !fits && self.tex_size != (0, 0) {
+            warn!("Captured frame {width}x{height} doesn't fit the GPU texture limit {max_dim} or its buffer; not displayed");
+            self.tex_size = (0, 0);
+        }
+        fits
+    }
+
+    /// Record the size of the frame now shown; resize the quad and return true if it changed.
+    /// Imported textures of the old size are dropped then (they can't be shown again).
+    fn set_shown_size(&mut self, queue: &wgpu::Queue, width: u32, height: u32) -> bool {
+        if self.tex_size == (width, height) {
+            return false;
+        }
+        info!("Screen texture resized to {width}x{height}");
+        if self.bound == Bound::Own {
+            self.external.clear();
+        }
+        self.tex_size = (width, height);
+        self.write_quad(queue);
+        true
+    }
+
     /// Clear `target` and draw the grid, then the screen on top.
     pub fn encode(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -378,7 +473,11 @@ impl Scene {
         rpass.execute_bundles(std::iter::once(&self.grid_bundle));
         rpass.set_pipeline(&self.quad_pipeline);
         rpass.set_bind_group(0, &self.uniform_bind_group, &[]);
-        rpass.set_bind_group(1, &self.quad_bind_group, &[]);
+        let bind_group = match self.bound {
+            Bound::Own => &self.quad_bind_group,
+            Bound::External(i) => &self.external[i].bind_group,
+        };
+        rpass.set_bind_group(1, bind_group, &[]);
         rpass.set_vertex_buffer(0, self.quad_vb.slice(..));
         rpass.set_index_buffer(self.quad_ib.slice(..), wgpu::IndexFormat::Uint16);
         rpass.draw_indexed(0..self.quad_index_count, 0, 0..1);
@@ -404,16 +503,26 @@ fn create_screen_texture(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
+    let bind_group = create_bind_group(device, bgl, sampler, &tex);
+    (tex, bind_group)
+}
+
+/// The bind group that draws `tex` on the screen quad.
+fn create_bind_group(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    tex: &wgpu::Texture,
+) -> wgpu::BindGroup {
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("quad-bg"),
         layout: bgl,
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Sampler(sampler) },
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
         ],
-    });
-    (tex, bind_group)
+    })
 }
 
 #[cfg(test)]
@@ -629,5 +738,91 @@ mod tests {
         h.scene.write_quad(&h.queue);
         let (near_w, _) = extent_of(&h.render(Quat::IDENTITY), MAGENTA);
         assert!(near_w.abs_diff(far_w * 2) <= 2, "{far_w} px at 4 m, {near_w} px at 2 m");
+    }
+
+    /// An ordinary texture of one colour, standing in for one the GPU reads in place.
+    fn solid_texture(h: &Harness, width: u32, height: u32, color: [u8; 4]) -> wgpu::Texture {
+        let tex = h.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test-external"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        h.queue.write_texture(
+            tex.as_image_copy(),
+            &solid(width, height, color),
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        tex
+    }
+
+    #[test]
+    fn external_textures_are_imported_once_per_key() {
+        let Some(mut h) = Harness::new(AHEAD) else { return };
+        let center = |h: &Harness| at(&h.render(Quat::IDENTITY), SIZE / 2, SIZE / 2);
+        let (red, green) = (solid_texture(&h, 16, 10, RED), solid_texture(&h, 16, 10, GREEN));
+        let mut red = Some(red);
+        let mut green = Some(green);
+
+        assert_eq!(h.scene.show_external(&h.device, &h.queue, 1, 16, 10, || red.take()), FrameUpload::Resized);
+        assert!(near(center(&h), RED));
+        assert_eq!(h.scene.show_external(&h.device, &h.queue, 2, 16, 10, || green.take()), FrameUpload::Imported);
+        assert!(near(center(&h), GREEN));
+
+        // Seen before: shown again without importing anything.
+        let not_called = || panic!("imported a texture that was already kept");
+        assert_eq!(h.scene.show_external(&h.device, &h.queue, 1, 16, 10, not_called), FrameUpload::Shared);
+        assert!(near(center(&h), RED));
+
+        // A failed import changes nothing, and copying the frame instead works.
+        assert_eq!(h.scene.show_external(&h.device, &h.queue, 3, 16, 10, || None), FrameUpload::NotImported);
+        assert!(near(center(&h), RED));
+        // Same size as shown, so the quad keeps its shape, though the copy's texture is new.
+        assert_eq!(h.upload(16, 10, 64, &solid(16, 10, BLUE)), FrameUpload::Copied);
+        assert!(near(center(&h), BLUE));
+
+        // A new size: the old textures are dropped, so key 1 is imported again.
+        let wide = solid_texture(&h, 32, 10, MAGENTA);
+        let mut wide = Some(wide);
+        assert_eq!(h.scene.show_external(&h.device, &h.queue, 1, 32, 10, || wide.take()), FrameUpload::Resized);
+        assert!(near(center(&h), MAGENTA));
+        assert_eq!(h.scene.tex_size, (32, 10));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn iosurfaces_are_shown_in_place_without_copying() {
+        use crate::iosurface::{self, test_surface::TestSurface};
+        let Some(mut h) = Harness::new(AHEAD) else { return };
+        if !iosurface::device_supports_import(&h.device) {
+            eprintln!("GPU isn't Metal; skipping IOSurface test");
+            return;
+        }
+        let center = |h: &Harness| at(&h.render(Quat::IDENTITY), SIZE / 2, SIZE / 2);
+        let surface = TestSurface::bgra(16, 10);
+        surface.fill(RED);
+        let key = u64::from(surface.id());
+        let import = |s: &TestSurface| unsafe { iosurface::import(&h.device, s.surface, s.width, s.height) };
+
+        let tex = import(&surface).expect("import a BGRA IOSurface");
+        let mut tex = Some(tex);
+        assert_eq!(h.scene.show_external(&h.device, &h.queue, key, 16, 10, || tex.take()), FrameUpload::Resized);
+        assert!(near(center(&h), RED), "{:?}", center(&h));
+
+        // The capture writes its next frame into the same surface. Showing that surface again
+        // reuses the texture, and the GPU sees the new pixels: nothing was copied.
+        surface.fill(GREEN);
+        assert_eq!(h.scene.show_external(&h.device, &h.queue, key, 16, 10, || None), FrameUpload::Shared);
+        assert!(near(center(&h), GREEN), "{:?}", center(&h));
+
+        // Surfaces that don't match are refused rather than shown wrongly.
+        assert!(unsafe { iosurface::import(&h.device, surface.surface, 8, 10) }.is_none(), "wrong size");
+        let yuv = TestSurface::new(16, 10, u32::from_be_bytes(*b"420v"));
+        assert!(import(&yuv).is_none(), "not BGRA");
     }
 }
