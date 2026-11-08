@@ -129,6 +129,11 @@ struct Cli {
     /// Hide the mouse cursor on the virtual screen
     #[arg(long)]
     no_cursor: bool,
+
+    /// Recenter only the left-right direction (yaw), keeping the horizon level even if
+    /// your head is tilted when you recenter
+    #[arg(long)]
+    recenter_yaw_only: bool,
 }
 
 impl Cli {
@@ -809,6 +814,26 @@ fn head_rotation_from_pose(pose: PoseCopy, invert: (bool, bool, bool)) -> Quat {
     q.conjugate()
 }
 
+// The calibration for a recenter: the inverse of the head orientation, or with `yaw_only` the
+// inverse of just its turn around the vertical axis (scene Y up, -Z forward), so pitch and
+// roll stay measured against the real horizon.
+fn recenter_calibration(head: Quat, yaw_only: bool) -> Quat {
+    if !yaw_only {
+        return head.inverse();
+    }
+    let forward = head * Vec3::NEG_Z;
+    // Looking almost straight up or down, the forward direction has no usable heading; the
+    // top of the head points where the face would (looking down) or away from it (looking up).
+    let dir = if forward.x.hypot(forward.z) > 1e-3 {
+        forward
+    } else {
+        let up = head * Vec3::Y;
+        if forward.y < 0.0 { up } else { -up }
+    };
+    let yaw = (-dir.x).atan2(-dir.z);
+    Quat::from_rotation_y(yaw).inverse()
+}
+
 // Camera view matrix for a camera orientation (already calibrated). With the neck model on, the
 // eye swings around a pivot behind and below it; looking straight ahead it is exactly at CAM_POS.
 fn camera_view(rotation: Quat, neck_model: f32) -> Mat4 {
@@ -1306,10 +1331,10 @@ fn main() -> anyhow::Result<()> {
                 let pose_copy = PoseCopy { roll: r, pitch: p, yaw: y };
                 let head = head_rotation_from_pose(pose_copy, (cli.invert_x, cli.invert_y, cli.invert_z));
 
-                // Recenter: make the current head orientation the new "forward".
+                // Recenter: make the current head orientation (or its heading) the new "forward".
                 if calibrate_pending {
                     calibrate_pending = false;
-                    calib_inv = head.inverse();
+                    calib_inv = recenter_calibration(head, cli.recenter_yaw_only);
                     gpu.show_calibrated_toast_until_ns = now_ns_from_start() + 1_000_000_000;
                 }
 

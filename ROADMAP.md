@@ -7,13 +7,13 @@ What's planned for vr-space, grouped by priority rather than dates. vr-space is 
 - **Finish testing on real glasses.** Runs with XREAL Air glasses confirmed that `--fullscreen` opens on the glasses, the screen is sharp and in the right proportions, recentering with `C` works, the screen stays in place as you turn your head, and the neck model feels natural at its default strength. Still to confirm:
   - glasses plugged in after launch are picked up
   - `--screen-height`, `--screen-distance` and `--fov` behave as described
+  - `--recenter-yaw-only` keeps the horizon level when you recenter with your head tilted
 
 ## Next
 
 - **A proper macOS app.** Package vr-space as a `.app` you open from Finder or at login, without a terminal. Screen Recording permission would then belong to vr-space instead of your terminal app.
 - **Survive unplugged glasses.** Today the app waits for glasses that are missing at startup, but unplugging them mid-session quits the app: `ar-drivers` calls `exit(0)` on a USB read error. Fixing it needs `ar-drivers` to return errors from `Fusion::update()` instead of exiting, which means a change upstream in [headset-utils](https://github.com/3rl-io/headset-utils).
 - **Capture a single window** instead of a whole display, using ScreenCaptureKit's window filters.
-- **Recenter yaw only**, as an option. Recentering currently takes your full head orientation, so calibrating while tilted also tilts the scene's horizon.
 
 ## Later
 

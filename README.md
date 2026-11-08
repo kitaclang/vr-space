@@ -108,6 +108,7 @@ Options:
 | `--fullscreen <id>` | off | Open fullscreen on this display (the glasses); 0 = main display |
 | `--neck-model <n>` | 1 | Neck model strength (0 = off, 1 = average head, up to 3) |
 | `--no-cursor` | off | Hide the mouse cursor on the virtual screen |
+| `--recenter-yaw-only` | off | Recenter only left-right, so the horizon stays level even if your head is tilted |
 
 Check screen capture on its own:
 
