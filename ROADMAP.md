@@ -8,6 +8,8 @@ What's planned for vr-space, grouped by priority rather than dates. vr-space is 
   - glasses plugged in after launch are picked up
   - `--screen-height`, `--screen-distance` and `--fov` behave as described
   - `--recenter-yaw-only` keeps the horizon level when you recenter with your head tilted
+  - choosing a window from **Show window**, then resizing and closing it
+  - with saved settings, opening vr-space before plugging in the glasses goes fullscreen on them once they're connected
 
 ## Next
 
@@ -19,7 +21,6 @@ What's planned for vr-space, grouped by priority rather than dates. vr-space is 
 - **More automated tests**, for example running the renderer on a headless GPU to check what it draws.
 - **Reduce latency further.** Upload frames straight from the capture's IOSurface instead of copying them through the CPU, and measure real motion-to-photon latency rather than the age of the last sample.
 - **Curved or multiple virtual screens.**
-- **Settings saved between runs** (screen size and distance as set with the keys, display) instead of passing flags each time.
 
 ## Known limitations
 

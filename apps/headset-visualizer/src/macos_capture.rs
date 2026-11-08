@@ -233,6 +233,21 @@ pub fn match_window(windows: &[WindowInfo], query: &str) -> Option<u32> {
         .map(|w| w.id)
 }
 
+/// Find the window shown last time: same app and title, or else any window of that app
+/// (titles change, for example with the open document).
+pub fn match_saved_window(windows: &[WindowInfo], app: &str, title: &str) -> Option<u32> {
+    windows
+        .iter()
+        .find(|w| w.app == app && w.title == title)
+        .or_else(|| windows.iter().find(|w| w.app == app))
+        .map(|w| w.id)
+}
+
+/// The window with this ID from the watcher's latest list, if it's there.
+pub fn window_info(id: u32) -> Option<WindowInfo> {
+    WINDOWS.lock().ok()?.iter().find(|w| w.id == id).cloned()
+}
+
 /// Resolve `--window` to a window ID.
 pub fn find_window(query: &str) -> anyhow::Result<u32> {
     let windows = list_windows()?;
@@ -647,6 +662,14 @@ mod tests {
         assert_eq!(match_window(&windows, "NOTES"), Some(12), "then part of a title, ignoring case");
         assert_eq!(match_window(&windows, "mail"), None);
         assert_eq!(match_window(&windows, "  "), None);
+    }
+
+    #[test]
+    fn saved_windows_are_found_by_app_and_title() {
+        let windows = [window(10, "Safari", "Start"), window(11, "Safari", "Docs"), window(12, "Notes", "Docs")];
+        assert_eq!(match_saved_window(&windows, "Safari", "Docs"), Some(11));
+        assert_eq!(match_saved_window(&windows, "Safari", "Old page"), Some(10), "same app, title changed");
+        assert_eq!(match_saved_window(&windows, "Mail", "Docs"), None, "app not open");
     }
 
     #[test]

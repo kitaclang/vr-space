@@ -3,7 +3,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use env_logger::Env;
 use log::{info, warn};
 
@@ -23,7 +24,7 @@ use wgpu_glyph::{GlyphBrush, GlyphBrushBuilder, HorizontalAlign, Layout, Section
 // On macOS, pull capture helpers into scope (now using screencapturekit crate under the hood)
 #[cfg(target_os = "macos")]
 use crate::macos_capture::{
-    capture_status, find_window, list_displays, list_windows, open_screen_recording_settings, resolve_display_id,
+    capture_status, find_window, list_displays, list_windows, match_saved_window, window_info, open_screen_recording_settings, resolve_display_id,
     start_stream, start_window_watcher, stop_stream, switch_source, take_latest_bgra, take_window_event,
     CaptureSource, CaptureStatus, CapturedWindowEvent,
 };
@@ -44,6 +45,10 @@ mod menu_bar;
 // Running as vr-space.app: log file, opening at login, permission wording
 #[cfg(target_os = "macos")]
 mod macos_app;
+
+// Settings saved between runs
+mod settings;
+use crate::settings::{SavedWindow, Settings, SettingsStore};
 
 /// Something the user asked for, from a key in the window, the menu bar or a global shortcut.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +157,76 @@ struct Cli {
     /// your head is tilted when you recenter
     #[arg(long)]
     recenter_yaw_only: bool,
+
+    /// Don't load or save settings (screen size and distance, display or window, fullscreen,
+    /// HUD) in ~/Library/Application Support/vr-space/settings.json
+    #[arg(long)]
+    ignore_settings: bool,
+}
+
+/// Which of the flags that saved settings can stand in for were given on the command line.
+/// Those win over the saved settings.
+#[derive(Clone, Copy, Debug, Default)]
+struct ExplicitFlags {
+    screen_distance: bool,
+    screen_height: bool,
+    /// `--display` or `--window`: either one decides what's shown.
+    source: bool,
+    fullscreen: bool,
+}
+
+impl ExplicitFlags {
+    fn from_matches(m: &ArgMatches) -> Self {
+        let given = |id: &str| m.value_source(id) == Some(ValueSource::CommandLine);
+        Self {
+            screen_distance: given("screen_distance"),
+            screen_height: given("screen_height"),
+            source: given("display") || given("window"),
+            fullscreen: given("fullscreen"),
+        }
+    }
+}
+
+/// What to show at startup when it's a window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WindowChoice {
+    /// `--window`: an ID, app name or part of a title.
+    Query(String),
+    /// The window shown last time, found again by its app and title.
+    Saved(SavedWindow),
+}
+
+/// How to start: the command line, with the saved settings filling in what it doesn't say.
+#[derive(Clone, Debug)]
+struct StartupPlan {
+    screen: ScreenPlacement,
+    /// Display to show, as on the command line (0 = main display). Also where to go back to
+    /// if the window closes.
+    display: u32,
+    window: Option<WindowChoice>,
+    fullscreen: Option<u32>,
+    hud: bool,
+}
+
+impl StartupPlan {
+    fn new(cli: &Cli, explicit: ExplicitFlags, saved: &Settings) -> Self {
+        let pick = |given: bool, flag: f32, saved: Option<f32>| if given { flag } else { saved.unwrap_or(flag) };
+        let (display, window) = if explicit.source {
+            (cli.display, cli.window.clone().map(WindowChoice::Query))
+        } else {
+            (saved.display.unwrap_or(cli.display), saved.window.clone().map(WindowChoice::Saved))
+        };
+        Self {
+            screen: ScreenPlacement {
+                distance: pick(explicit.screen_distance, cli.screen_distance, saved.screen_distance),
+                height: pick(explicit.screen_height, cli.screen_height, saved.screen_height),
+            },
+            display,
+            window,
+            fullscreen: if explicit.fullscreen { cli.fullscreen } else { saved.fullscreen },
+            hud: !cli.no_hud && saved.hud.unwrap_or(true),
+        }
+    }
 }
 
 impl Cli {
@@ -365,7 +440,7 @@ struct Gpu {
 
 /// Where the virtual screen sits: straight ahead of the eye at the calibrated "forward".
 /// Its width follows the captured screen's aspect ratio.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct ScreenPlacement {
     height: f32,
     distance: f32,
@@ -1040,10 +1115,14 @@ fn main() -> anyhow::Result<()> {
 
     // Older macOS versions pass a -psn_ argument to apps opened from Finder.
     #[cfg(target_os = "macos")]
-    let cli = Cli::parse_from(macos_app::without_psn_args(std::env::args_os()));
+    let args = macos_app::without_psn_args(std::env::args_os());
     #[cfg(not(target_os = "macos"))]
-    let cli = Cli::parse();
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    // Parsed in two steps to learn which flags were actually given (they beat saved settings).
+    let matches = Cli::command().get_matches_from(args);
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     cli.validate()?;
+    let explicit = ExplicitFlags::from_matches(&matches);
 
     #[cfg(target_os = "macos")]
     if cli.list_displays {
@@ -1088,6 +1167,15 @@ fn main() -> anyhow::Result<()> {
         cli.vsync, cli.invert_x, cli.invert_y, cli.invert_z, cli.poll_ms, cli.no_hud, cli.hud_size, cli.max_fps
     );
 
+    // Saved settings fill in what the command line doesn't say. `settings` is updated when
+    // you change something in the app and written back then.
+    let (mut settings_store, mut settings) = if cli.ignore_settings {
+        SettingsStore::disabled()
+    } else {
+        SettingsStore::open(settings::default_path())
+    };
+    let plan = StartupPlan::new(&cli, explicit, &settings);
+
     // Window and event loop (winit 0.28 API)
     let mut builder = EventLoopBuilder::<Command>::with_user_event();
     // Live in the menu bar only: no Dock icon (and no Dock menu to quit from by accident).
@@ -1102,9 +1190,11 @@ fn main() -> anyhow::Result<()> {
     let window = Window::new(&event_loop).expect("create window");
     window.set_title("Headset Visualizer");
 
-    // Go fullscreen on the chosen display (normally the glasses).
+    // Go fullscreen on the chosen display (normally the glasses). If it isn't connected yet,
+    // `pending_fullscreen` goes fullscreen on it once it shows up.
     let mut fullscreen_on: Option<u32> = None;
-    if let Some(id) = cli.fullscreen {
+    let mut pending_fullscreen: Option<u32> = None;
+    if let Some(id) = plan.fullscreen {
         match find_monitor(&window, id) {
             Some(monitor) => {
                 #[cfg(target_os = "macos")]
@@ -1112,7 +1202,7 @@ fn main() -> anyhow::Result<()> {
                     use winit::platform::macos::MonitorHandleExtMacOS;
                     let main_id = window.primary_monitor().map(|m| m.native_id());
                     let resolve = |d: u32| if d == 0 { main_id } else { Some(d) };
-                    if cli.window.is_none() && resolve(id).is_some() && resolve(id) == resolve(cli.display) {
+                    if plan.window.is_none() && resolve(id).is_some() && resolve(id) == resolve(plan.display) {
                         warn!(
                             "--fullscreen and --display are the same display, so the virtual screen will show \
                              the app itself. Use --display for the screen you want to see and --fullscreen for the glasses."
@@ -1125,7 +1215,10 @@ fn main() -> anyhow::Result<()> {
                 #[cfg(not(target_os = "macos"))]
                 window.set_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
             }
-            None => warn!("Display {id} not found for --fullscreen; staying windowed. Run with --list-displays to see the IDs."),
+            None => {
+                warn!("Display {id} isn't connected; going fullscreen on it once it is. Run with --list-displays to see the IDs.");
+                pending_fullscreen = Some(id);
+            }
         }
     }
     let mut window_scale_factor = window.scale_factor() as f32;
@@ -1215,17 +1308,31 @@ fn main() -> anyhow::Result<()> {
 
     // GPU init
     let mut gpu = pollster::block_on(init_gpu(&window, &cli, &grid_vertices))?;
+    gpu.screen = plan.screen;
+    gpu.hud_enabled &= plan.hud;
+    write_quad(&gpu);
 
     // What's on the virtual screen: a display (as a real ID; 0 on the command line means the
     // main display) or a window. `last_display` is where to go back to if the window closes.
     #[cfg(target_os = "macos")]
-    let mut last_display = resolve_display_id(cli.display);
+    let mut last_display = resolve_display_id(plan.display);
     #[cfg(target_os = "macos")]
-    let mut shown = match cli.window.as_deref().map(find_window) {
-        Some(Ok(id)) => CaptureSource::Window(id),
-        Some(Err(e)) => {
-            warn!("{e} Showing display {last_display} instead.");
-            CaptureSource::Display(last_display)
+    let mut shown = match &plan.window {
+        Some(WindowChoice::Query(query)) => match find_window(query) {
+            Ok(id) => CaptureSource::Window(id),
+            Err(e) => {
+                warn!("{e} Showing display {last_display} instead.");
+                CaptureSource::Display(last_display)
+            }
+        },
+        Some(WindowChoice::Saved(saved)) => {
+            match list_windows().ok().and_then(|list| match_saved_window(&list, &saved.app, &saved.title)) {
+                Some(id) => CaptureSource::Window(id),
+                None => {
+                    info!("{} isn't open; showing display {last_display}.", saved.app);
+                    CaptureSource::Display(last_display)
+                }
+            }
         }
         None => CaptureSource::Display(last_display),
     };
@@ -1367,6 +1474,14 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                         None => {}
+                    }
+                    // The display to go fullscreen on (the glasses) was plugged in.
+                    if let Some(id) = pending_fullscreen {
+                        if find_monitor(&window, id).is_some() {
+                            info!("Display {id} connected; going fullscreen on it.");
+                            pending_fullscreen = None;
+                            fullscreen_on = apply_fullscreen(&window, fullscreen_on, Some(id));
+                        }
                     }
                     if let Some(bar) = menu_bar.as_mut() {
                         bar.refresh();
@@ -1751,6 +1866,35 @@ fn main() -> anyhow::Result<()> {
             ) {
                 write_quad(&gpu);
             }
+            // Remember what was changed for next time. Only what you change is saved, so a
+            // window that isn't open at startup is still remembered.
+            match cmd {
+                Command::Further | Command::Closer | Command::Bigger | Command::Smaller => {
+                    settings.screen_distance = Some(gpu.screen.distance);
+                    settings.screen_height = Some(gpu.screen.height);
+                }
+                // Back to the command-line values, and keep following them.
+                Command::ResetScreen => {
+                    settings.screen_distance = None;
+                    settings.screen_height = None;
+                }
+                Command::ToggleFullscreen | Command::FullscreenOn(_) => {
+                    pending_fullscreen = None;
+                    settings.fullscreen = fullscreen_on;
+                }
+                Command::ToggleHud => settings.hud = Some(gpu.hud_enabled),
+                #[cfg(target_os = "macos")]
+                Command::ShowDisplay(id) if shown == CaptureSource::Display(id) => {
+                    settings.display = Some(id);
+                    settings.window = None;
+                }
+                #[cfg(target_os = "macos")]
+                Command::ShowWindow(id) if shown == CaptureSource::Window(id) => {
+                    settings.window = window_info(id).map(|w| SavedWindow { app: w.app, title: w.title });
+                }
+                _ => {}
+            }
+            settings_store.save(&settings);
             gpu.hud_text.clear(); // refresh the HUD's text now
             #[cfg(target_os = "macos")]
             if let Some(bar) = menu_bar.as_mut() {
@@ -1978,6 +2122,55 @@ mod tests {
     fn default_flags_are_valid() {
         let cli = parse(&[]).unwrap();
         assert!(!cli.recenter_yaw_only);
+    }
+
+    fn plan(args: &[&str], saved: &Settings) -> StartupPlan {
+        let argv: Vec<&str> = std::iter::once("headset-visualizer").chain(args.iter().copied()).collect();
+        let matches = Cli::command().try_get_matches_from(argv).unwrap();
+        let cli = Cli::from_arg_matches(&matches).unwrap();
+        StartupPlan::new(&cli, ExplicitFlags::from_matches(&matches), saved)
+    }
+
+    fn saved_all() -> Settings {
+        Settings {
+            screen_distance: Some(2.5),
+            screen_height: Some(2.0),
+            display: Some(7),
+            window: Some(SavedWindow { app: "Safari".into(), title: "Docs".into() }),
+            fullscreen: Some(9),
+            hud: Some(false),
+        }
+    }
+
+    #[test]
+    fn saved_settings_fill_in_when_no_flags_are_given() {
+        let p = plan(&[], &saved_all());
+        assert_eq!(p.screen, ScreenPlacement { distance: 2.5, height: 2.0 });
+        assert_eq!(p.display, 7);
+        assert_eq!(p.window, Some(WindowChoice::Saved(SavedWindow { app: "Safari".into(), title: "Docs".into() })));
+        assert_eq!(p.fullscreen, Some(9));
+        assert!(!p.hud);
+
+        // Nothing saved: the defaults.
+        let p = plan(&[], &Settings::default());
+        assert_eq!(p.screen, ScreenPlacement { distance: 4.0, height: 1.4 });
+        assert_eq!((p.display, p.window, p.fullscreen, p.hud), (0, None, None, true));
+    }
+
+    #[test]
+    fn flags_beat_saved_settings() {
+        let p = plan(&["--screen-distance", "6", "--display", "3", "--fullscreen", "4", "--no-hud"], &saved_all());
+        assert_eq!(p.screen, ScreenPlacement { distance: 6.0, height: 2.0 }, "height still saved");
+        assert_eq!((p.display, p.window.clone()), (3, None), "--display drops the saved window");
+        assert_eq!(p.fullscreen, Some(4));
+        assert!(!p.hud);
+
+        let p = plan(&["--window", "Notes"], &saved_all());
+        assert_eq!(p.window, Some(WindowChoice::Query("Notes".into())));
+        assert_eq!(p.display, 0, "not the saved display either");
+
+        // A flag set to its default value still counts as given.
+        assert_eq!(plan(&["--screen-height", "1.4"], &saved_all()).screen.height, 1.4);
     }
 
     #[test]

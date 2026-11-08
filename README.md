@@ -45,7 +45,7 @@ The script signs the app with an ad-hoc signature, which changes with every buil
 VR_SPACE_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" scripts/bundle-macos.sh --install
 ```
 
-Opened from Finder, the app starts with the default options. Use the menu bar icon to choose the display and go fullscreen on the glasses. To pass options to the app, use `open`:
+Opened from Finder, the app starts the way you left it (see [Saved settings](#saved-settings)). The first time, use the menu bar icon to choose the display and go fullscreen on the glasses. To pass options to the app, use `open`:
 
 ```bash
 open ~/Applications/vr-space.app --args --screen-distance 3
@@ -107,7 +107,7 @@ These shortcuts work from any app, so you can adjust the screen while you work:
 | `⌃⌥C` | Recenter (look straight ahead first) |
 | `⌃⌥↑` / `⌃⌥↓` | Move the screen further away / closer (it keeps its size, so closer looks bigger) |
 | `⌃⌥=` / `⌃⌥-` | Make the screen bigger / smaller |
-| `⌃⌥R` | Reset distance and size to the `--screen-distance` and `--screen-height` values |
+| `⌃⌥R` | Reset distance and size to the `--screen-distance` and `--screen-height` values (or their defaults) |
 
 If another app already uses one of these, the log says so and that shortcut is skipped.
 
@@ -124,7 +124,20 @@ When the vr-space window has focus, plain keys work too:
 | `P` | Open Screen Recording settings |
 | `Esc` | Quit |
 
-The HUD shows the current distance and height. Once you've found values you like, pass them as `--screen-distance` and `--screen-height` next time.
+The HUD shows the current distance and height.
+
+### Saved settings
+
+vr-space remembers what you change while it runs and starts that way next time:
+
+- the screen distance and size (the arrow and `+`/`-` keys or shortcuts)
+- the display or window shown on the virtual screen
+- the display it's fullscreen on (the glasses), or that it's a window
+- whether the HUD is shown
+
+A saved window is found again by its app and title, or any window of that app if the title changed. If the app isn't open, the virtual screen shows the saved display instead, and the window stays remembered. If the glasses aren't plugged in at startup, vr-space goes fullscreen on them as soon as they are, so you can open it at login before connecting them.
+
+Flags you pass on the command line win over the saved settings for that run. Reset (`R` or `⌃⌥R`) goes back to the `--screen-distance` and `--screen-height` values and forgets the saved ones. The settings are stored in `~/Library/Application Support/vr-space/settings.json`; delete the file to start over, or pass `--ignore-settings` to neither load nor save it.
 
 Options:
 
@@ -147,6 +160,7 @@ Options:
 | `--neck-model <n>` | 1 | Neck model strength (0 = off, 1 = average head, up to 3) |
 | `--no-cursor` | off | Hide the mouse cursor on the virtual screen |
 | `--recenter-yaw-only` | off | Recenter only left-right, so the horizon stays level even if your head is tilted |
+| `--ignore-settings` | off | Don't load or save [saved settings](#saved-settings) |
 
 Check screen capture on its own:
 
