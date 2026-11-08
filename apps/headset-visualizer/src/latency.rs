@@ -12,6 +12,8 @@
 //! (up to one refresh). wgpu 0.17 doesn't expose the Metal drawable or command buffers that
 //! would report them, so the time to photons is these numbers plus that.
 
+use std::time::Instant;
+
 /// How many recent samples each `Samples` keeps.
 pub const WINDOW: usize = 512;
 
@@ -151,6 +153,31 @@ pub mod mach {
             return 0;
         }
         super::mach_ticks_to_ns(now.saturating_sub(then), numer, denom)
+    }
+}
+
+/// Frames per second, updated every half second.
+pub struct FpsMeter {
+    pub last_instant: Instant,
+    pub accum_time: f32,
+    pub frames: u32,
+    pub fps: f32,
+}
+impl FpsMeter {
+    pub fn new() -> Self {
+        Self { last_instant: Instant::now(), accum_time: 0.0, frames: 0, fps: 0.0 }
+    }
+    pub fn on_frame(&mut self) {
+        let now = Instant::now();
+        let dt = (now - self.last_instant).as_secs_f32();
+        self.last_instant = now;
+        self.accum_time += dt;
+        self.frames += 1;
+        if self.accum_time >= 0.5 {
+            self.fps = self.frames as f32 / self.accum_time;
+            self.accum_time = 0.0;
+            self.frames = 0;
+        }
     }
 }
 

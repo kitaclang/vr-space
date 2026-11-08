@@ -14,7 +14,10 @@ use glam::Mat4;
 use log::{info, warn};
 use wgpu::util::DeviceExt;
 
-use crate::{quad_vertices, ScreenPlacement};
+use glam::Vec3;
+
+use crate::camera::CAM_POS;
+use crate::cli::Cli;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -525,13 +528,99 @@ fn create_bind_group(
     })
 }
 
+// ================= Screen placement and grid =================
+
+/// Where the virtual screen sits: straight ahead of the eye at the calibrated "forward".
+/// Its width follows the captured screen's aspect ratio.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScreenPlacement {
+    pub height: f32,
+    pub distance: f32,
+}
+
+/// Each press of a distance or size key changes it by this factor, so steps feel even
+/// whether the screen is near or far.
+pub const SCREEN_STEP: f32 = 1.1;
+pub const SCREEN_DISTANCE_RANGE: (f32, f32) = (0.5, 50.0);
+pub const SCREEN_HEIGHT_RANGE: (f32, f32) = (0.1, 30.0);
+
+impl ScreenPlacement {
+    pub fn from_cli(cli: &Cli) -> Self {
+        Self { height: cli.screen_height, distance: cli.screen_distance }
+    }
+
+    /// Scale the distance (`factor` > 1 moves the screen away). The size stays the same,
+    /// so a closer screen looks bigger, as a real one would.
+    pub fn scale_distance(&mut self, factor: f32) {
+        let (lo, hi) = SCREEN_DISTANCE_RANGE;
+        self.distance = (self.distance * factor).clamp(lo.min(self.distance), hi.max(self.distance));
+    }
+
+    pub fn scale_height(&mut self, factor: f32) {
+        let (lo, hi) = SCREEN_HEIGHT_RANGE;
+        self.height = (self.height * factor).clamp(lo.min(self.height), hi.max(self.height));
+    }
+}
+
+pub fn quad_vertices(screen: ScreenPlacement, aspect: f32) -> [TVertex; 4] {
+    let hh = screen.height * 0.5;
+    let hw = hh * aspect;
+    let c = CAM_POS - Vec3::Z * screen.distance;
+    [
+        TVertex { pos: [c.x - hw, c.y + hh, c.z], uv: [0.0, 0.0] },
+        TVertex { pos: [c.x + hw, c.y + hh, c.z], uv: [1.0, 0.0] },
+        TVertex { pos: [c.x + hw, c.y - hh, c.z], uv: [1.0, 1.0] },
+        TVertex { pos: [c.x - hw, c.y - hh, c.z], uv: [0.0, 1.0] },
+    ]
+}
+
+pub fn build_grid_vertices(size: i32, step: i32) -> Vec<Vertex> {
+    // Grid on XZ plane (Y-up), axes colored RGB
+    let mut verts: Vec<Vertex> = Vec::new();
+    let half = size;
+
+    // grid lines (grey)
+    for i in (-half..=half).step_by(step as usize) {
+        let x = i as f32;
+        let z0 = -half as f32;
+        let z1 = half as f32;
+
+        // line parallel to Z at X
+        verts.push(Vertex { position: [x, 0.0, z0], color: [0.3, 0.3, 0.3] });
+        verts.push(Vertex { position: [x, 0.0, z1], color: [0.3, 0.3, 0.3] });
+
+        let z = i as f32;
+        let x0 = -half as f32;
+        let x1 = half as f32;
+
+        // line parallel to X at Z
+        verts.push(Vertex { position: [x0, 0.0, z], color: [0.3, 0.3, 0.3] });
+        verts.push(Vertex { position: [x1, 0.0, z], color: [0.3, 0.3, 0.3] });
+    }
+
+    // axes: X (red), Y (green), Z (blue)
+    let a = -half as f32;
+    let b = half as f32;
+    // X axis
+    verts.push(Vertex { position: [a, 0.0, 0.0], color: [1.0, 0.0, 0.0] });
+    verts.push(Vertex { position: [b, 0.0, 0.0], color: [1.0, 0.0, 0.0] });
+    // Y axis
+    verts.push(Vertex { position: [0.0, a, 0.0], color: [0.0, 1.0, 0.0] });
+    verts.push(Vertex { position: [0.0, b, 0.0], color: [0.0, 1.0, 0.0] });
+    // Z axis
+    verts.push(Vertex { position: [0.0, 0.0, a], color: [0.0, 0.0, 1.0] });
+    verts.push(Vertex { position: [0.0, 0.0, b], color: [0.0, 0.0, 1.0] });
+
+    verts
+}
+
 #[cfg(test)]
 mod tests {
     //! Render the scene offscreen on the real GPU and check the pixels. Skipped (with a note)
     //! where there's no GPU adapter, such as some CI machines.
 
     use super::*;
-    use crate::{build_grid_vertices, camera_view, make_proj};
+    use crate::camera::{camera_view, make_proj, CAM_POS};
     use glam::Quat;
 
     const SIZE: u32 = 64; // 64 * 4 bytes = 256, the row alignment copy_texture_to_buffer needs
@@ -824,5 +913,55 @@ mod tests {
         assert!(unsafe { iosurface::import(&h.device, surface.surface, 8, 10) }.is_none(), "wrong size");
         let yuv = TestSurface::new(16, 10, u32::from_be_bytes(*b"420v"));
         assert!(import(&yuv).is_none(), "not BGRA");
+    }
+
+    // --- Screen placement ---
+
+    const EPS: f32 = 1e-4;
+
+    // --- Screen placement ---
+
+    #[test]
+    fn screen_quad_has_the_right_size_and_place() {
+        let screen = ScreenPlacement { height: 2.0, distance: 3.0 };
+        let v = quad_vertices(screen, 16.0 / 9.0);
+        let width = v[1].pos[0] - v[0].pos[0];
+        let height = v[0].pos[1] - v[3].pos[1];
+        assert!((width - 2.0 * 16.0 / 9.0).abs() < EPS);
+        assert!((height - 2.0).abs() < EPS);
+        for t in &v {
+            assert!((t.pos[2] - (CAM_POS.z - 3.0)).abs() < EPS);
+        }
+        // Top-left of the image is at the top-left corner (the texture isn't flipped).
+        assert_eq!(v[0].uv, [0.0, 0.0]);
+        assert!(v[0].pos[0] < v[1].pos[0] && v[0].pos[1] > v[3].pos[1]);
+    }
+
+    #[test]
+    fn screen_keys_stay_within_their_ranges() {
+        let mut s = ScreenPlacement { height: 1.0, distance: 1.0 };
+        for _ in 0..200 {
+            s.scale_distance(SCREEN_STEP);
+            s.scale_height(SCREEN_STEP);
+        }
+        assert_eq!(s.distance, SCREEN_DISTANCE_RANGE.1);
+        assert_eq!(s.height, SCREEN_HEIGHT_RANGE.1);
+        for _ in 0..200 {
+            s.scale_distance(1.0 / SCREEN_STEP);
+            s.scale_height(1.0 / SCREEN_STEP);
+        }
+        assert_eq!(s.distance, SCREEN_DISTANCE_RANGE.0);
+        assert_eq!(s.height, SCREEN_HEIGHT_RANGE.0);
+    }
+
+    #[test]
+    fn screen_keys_dont_snap_a_flag_value_outside_the_range() {
+        // A distance set by flag beyond the keys' range isn't pulled in by a key press...
+        let mut s = ScreenPlacement { height: 1.0, distance: 100.0 };
+        s.scale_distance(SCREEN_STEP);
+        assert_eq!(s.distance, 100.0);
+        // ...but can still be moved back towards it.
+        s.scale_distance(1.0 / SCREEN_STEP);
+        assert!(s.distance < 100.0);
     }
 }

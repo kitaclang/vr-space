@@ -33,7 +33,7 @@ The HUD's `frames=` shows which path is in use; `⌃⌥Z` (or **Latency > Copy f
 | frame upload mean (ms) | | |
 | Looks smoother? | | |
 
-If shared frames tear or flicker, the renderer is letting go of frames too early (it keeps three; see `shown_frames` in `main.rs`).
+If shared frames tear or flicker, the renderer is letting go of frames too early (it keeps three; see `shown_frames` in `gpu.rs`).
 
 ## 3. Latency figures
 

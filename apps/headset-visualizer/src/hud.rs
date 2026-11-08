@@ -11,6 +11,9 @@
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use wgpu_glyph::{GlyphBrush, Section, Text};
 
+#[cfg(target_os = "macos")]
+use crate::macos_capture::{capture_status, CaptureSource, CaptureStatus};
+
 /// The HUD font, Noto Sans (SIL OFL 1.1, see `assets/OFL.txt`).
 pub static FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSans-Regular.ttf");
 
@@ -161,6 +164,29 @@ pub fn queue_hud(gb: &mut GlyphBrush<()>, layout: &HudLayout, lines: &[String], 
     }
     if layout.settings.is_some() {
         text(SETTINGS_LABEL, layout.settings_text, SETTINGS_COLOR);
+    }
+}
+
+/// The HUD line describing the screen capture.
+pub fn screen_status_line(tex_size: (u32, u32), #[cfg(target_os = "macos")] source: CaptureSource) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let what = match source {
+            CaptureSource::Display(id) => format!("display {id}"),
+            CaptureSource::Window(id) => format!("window {id}"),
+        };
+        match capture_status() {
+            CaptureStatus::Starting => "screen: starting".to_string(),
+            CaptureStatus::NoPermission => "screen: no Screen Recording permission".to_string(),
+            CaptureStatus::Failed => "screen: capture failed (see log)".to_string(),
+            CaptureStatus::WaitingForFrames => "screen: waiting for first frame".to_string(),
+            CaptureStatus::Capturing => format!("screen: {what}, {}x{}", tex_size.0, tex_size.1),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = tex_size;
+        "screen: capture not supported on this platform".to_string()
     }
 }
 
