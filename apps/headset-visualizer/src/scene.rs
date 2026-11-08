@@ -84,7 +84,7 @@ struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, };
 fn vs_main_q(in: VsIn) -> VsOut {
  var o: VsOut;
  o.pos = ubo.view_proj * vec4<f32>(in.pos, 1.0);
- o.uv = in.uv; // v = 0 is the top row, matching quad_vertices
+ o.uv = in.uv; // v = 0 is the top row, matching screen_mesh
  return o;
 }
 
@@ -146,6 +146,9 @@ pub struct Scene {
     quad_vb: wgpu::Buffer,
     quad_ib: wgpu::Buffer,
     quad_index_count: u32,
+    /// How much the screen bends around the eye: 0 = flat, 1 = every column the same
+    /// distance from the eye (`--curve`). Call `write_quad` after changing it.
+    pub curve: f32,
     quad_bgl: wgpu::BindGroupLayout,
     quad_sampler: wgpu::Sampler,
     // Screen texture for copied frames; recreated (rarely) when the frame size changes.
@@ -301,10 +304,10 @@ impl Scene {
         let tex_size = (1u32, 1u32);
         let (tex, quad_bind_group) = create_screen_texture(device, &quad_bgl, &quad_sampler, tex_size.0, tex_size.1);
 
-        let quad_indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
+        let quad_indices = screen_indices();
         let quad_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("quad-vb"),
-            contents: bytemuck::cast_slice(&quad_vertices(screen, PLACEHOLDER_ASPECT)),
+            contents: bytemuck::cast_slice(&screen_mesh(screen, PLACEHOLDER_ASPECT, 0.0)),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
         let quad_ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -323,6 +326,7 @@ impl Scene {
             quad_vb,
             quad_ib,
             quad_index_count: quad_indices.len() as u32,
+            curve: 0.0,
             quad_bgl,
             quad_sampler,
             tex,
@@ -345,7 +349,7 @@ impl Scene {
     pub fn write_quad(&self, queue: &wgpu::Queue) {
         let (w, h) = self.tex_size;
         let aspect = if w > 0 && h > 0 { w as f32 / h as f32 } else { PLACEHOLDER_ASPECT };
-        let verts = quad_vertices(self.screen, aspect);
+        let verts = screen_mesh(self.screen, aspect, self.curve);
         queue.write_buffer(&self.quad_vb, 0, bytemuck::cast_slice(&verts));
     }
 
@@ -562,16 +566,51 @@ impl ScreenPlacement {
     }
 }
 
-pub fn quad_vertices(screen: ScreenPlacement, aspect: f32) -> [TVertex; 4] {
+/// Columns the virtual screen is made of. A flat screen needs one; a curved one needs enough
+/// that the bend looks smooth.
+pub const SCREEN_COLUMNS: usize = 48;
+/// Vertices in `screen_mesh`: a top and a bottom one per column edge.
+pub const SCREEN_VERTICES: usize = 2 * (SCREEN_COLUMNS + 1);
+
+/// The farthest a screen bends round, so a very wide one doesn't close into a ring.
+const MAX_ARC: f32 = 1.8 * std::f32::consts::PI;
+
+/// The virtual screen as a strip of columns, left to right, each a top vertex then a bottom
+/// one. `aspect` is the frame's width over its height. With `curve` > 0 the screen bends
+/// around a vertical axis in front of it, `distance / curve` away, keeping its width along
+/// the bend; at 1 that axis passes through the eye, so every column is equally far away.
+pub fn screen_mesh(screen: ScreenPlacement, aspect: f32, curve: f32) -> [TVertex; SCREEN_VERTICES] {
     let hh = screen.height * 0.5;
-    let hw = hh * aspect;
-    let c = CAM_POS - Vec3::Z * screen.distance;
-    [
-        TVertex { pos: [c.x - hw, c.y + hh, c.z], uv: [0.0, 0.0] },
-        TVertex { pos: [c.x + hw, c.y + hh, c.z], uv: [1.0, 0.0] },
-        TVertex { pos: [c.x + hw, c.y - hh, c.z], uv: [1.0, 1.0] },
-        TVertex { pos: [c.x - hw, c.y - hh, c.z], uv: [0.0, 1.0] },
-    ]
+    let width = screen.height * aspect;
+    let centre = CAM_POS - Vec3::Z * screen.distance;
+    let radius = if curve > 1e-4 { (screen.distance / curve).max(width / MAX_ARC) } else { f32::INFINITY };
+    let mut verts = [TVertex { pos: [0.0; 3], uv: [0.0; 2] }; SCREEN_VERTICES];
+    for i in 0..=SCREEN_COLUMNS {
+        let u = i as f32 / SCREEN_COLUMNS as f32;
+        let along = (u - 0.5) * width; // distance along the screen from its centre
+        let (x, z) = if radius.is_finite() {
+            let angle = along / radius;
+            (centre.x + radius * angle.sin(), centre.z + radius * (1.0 - angle.cos()))
+        } else {
+            (centre.x + along, centre.z)
+        };
+        verts[2 * i] = TVertex { pos: [x, centre.y + hh, z], uv: [u, 0.0] };
+        verts[2 * i + 1] = TVertex { pos: [x, centre.y - hh, z], uv: [u, 1.0] };
+    }
+    verts
+}
+
+/// Two triangles per column of `screen_mesh`.
+pub fn screen_indices() -> [u16; 6 * SCREEN_COLUMNS] {
+    let mut indices = [0u16; 6 * SCREEN_COLUMNS];
+    for i in 0..SCREEN_COLUMNS {
+        let (top_left, bottom_left, top_right, bottom_right) = (2 * i, 2 * i + 1, 2 * i + 2, 2 * i + 3);
+        let quad = [top_left, top_right, bottom_right, top_left, bottom_right, bottom_left];
+        for (k, v) in quad.into_iter().enumerate() {
+            indices[6 * i + k] = v as u16;
+        }
+    }
+    indices
 }
 
 pub fn build_grid_vertices(size: i32, step: i32) -> Vec<Vertex> {
@@ -819,6 +858,29 @@ mod tests {
     }
 
     #[test]
+    fn a_curved_screen_looks_taller_towards_its_edges() {
+        // 1.6 m wide at 1 m: wider than the 60° view, so the view's edges show the screen.
+        let screen = ScreenPlacement { height: 0.4, distance: 1.0 };
+        let Some(mut h) = Harness::new(screen) else { return };
+        h.upload(64, 16, 256, &solid(64, 16, MAGENTA));
+        // Rows drawn in magenta in column `x`.
+        let column_height = |px: &[[u8; 4]], x: u32| (0..SIZE).filter(|&y| near(at(px, x, y), MAGENTA)).count() as i32;
+
+        // Flat, the screen is parallel to the view, so every column looks the same height.
+        let flat = h.render(Quat::IDENTITY);
+        let (centre, edge) = (column_height(&flat, SIZE / 2), column_height(&flat, 1));
+        assert!(centre > 10 && (edge - centre).abs() <= 1, "flat: centre {centre} px, edge {edge} px");
+
+        // Curved round the eye, the parts at the view's edges are nearer, so they look taller.
+        h.scene.curve = 1.0;
+        h.scene.write_quad(&h.queue);
+        let curved = h.render(Quat::IDENTITY);
+        let (c_centre, c_edge) = (column_height(&curved, SIZE / 2), column_height(&curved, 1));
+        assert!((c_centre - centre).abs() <= 1, "the middle is where it was: {c_centre} vs {centre} px");
+        assert!(c_edge >= c_centre + 2, "curved: centre {c_centre} px, edge {c_edge} px");
+    }
+
+    #[test]
     fn moving_the_screen_closer_makes_it_bigger() {
         let Some(mut h) = Harness::new(ScreenPlacement { height: 0.5, distance: 4.0 }) else { return };
         h.upload(16, 10, 64, &solid(16, 10, MAGENTA));
@@ -924,17 +986,58 @@ mod tests {
     #[test]
     fn screen_quad_has_the_right_size_and_place() {
         let screen = ScreenPlacement { height: 2.0, distance: 3.0 };
-        let v = quad_vertices(screen, 16.0 / 9.0);
-        let width = v[1].pos[0] - v[0].pos[0];
-        let height = v[0].pos[1] - v[3].pos[1];
+        let v = screen_mesh(screen, 16.0 / 9.0, 0.0);
+        let (top_left, bottom_left, top_right) = (v[0], v[1], v[SCREEN_VERTICES - 2]);
+        let width = top_right.pos[0] - top_left.pos[0];
+        let height = top_left.pos[1] - bottom_left.pos[1];
         assert!((width - 2.0 * 16.0 / 9.0).abs() < EPS);
         assert!((height - 2.0).abs() < EPS);
         for t in &v {
-            assert!((t.pos[2] - (CAM_POS.z - 3.0)).abs() < EPS);
+            assert!((t.pos[2] - (CAM_POS.z - 3.0)).abs() < EPS, "flat");
         }
         // Top-left of the image is at the top-left corner (the texture isn't flipped).
-        assert_eq!(v[0].uv, [0.0, 0.0]);
-        assert!(v[0].pos[0] < v[1].pos[0] && v[0].pos[1] > v[3].pos[1]);
+        assert_eq!(top_left.uv, [0.0, 0.0]);
+        assert_eq!(v[SCREEN_VERTICES - 1].uv, [1.0, 1.0]);
+        assert!(top_left.pos[0] < top_right.pos[0] && top_left.pos[1] > bottom_left.pos[1]);
+    }
+
+    #[test]
+    fn a_full_curve_keeps_every_column_as_far_as_the_centre() {
+        let screen = ScreenPlacement { height: 1.0, distance: 2.0 };
+        let v = screen_mesh(screen, 3.0, 1.0);
+        let eye = CAM_POS;
+        for t in &v {
+            let off = Vec3::from(t.pos) - eye;
+            let d = off.x.hypot(off.z);
+            assert!((d - 2.0).abs() < 1e-4, "{:?} is {d} from the eye", t.pos);
+        }
+        // The middle column is where a flat screen's would be, and the width is kept along
+        // the bend (the chords add up to just under the arc).
+        let mid = v[SCREEN_COLUMNS];
+        assert!((mid.pos[0] - eye.x).abs() < EPS && (mid.pos[2] - (eye.z - 2.0)).abs() < EPS);
+        let along: f32 = (0..SCREEN_COLUMNS).map(|i| (Vec3::from(v[2 * i + 2].pos) - Vec3::from(v[2 * i].pos)).length()).sum();
+        assert!((along - 3.0).abs() < 0.01, "width along the screen {along}");
+        // Columns go left to right with the image.
+        assert!((0..SCREEN_COLUMNS).all(|i| v[2 * i + 2].uv[0] > v[2 * i].uv[0] && v[2 * i + 2].pos[0] > v[2 * i].pos[0]));
+    }
+
+    #[test]
+    fn a_partial_curve_bends_less_and_a_huge_screen_never_closes_into_a_ring() {
+        let screen = ScreenPlacement { height: 1.0, distance: 2.0 };
+        let edge_z = |curve: f32| screen_mesh(screen, 3.0, curve)[0].pos[2];
+        let flat = edge_z(0.0);
+        assert!(edge_z(0.5) > flat && edge_z(1.0) > edge_z(0.5), "edges come towards you as it curves");
+        // 100 m wide at 2 m: the bend is capped short of a full circle.
+        let v = screen_mesh(screen, 100.0, 1.0);
+        let (left, right) = (Vec3::from(v[0].pos), Vec3::from(v[SCREEN_VERTICES - 2].pos));
+        assert!(left.distance(right) > 1.0, "the two edges don't meet");
+    }
+
+    #[test]
+    fn the_index_strip_covers_each_column_with_two_triangles() {
+        let idx = screen_indices();
+        assert_eq!(&idx[..6], &[0, 2, 3, 0, 3, 1]);
+        assert_eq!(*idx.iter().max().unwrap() as usize, SCREEN_VERTICES - 1);
     }
 
     #[test]

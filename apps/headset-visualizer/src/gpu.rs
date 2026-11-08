@@ -119,7 +119,8 @@ pub async fn init_gpu(window: &Window, cli: &Cli, vertices: &[Vertex]) -> anyhow
     };
     surface.configure(&device, &config);
 
-    let scene = Scene::new(&device, format, vertices, screen);
+    let mut scene = Scene::new(&device, format, vertices, screen);
+    scene.curve = cli.curve;
 
     // HUD: Noto Sans (SIL OFL 1.1, see assets/OFL.txt) is embedded in the binary; if it fails to parse, disable HUD text.
     let font_arc: Option<FontArc> = match FontArc::try_from_slice(hud::FONT_BYTES) {

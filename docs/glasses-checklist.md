@@ -59,7 +59,17 @@ Prediction is off by default. `⌃⌥X` turns it on and off (it starts at 20 ms 
 
 If a still screen shimmers at the amount that's right for turning, the smoothing (`SMOOTHING_NS` in `prediction.rs`) needs to be longer.
 
-## 5. Unplugging (`local/unplug-fix` branch)
+## 5. Curved screen
+
+- [ ] Start with `--curve 1` (and again with `--curve 0.5`): the screen bends around you, and text near its left and right edges is easier to read than on the flat screen at the same size.
+- [ ] Turn your head along the screen: no visible seams or kinks where its 48 columns meet.
+- [ ] Recentering, moving the screen closer and further, and making it bigger and smaller still work with the curve.
+
+| Curve that feels best | Edges easier to read? | Seams visible? |
+|---|---|---|
+| | | |
+
+## 6. Unplugging (`local/unplug-fix` branch)
 
 This needs the locally patched `ar-drivers` described in that branch's `patches/README.md`.
 
@@ -67,7 +77,7 @@ This needs the locally patched `ar-drivers` described in that branch's `patches/
 - [ ] Plug them back in: tracking resumes without restarting the app.
 - [ ] Repeat a few times, including unplugging while turning your head.
 
-## 6. The app bundle
+## 7. The app bundle
 
 - [ ] Install with `scripts/bundle-macos.sh --install`, choose **Open at Login** in the menu, log out and back in: vr-space starts and appears in the menu bar.
 

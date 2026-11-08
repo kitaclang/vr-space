@@ -91,6 +91,11 @@ pub struct Cli {
     #[arg(long, default_value_t = 0.0)]
     pub predict_ms: f32,
 
+    /// Curve the virtual screen around you: 0 = flat, 1 = every part of it the same distance
+    /// from your eyes, like a curved monitor wrapped around your head
+    #[arg(long, default_value_t = 0.0)]
+    pub curve: f32,
+
     /// Copy each captured frame through the CPU instead of letting the GPU read it in place
     /// (slower; for comparison, or if the screen looks wrong)
     #[arg(long)]
@@ -195,6 +200,9 @@ impl Cli {
         if !(0.0..=3.0).contains(&self.neck_model) {
             anyhow::bail!("--neck-model must be between 0 and 3");
         }
+        if !(0.0..=1.0).contains(&self.curve) {
+            anyhow::bail!("--curve must be between 0 and 1");
+        }
         if !(0.0..=100.0).contains(&self.predict_ms) {
             anyhow::bail!("--predict-ms must be between 0 and 100");
         }
@@ -289,10 +297,13 @@ mod tests {
             &["--neck-model", "3.5"],
             &["--screen-height", "NaN"],
             &["--predict-ms", "101"],
+            &["--curve", "1.5"],
+            &["--curve", "-0.1"],
             &["--predict-ms", "NaN"],
         ] {
             assert!(parse(args).is_err(), "accepted {args:?}");
         }
         assert!(parse(&["--predict-ms", "20"]).is_ok());
+        assert!(parse(&["--curve", "0.5"]).is_ok());
     }
 }
