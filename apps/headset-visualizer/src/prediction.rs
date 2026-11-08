@@ -95,6 +95,60 @@ impl PosePredictor {
     }
 }
 
+/// The prediction lead in use, as set by `--predict-ms`, saved settings, keys or the menu.
+/// Turning it off remembers the amount, so turning it back on restores it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Lead {
+    /// Milliseconds ahead; 0 = off.
+    pub ms: f32,
+    /// What turning it on again goes back to.
+    restore_ms: f32,
+}
+
+impl Lead {
+    /// Turning on from off with nothing to go back to uses this.
+    pub const DEFAULT_MS: f32 = 20.0;
+    /// How much one "further" or "less far" step changes it.
+    pub const STEP_MS: f32 = 5.0;
+    pub const MAX_MS: f32 = 100.0;
+
+    pub fn new(ms: f32) -> Self {
+        let ms = ms.clamp(0.0, Self::MAX_MS);
+        Self { ms, restore_ms: if ms > 0.0 { ms } else { Self::DEFAULT_MS } }
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.ms > 0.0
+    }
+
+    pub fn ns(&self) -> u64 {
+        (f64::from(self.ms) * 1e6) as u64
+    }
+
+    pub fn toggle(&mut self) {
+        if self.is_on() {
+            self.restore_ms = self.ms;
+            self.ms = 0.0;
+        } else {
+            self.ms = self.restore_ms;
+        }
+    }
+
+    /// One step further ahead (turning it on if it was off).
+    pub fn more(&mut self) {
+        self.ms = (self.ms + Self::STEP_MS).min(Self::MAX_MS);
+        self.restore_ms = self.ms;
+    }
+
+    /// One step less far ahead; reaching 0 turns it off.
+    pub fn less(&mut self) {
+        self.ms = (self.ms - Self::STEP_MS).max(0.0);
+        if self.is_on() {
+            self.restore_ms = self.ms;
+        }
+    }
+}
+
 /// How far ahead to predict a sample taken at `sampled_ns` for a frame drawn at `now_ns` and
 /// shown `lead_ns` later: the sample's age plus the lead.
 pub fn horizon_ns(sampled_ns: u64, now_ns: u64, lead_ns: u64) -> u64 {
@@ -215,6 +269,35 @@ mod tests {
         let capped = p.predict(q, 10 * MAX_HORIZON_NS);
         let at_cap = p.predict(q, MAX_HORIZON_NS);
         assert!(angle_between(capped, at_cap) < 1e-6);
+    }
+
+    #[test]
+    fn the_lead_toggles_and_steps() {
+        let mut lead = Lead::new(0.0);
+        assert!(!lead.is_on());
+        lead.toggle();
+        assert_eq!(lead.ms, Lead::DEFAULT_MS, "on with nothing to restore");
+        lead.more();
+        assert_eq!(lead.ms, 25.0);
+        lead.toggle();
+        assert_eq!((lead.ms, lead.ns()), (0.0, 0));
+        lead.toggle();
+        assert_eq!(lead.ms, 25.0, "back to the amount it had");
+
+        let mut lead = Lead::new(5.0);
+        lead.less();
+        assert!(!lead.is_on(), "stepping to 0 turns it off");
+        lead.toggle();
+        assert_eq!(lead.ms, 5.0, "and on again restores the last amount");
+        lead.toggle();
+        lead.more();
+        assert_eq!(lead.ms, 5.0, "a step up from off");
+
+        let mut lead = Lead::new(98.0);
+        lead.more();
+        assert_eq!(lead.ms, Lead::MAX_MS);
+        assert_eq!(Lead::new(500.0).ms, Lead::MAX_MS);
+        assert_eq!(Lead::new(20.0).ns(), 20_000_000);
     }
 
     #[test]

@@ -4,6 +4,8 @@ What's planned for vr-space, grouped by priority rather than dates. vr-space is 
 
 ## Now
 
+[docs/glasses-checklist.md](docs/glasses-checklist.md) lists everything below that needs the glasses, as one session's worth of steps.
+
 - **Finish testing on real glasses.** Runs with XREAL Air glasses confirmed that `--fullscreen` opens on the glasses, the screen is sharp and in the right proportions, recentering with `C` works, the screen stays in place as you turn your head, and the neck model feels natural at its default strength. Still to confirm:
   - glasses plugged in after launch are picked up
   - `--screen-height`, `--screen-distance` and `--fov` behave as described

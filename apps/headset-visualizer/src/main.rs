@@ -86,6 +86,13 @@ pub(crate) enum Command {
     OpenScreenSettings,
     /// Turn opening at login on or off (only offered when running as vr-space.app).
     ToggleOpenAtLogin,
+    /// Turn head-pose prediction on or off.
+    TogglePrediction,
+    /// Predict one step further ahead / less far ahead.
+    PredictMore,
+    PredictLess,
+    /// Switch between the GPU reading captured frames in place and copying them.
+    ToggleFrameCopying,
     Quit,
 }
 
@@ -204,6 +211,7 @@ struct ExplicitFlags {
     /// `--display` or `--window`: either one decides what's shown.
     source: bool,
     fullscreen: bool,
+    predict_ms: bool,
 }
 
 impl ExplicitFlags {
@@ -214,6 +222,7 @@ impl ExplicitFlags {
             screen_height: given("screen_height"),
             source: given("display") || given("window"),
             fullscreen: given("fullscreen"),
+            predict_ms: given("predict_ms"),
         }
     }
 }
@@ -237,6 +246,7 @@ struct StartupPlan {
     window: Option<WindowChoice>,
     fullscreen: Option<u32>,
     hud: bool,
+    predict_ms: f32,
 }
 
 impl StartupPlan {
@@ -256,6 +266,7 @@ impl StartupPlan {
             window,
             fullscreen: if explicit.fullscreen { cli.fullscreen } else { saved.fullscreen },
             hud: !cli.no_hud && saved.hud.unwrap_or(true),
+            predict_ms: pick(explicit.predict_ms, cli.predict_ms, saved.predict_ms),
         }
     }
 }
@@ -403,6 +414,8 @@ struct Gpu {
     // current frame and the two before it is enough.
     frame_seq: u64,
     zero_copy: bool,
+    // Whether the GPU can read frames in place at all (Metal, and no import has failed).
+    zero_copy_available: bool,
     #[cfg(target_os = "macos")]
     shown_frames: [Option<CapturedFrame>; 3],
 }
@@ -542,9 +555,10 @@ async fn init_gpu(window: &Window, cli: &Cli, vertices: &[Vertex]) -> anyhow::Re
     };
 
     #[cfg(target_os = "macos")]
-    let zero_copy = !cli.copy_frames && iosurface::device_supports_import(&device);
+    let zero_copy_available = iosurface::device_supports_import(&device);
     #[cfg(not(target_os = "macos"))]
-    let zero_copy = false;
+    let zero_copy_available = false;
+    let zero_copy = zero_copy_available && !cli.copy_frames;
     info!("Captured frames: {}", if zero_copy { "read in place by the GPU" } else { "copied through the CPU" });
 
     let hud_font_size = hud_size.max(8.0);
@@ -570,6 +584,7 @@ async fn init_gpu(window: &Window, cli: &Cli, vertices: &[Vertex]) -> anyhow::Re
         hud_text_updated_ns: 0,
         frame_seq: 0,
         zero_copy,
+        zero_copy_available,
         #[cfg(target_os = "macos")]
         shown_frames: [None, None, None],
     })
@@ -794,7 +809,7 @@ fn screen_status_line(tex_size: (u32, u32), #[cfg(target_os = "macos")] source: 
 /// read it, else by copying its pixels. If sharing fails once, frames are copied from then on.
 #[cfg(target_os = "macos")]
 fn show_captured_frame(gpu: &mut Gpu, frame: CapturedFrame) {
-    let Gpu { device, queue, scene, zero_copy, shown_frames, .. } = gpu;
+    let Gpu { device, queue, scene, zero_copy, zero_copy_available, shown_frames, .. } = gpu;
     if *zero_copy {
         if let Some(surface) = frame.iosurface() {
             // SAFETY: `surface` belongs to `frame`, which is alive here and, once shown, kept
@@ -811,9 +826,12 @@ fn show_captured_frame(gpu: &mut Gpu, frame: CapturedFrame) {
         }
         warn!("Can't let the GPU read captured frames in place; copying them instead");
         *zero_copy = false;
+        *zero_copy_available = false;
     }
-    // Copied frames needn't be kept: `write_texture` takes its own copy.
-    *shown_frames = [None, None, None];
+    // Copied frames needn't be kept (`write_texture` takes its own copy), but frames shown in
+    // place before may still be in the GPU's queue: let them go one frame at a time.
+    shown_frames.rotate_right(1);
+    shown_frames[0] = None;
     frame.with_bytes(|bytes| scene.upload_frame(device, queue, frame.width, frame.height, frame.bytes_per_row, bytes));
 }
 
@@ -1115,7 +1133,7 @@ fn main() -> anyhow::Result<()> {
     let mut fps = FpsMeter::new();
     let mut latency_meter = latency::LatencyMeter::default();
     let mut predictor = prediction::PosePredictor::new();
-    let predict_lead_ns = (f64::from(cli.predict_ms) * 1e6) as u64;
+    let mut predict_lead = prediction::Lead::new(plan.predict_ms);
     let mut latency_logged_ns = 0u64;
 
     // Menu bar icon: created once the event loop runs (macOS requires that). Its menu and the
@@ -1179,6 +1197,10 @@ fn main() -> anyhow::Result<()> {
                             VirtualKeyCode::Equals | VirtualKeyCode::Plus | VirtualKeyCode::NumpadAdd => Some(Command::Bigger),
                             VirtualKeyCode::Minus | VirtualKeyCode::NumpadSubtract => Some(Command::Smaller),
                             VirtualKeyCode::R => Some(Command::ResetScreen),
+                            VirtualKeyCode::X => Some(Command::TogglePrediction),
+                            VirtualKeyCode::RBracket => Some(Command::PredictMore),
+                            VirtualKeyCode::LBracket => Some(Command::PredictLess),
+                            VirtualKeyCode::Z => Some(Command::ToggleFrameCopying),
                             _ => None,
                         };
                     }
@@ -1266,7 +1288,10 @@ fn main() -> anyhow::Result<()> {
                     gpu.glyph_brush.is_some(),
                     macos_app::open_at_login(),
                 ) {
-                    Ok(bar) => menu_bar = Some(bar),
+                    Ok(mut bar) => {
+                        bar.set_latency(predict_lead.ms, !gpu.zero_copy, gpu.zero_copy_available);
+                        menu_bar = Some(bar);
+                    }
                     Err(e) => warn!("Menu bar icon unavailable: {e}"),
                 }
                 if fullscreen_on.is_some() {
@@ -1320,6 +1345,7 @@ fn main() -> anyhow::Result<()> {
 
                 // With --predict-ms, draw the head where it's expected to be when the frame is
                 // on the glasses. Recentering above uses the measured pose.
+                let predict_lead_ns = predict_lead.ns();
                 let shown_head = if predict_lead_ns == 0 {
                     head
                 } else if has {
@@ -1386,13 +1412,15 @@ fn main() -> anyhow::Result<()> {
                         screen_line,
                         format!("distance: {:.2}  height: {:.2}", gpu.scene.screen.distance, gpu.scene.screen.height),
                     ];
-                    if predict_lead_ns > 0 {
-                        gpu.hud_text.push(format!(
+                    gpu.hud_text.push(if predict_lead.is_on() {
+                        format!(
                             "predict: {:.0} ms ahead, head turning {:.0}°/s",
-                            cli.predict_ms,
+                            predict_lead.ms,
                             predictor.speed().to_degrees()
-                        ));
-                    }
+                        )
+                    } else {
+                        "predict: off".to_string()
+                    });
                     gpu.hud_text_updated_ns = now_ns;
                 }
 
@@ -1601,6 +1629,17 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+                Command::TogglePrediction => predict_lead.toggle(),
+                Command::PredictMore => predict_lead.more(),
+                Command::PredictLess => predict_lead.less(),
+                Command::ToggleFrameCopying => {
+                    if gpu.zero_copy_available {
+                        gpu.zero_copy = !gpu.zero_copy;
+                        info!("Captured frames: {}", if gpu.zero_copy { "read in place by the GPU" } else { "copied through the CPU" });
+                    } else {
+                        info!("Captured frames can only be copied here: the GPU can't read them in place");
+                    }
+                }
             }
             if matches!(
                 cmd,
@@ -1625,6 +1664,10 @@ fn main() -> anyhow::Result<()> {
                     settings.fullscreen = fullscreen_on;
                 }
                 Command::ToggleHud => settings.hud = Some(gpu.hud_enabled),
+                Command::TogglePrediction | Command::PredictMore | Command::PredictLess => {
+                    settings.predict_ms = Some(predict_lead.ms);
+                    info!("Head-pose prediction: {} ms ahead", predict_lead.ms);
+                }
                 #[cfg(target_os = "macos")]
                 Command::ShowDisplay(id) if shown == CaptureSource::Display(id) => {
                     settings.display = Some(id);
@@ -1641,6 +1684,7 @@ fn main() -> anyhow::Result<()> {
             #[cfg(target_os = "macos")]
             if let Some(bar) = menu_bar.as_mut() {
                 bar.set_state(shown, fullscreen_on, gpu.hud_enabled);
+                bar.set_latency(predict_lead.ms, !gpu.zero_copy, gpu.zero_copy_available);
             }
         }
     });
@@ -1881,6 +1925,7 @@ mod tests {
             window: Some(SavedWindow { app: "Safari".into(), title: "Docs".into() }),
             fullscreen: Some(9),
             hud: Some(false),
+            predict_ms: Some(25.0),
         }
     }
 
@@ -1892,11 +1937,13 @@ mod tests {
         assert_eq!(p.window, Some(WindowChoice::Saved(SavedWindow { app: "Safari".into(), title: "Docs".into() })));
         assert_eq!(p.fullscreen, Some(9));
         assert!(!p.hud);
+        assert_eq!(p.predict_ms, 25.0);
 
         // Nothing saved: the defaults.
         let p = plan(&[], &Settings::default());
         assert_eq!(p.screen, ScreenPlacement { distance: 4.0, height: 1.4 });
         assert_eq!((p.display, p.window, p.fullscreen, p.hud), (0, None, None, true));
+        assert_eq!(p.predict_ms, 0.0, "prediction is off by default");
     }
 
     #[test]
@@ -1913,6 +1960,7 @@ mod tests {
 
         // A flag set to its default value still counts as given.
         assert_eq!(plan(&["--screen-height", "1.4"], &saved_all()).screen.height, 1.4);
+        assert_eq!(plan(&["--predict-ms", "0"], &saved_all()).predict_ms, 0.0, "turned off on the command line");
     }
 
     #[test]

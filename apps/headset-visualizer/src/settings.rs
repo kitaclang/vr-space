@@ -40,6 +40,9 @@ pub struct Settings {
     /// Whether the HUD is shown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hud: Option<bool>,
+    /// How far ahead head movement is predicted, in ms (0 = off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predict_ms: Option<f32>,
 }
 
 impl Settings {
@@ -49,6 +52,7 @@ impl Settings {
         let positive = |v: Option<f32>| v.filter(|x| x.is_finite() && *x > 0.0);
         s.screen_distance = positive(s.screen_distance);
         s.screen_height = positive(s.screen_height);
+        s.predict_ms = s.predict_ms.filter(|x| (0.0..=100.0).contains(x));
         if s.window.as_ref().is_some_and(|w| w.app.is_empty()) {
             s.window = None;
         }
@@ -147,11 +151,13 @@ mod tests {
     #[test]
     fn drops_bad_values_and_ignores_unknown_ones() {
         let s = Settings::from_json(
-            r#"{"screen_distance": -2, "screen_height": 0, "window": {"app": ""}, "hud": false, "future": 1}"#,
+            r#"{"screen_distance": -2, "screen_height": 0, "window": {"app": ""}, "hud": false, "predict_ms": 300, "future": 1}"#,
         )
         .unwrap();
         assert_eq!(s, Settings { hud: Some(false), ..Settings::default() });
         assert!(Settings::from_json("not json").is_err());
+        assert_eq!(Settings::from_json(r#"{"predict_ms": -1}"#).unwrap().predict_ms, None);
+        assert_eq!(Settings::from_json(r#"{"predict_ms": 15}"#).unwrap().predict_ms, Some(15.0));
     }
 
     #[test]

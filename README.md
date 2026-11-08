@@ -75,7 +75,7 @@ The HUD shows where the time goes, as a mean with the 95th percentile and maximu
 
 These stop where the frame is handed to the GPU. The GPU's drawing time and the wait for the glasses to show the frame (up to one refresh) aren't included: wgpu 0.17 doesn't expose what would report them. To compare frame sharing with copying, run once with and once without `--copy-frames` and compare the log lines.
 
-`--predict-ms` hides some of this delay. The app estimates how fast your head is turning and draws it where it will be, the given number of milliseconds after the frame is drawn (plus the age of the head-tracking sample). Too little and the screen still trails behind when you turn; too much and it overshoots and springs back when you stop. A good starting point is `pose->submit` plus one refresh of the glasses (about 17 ms at 60 Hz). While it's on, the HUD shows how fast your head is turning.
+`--predict-ms` hides some of this delay. The app estimates how fast your head is turning and draws it where it will be, the given number of milliseconds after the frame is drawn (plus the age of the head-tracking sample). Too little and the screen still trails behind when you turn; too much and it overshoots and springs back when you stop. A good starting point is `pose->submit` plus one refresh of the glasses (about 17 ms at 60 Hz). The HUD's `predict:` line shows the amount and how fast your head is turning. To find the right amount, turn prediction on and off with `⌃⌥X` and step it with `⌃⌥]` and `⌃⌥[` while you wear the glasses; the amount you leave it at is saved. `⌃⌥Z` switches frame copying the same way. [docs/glasses-checklist.md](docs/glasses-checklist.md) walks through trying all of this on the glasses.
 
 ### Using it with the glasses
 
@@ -112,7 +112,7 @@ The glasses only track rotation (3DoF), not position, so leaning or moving in yo
 
 ### Controls
 
-vr-space lives in the menu bar (it has no Dock icon). While it runs, its glasses icon has the controls: recenter, move and resize the screen, choose which display or window to show and which display to go fullscreen on (the glasses), show or hide the HUD, open Screen Recording settings, open at login (when run as vr-space.app), and quit. The display lists update when you plug in or remove a display, and the window list updates as windows open and close.
+vr-space lives in the menu bar (it has no Dock icon). While it runs, its glasses icon has the controls: recenter, move and resize the screen, choose which display or window to show and which display to go fullscreen on (the glasses), show or hide the HUD, the latency switches (head-pose prediction and frame copying, under **Latency**), open Screen Recording settings, open at login (when run as vr-space.app), and quit. The display lists update when you plug in or remove a display, and the window list updates as windows open and close.
 
 These shortcuts work from any app, so you can adjust the screen while you work:
 
@@ -122,6 +122,9 @@ These shortcuts work from any app, so you can adjust the screen while you work:
 | `⌃⌥↑` / `⌃⌥↓` | Move the screen further away / closer (it keeps its size, so closer looks bigger) |
 | `⌃⌥=` / `⌃⌥-` | Make the screen bigger / smaller |
 | `⌃⌥R` | Reset distance and size to the `--screen-distance` and `--screen-height` values (or their defaults) |
+| `⌃⌥X` | Turn head-pose prediction on or off (see [Latency](#latency)) |
+| `⌃⌥]` / `⌃⌥[` | Predict 5 ms further ahead / less far ahead |
+| `⌃⌥Z` | Switch between the GPU reading captured frames in place and copying them (for comparison) |
 
 If another app already uses one of these, the log says so and that shortcut is skipped.
 
@@ -133,6 +136,9 @@ When the vr-space window has focus, plain keys work too:
 | `↑` / `↓` | Further away / closer |
 | `+` / `-` | Bigger / smaller |
 | `R` | Reset distance and size |
+| `X` | Prediction on or off |
+| `]` / `[` | Predict further ahead / less far ahead |
+| `Z` | Share or copy captured frames |
 | `F` | Toggle fullscreen |
 | `H` | Show or hide the HUD |
 | `P` | Open Screen Recording settings |
@@ -148,6 +154,7 @@ vr-space remembers what you change while it runs and starts that way next time:
 - the display or window shown on the virtual screen
 - the display it's fullscreen on (the glasses), or that it's a window
 - whether the HUD is shown
+- how far ahead head movement is predicted (or that prediction is off)
 
 A saved window is found again by its app and title, or any window of that app if the title changed. If the app isn't open, the virtual screen shows the saved display instead, and the window stays remembered. If the glasses aren't plugged in at startup, vr-space goes fullscreen on them as soon as they are, so you can open it at login before connecting them.
 

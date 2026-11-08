@@ -40,6 +40,14 @@ const SHORTCUTS: [(Code, Command, &str, &str); 6] = [
     (Code::KeyR, Command::ResetScreen, "reset", "Reset size and distance"),
 ];
 
+/// The same for the Latency submenu: switches for trying latency settings on the glasses.
+const LATENCY_SHORTCUTS: [(Code, Command, &str, &str); 4] = [
+    (Code::KeyX, Command::TogglePrediction, "predict", "Predict head movement"),
+    (Code::BracketRight, Command::PredictMore, "predict:more", "Predict further ahead"),
+    (Code::BracketLeft, Command::PredictLess, "predict:less", "Predict less far ahead"),
+    (Code::KeyZ, Command::ToggleFrameCopying, "copy", "Copy frames through the CPU (slower)"),
+];
+
 pub struct MenuBar {
     _tray: TrayIcon,
     _hotkeys: Option<GlobalHotKeyManager>,
@@ -47,6 +55,8 @@ pub struct MenuBar {
     window_menu: Submenu,
     fullscreen_menu: Submenu,
     hud_item: CheckMenuItem,
+    predict_item: CheckMenuItem,
+    copy_item: CheckMenuItem,
     login_item: Option<CheckMenuItem>,
     displays: Vec<u32>,
     windows: Vec<WindowInfo>,
@@ -80,6 +90,21 @@ impl MenuBar {
         let window_menu = Submenu::new("Show window", true);
         let fullscreen_menu = Submenu::new("Fullscreen on", true);
         let hud_item = CheckMenuItem::with_id("hud", "Show HUD", hud_available, hud_on, None);
+
+        // Latency: check marks for the two switches, plain items for the steps. Their state is
+        // set right after with `set_latency`.
+        let latency_menu = Submenu::new("Latency", true);
+        let accel = |code: Code| Some(Accelerator::new(shortcut_mods(), code));
+        let [predict, more, less, copy] = LATENCY_SHORTCUTS;
+        let predict_item = CheckMenuItem::with_id(predict.2, predict.3, true, false, accel(predict.0));
+        let copy_item = CheckMenuItem::with_id(copy.2, copy.3, true, false, accel(copy.0));
+        latency_menu.append_items(&[
+            &predict_item,
+            &MenuItem::with_id(more.2, more.3, true, accel(more.0)),
+            &MenuItem::with_id(less.2, less.3, true, accel(less.0)),
+            &PredefinedMenuItem::separator(),
+            &copy_item,
+        ])?;
         let (recenter_code, _, recenter_id, recenter_label) = SHORTCUTS[0];
         let recenter = MenuItem::with_id(
             recenter_id,
@@ -94,7 +119,7 @@ impl MenuBar {
         let quit = MenuItem::with_id("quit", "Quit vr-space", true, None);
 
         let menu = Menu::new();
-        let items: [&dyn IsMenuItem; 9] = [
+        let items: [&dyn IsMenuItem; 10] = [
             &recenter,
             &screen_menu,
             &PredefinedMenuItem::separator(),
@@ -102,6 +127,7 @@ impl MenuBar {
             &window_menu,
             &fullscreen_menu,
             &hud_item,
+            &latency_menu,
             &PredefinedMenuItem::separator(),
             &settings,
         ];
@@ -137,6 +163,8 @@ impl MenuBar {
             window_menu,
             fullscreen_menu,
             hud_item,
+            predict_item,
+            copy_item,
             login_item,
             displays: Vec::new(),
             windows: Vec::new(),
@@ -200,6 +228,15 @@ impl MenuBar {
         }
     }
 
+    /// Update the Latency submenu: the prediction lead in ms (0 = off), whether frames are
+    /// copied, and whether they can be shared at all (if not, copying can't be turned off).
+    pub fn set_latency(&mut self, predict_ms: f32, copying: bool, sharing_available: bool) {
+        self.predict_item.set_checked(predict_ms > 0.0);
+        self.predict_item.set_text(predict_label(predict_ms));
+        self.copy_item.set_checked(copying);
+        self.copy_item.set_enabled(sharing_available);
+    }
+
     /// Update the Open at Login check mark (`None`: the setting couldn't be read).
     pub fn set_open_at_login(&mut self, on: Option<bool>) {
         if let (Some(item), Some(on)) = (&self.login_item, on) {
@@ -249,7 +286,7 @@ fn register_shortcuts(proxy: EventLoopProxy<Command>) -> Option<GlobalHotKeyMana
         }
     };
     let mut bindings = Vec::new();
-    for (code, cmd, _, label) in SHORTCUTS {
+    for (code, cmd, _, label) in SHORTCUTS.into_iter().chain(LATENCY_SHORTCUTS) {
         let hotkey = HotKey::new(Some(shortcut_mods()), code);
         match manager.register(hotkey) {
             Ok(()) => bindings.push((hotkey.id(), cmd)),
@@ -272,7 +309,7 @@ fn register_shortcuts(proxy: EventLoopProxy<Command>) -> Option<GlobalHotKeyMana
 }
 
 fn command_for_menu_id(id: &str) -> Option<Command> {
-    if let Some(&(_, cmd, _, _)) = SHORTCUTS.iter().find(|(_, _, item, _)| *item == id) {
+    if let Some(&(_, cmd, _, _)) = SHORTCUTS.iter().chain(&LATENCY_SHORTCUTS).find(|(_, _, item, _)| *item == id) {
         return Some(cmd);
     }
     match id {
@@ -292,6 +329,16 @@ fn command_for_menu_id(id: &str) -> Option<Command> {
                 None
             }
         }
+    }
+}
+
+/// "Predict head movement", with how far ahead while it's on.
+fn predict_label(ms: f32) -> String {
+    let base = LATENCY_SHORTCUTS[0].3;
+    if ms > 0.0 {
+        format!("{base} ({ms:.0} ms ahead)")
+    } else {
+        base.to_string()
     }
 }
 
@@ -341,6 +388,27 @@ mod tests {
         assert_eq!(command_for_menu_id("fullscreen:7"), Some(Command::FullscreenOn(Some(7))));
         assert_eq!(command_for_menu_id("fullscreen:window"), Some(Command::FullscreenOn(None)));
         assert_eq!(command_for_menu_id("window:abc"), None);
+        assert_eq!(command_for_menu_id("predict"), Some(Command::TogglePrediction));
+        assert_eq!(command_for_menu_id("predict:more"), Some(Command::PredictMore));
+        assert_eq!(command_for_menu_id("predict:less"), Some(Command::PredictLess));
+        assert_eq!(command_for_menu_id("copy"), Some(Command::ToggleFrameCopying));
+    }
+
+    #[test]
+    fn shortcuts_and_menu_ids_are_unique() {
+        let all: Vec<_> = SHORTCUTS.iter().chain(&LATENCY_SHORTCUTS).collect();
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.0, b.0, "two shortcuts on one key");
+                assert_ne!(a.2, b.2, "two items with one id");
+            }
+        }
+    }
+
+    #[test]
+    fn the_prediction_item_shows_how_far_ahead() {
+        assert_eq!(predict_label(0.0), "Predict head movement");
+        assert_eq!(predict_label(20.0), "Predict head movement (20 ms ahead)");
     }
 
     #[test]
