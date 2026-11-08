@@ -14,7 +14,7 @@ What's planned for vr-space, grouped by priority rather than dates. vr-space is 
 ## Next
 
 - **Finish the macOS app.** `scripts/bundle-macos.sh` now builds `vr-space.app`, which opens from Finder, can open at login, holds its own Screen Recording permission and logs to `~/Library/Logs/vr-space.log`. It has its own icon. Still to do: confirming Open at Login across a real logout and login, and a signed, notarized download (which also needs the libusb LGPL terms to be met, see the README).
-- **Survive unplugged glasses.** Today the app waits for glasses that are missing at startup, but unplugging them mid-session quits the app: `ar-drivers` calls `exit(0)` on a USB read error. Fixing it needs `ar-drivers` to return errors from `Fusion::update()` instead of exiting, which means a change upstream in [headset-utils](https://github.com/3rl-io/headset-utils).
+- **Survive unplugged glasses.** Today the app waits for glasses that are missing at startup, but unplugging them mid-session quits the app: `ar-drivers` calls `exit(0)` on a USB read error. A fix is on the local `local/unplug-fix` branch: a patch to `ar-drivers` adds `try_update()` and `try_any_fusion()`, which return errors instead, and vr-space then waits for the glasses to come back. That branch builds only against a locally patched `ar-drivers` (see `patches/README.md` there), and the fix isn't sent upstream, so it stays off `main`. Still to do: test unplugging and replugging with the glasses.
 
 ## Later
 
