@@ -20,7 +20,7 @@ What's planned for vr-space, grouped by priority rather than dates. vr-space is 
 
 ## Later
 
-- **More automated tests.** The scene is now rendered offscreen on the GPU in `cargo test` and its pixels checked. Still to cover: the HUD (text and button positions) and the window and fullscreen handling, which need a real window.
+- **More automated tests.** The scene and the HUD are now drawn offscreen on the GPU in `cargo test` and their pixels checked (the HUD tests found, and the HUD now fixes, a Calibrate button too small for its label at large `--hud-size`). Still to cover: the window and fullscreen handling, which need a real window.
 - **Reduce latency further.** Captured frames are now read by the GPU straight from the capture's IOSurface, with no copy through the CPU (`--copy-frames` brings the copy back for comparison). The HUD and log now measure pose → submit, capture → submit and frame upload time; on a 1920×1080 Mac display, sharing cut frame upload from about 1.8 ms to 0.02 ms and mean capture → submit from about 7.9 ms to 4.2 ms. Still to do: check the numbers on the glasses, and measure the rest of motion-to-photon (GPU time and the wait for the display), which needs access to the Metal drawable that wgpu 0.17 doesn't give, or a photodiode. `--predict-ms` (off by default) now predicts head movement to hide part of the delay; still to do: tune it on the glasses (how far ahead, and how much smoothing before a still screen shimmers), then consider turning it on by default.
 - **Curved or multiple virtual screens.**
 

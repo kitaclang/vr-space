@@ -43,6 +43,10 @@ mod latency;
 // Head-pose prediction (--predict-ms)
 mod prediction;
 
+// HUD layout and text
+mod hud;
+use crate::hud::{HudLayout, LabelMetrics, Rect};
+
 // Captured frames shown in place on the GPU (IOSurface -> Metal texture)
 #[cfg(target_os = "macos")]
 mod iosurface;
@@ -369,20 +373,6 @@ struct PoseCopy {
 
 // ================= GPU =================
 
-// Simple rectangle hitbox
-#[derive(Clone, Copy, Debug)]
-struct Rect {
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-}
-impl Rect {
-    fn contains(&self, px: f32, py: f32) -> bool {
-        px >= self.x && px <= self.x + self.w && py >= self.y && py <= self.y + self.h
-    }
-}
-
 struct Gpu {
     surface: wgpu::Surface,
     device: wgpu::Device,
@@ -397,7 +387,10 @@ struct Gpu {
     staging_belt: Option<wgpu::util::StagingBelt>,
     hud_enabled: bool,
     hud_font_size: f32,
-    hud_padding: f32,
+    // The HUD font, and its button label sizes at the last font size used (measured again
+    // only when that changes, for example on a move to a display with another scale).
+    hud_font: Option<FontArc>,
+    hud_metrics: Option<LabelMetrics>,
     calibrate_btn: Rect,
     // "Screen Recording settings" button; only shown while capture has no permission or failed.
     settings_btn: Option<Rect>,
@@ -532,8 +525,7 @@ async fn init_gpu(window: &Window, cli: &Cli, vertices: &[Vertex]) -> anyhow::Re
     let scene = Scene::new(&device, format, vertices, screen);
 
     // HUD: Noto Sans (SIL OFL 1.1, see assets/OFL.txt) is embedded in the binary; if it fails to parse, disable HUD text.
-    static EMBED_FONT: &[u8] = include_bytes!("../assets/NotoSans-Regular.ttf");
-    let font_arc: Option<FontArc> = match FontArc::try_from_slice(EMBED_FONT) {
+    let font_arc: Option<FontArc> = match FontArc::try_from_slice(hud::FONT_BYTES) {
         Ok(f) => Some(f),
         Err(_) => {
             warn!("Embedded font invalid; HUD text will be disabled.");
@@ -542,6 +534,7 @@ async fn init_gpu(window: &Window, cli: &Cli, vertices: &[Vertex]) -> anyhow::Re
     };
     // Setup HUD resources optionally
     let hud_requested = !hud_forced_off;
+    let hud_font = font_arc.clone().filter(|_| hud_requested);
     let (glyph_brush, staging_belt, hud_enabled) = if hud_requested {
         if let Some(font) = font_arc {
             let gb = GlyphBrushBuilder::using_font(font).build(&device, format);
@@ -562,8 +555,8 @@ async fn init_gpu(window: &Window, cli: &Cli, vertices: &[Vertex]) -> anyhow::Re
     info!("Captured frames: {}", if zero_copy { "read in place by the GPU" } else { "copied through the CPU" });
 
     let hud_font_size = hud_size.max(8.0);
-    let hud_padding = 10.0;
-    let calibrate_btn = Rect { x: 0.0, y: 0.0, w: 110.0, h: 28.0 };
+    // Placed on the first frame, once the window size is known.
+    let calibrate_btn = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
     let show_calibrated_toast_until_ns = 0;
 
     Ok(Gpu {
@@ -576,7 +569,8 @@ async fn init_gpu(window: &Window, cli: &Cli, vertices: &[Vertex]) -> anyhow::Re
         staging_belt,
         hud_enabled,
         hud_font_size,
-        hud_padding,
+        hud_font,
+        hud_metrics: None,
         calibrate_btn,
         settings_btn: None,
         show_calibrated_toast_until_ns,
@@ -1426,89 +1420,38 @@ fn main() -> anyhow::Result<()> {
 
                 // Queue HUD text every frame: wgpu_glyph draws only what was queued for this frame,
                 // so skipping the queue makes the HUD disappear on that frame.
+                // HUD text and buttons, laid out in physical pixels like the mouse position.
                 let scale = gpu.hud_font_size * window_scale_factor;
-                let pad = gpu.hud_padding * window_scale_factor;
-                let mut y_cursor = pad;
+                #[cfg(target_os = "macos")]
+                let capture = capture_status();
+                #[cfg(target_os = "macos")]
+                let needs_settings = matches!(capture, CaptureStatus::NoPermission | CaptureStatus::Failed);
+                #[cfg(not(target_os = "macos"))]
+                let needs_settings = false;
+                if let Some(font) = gpu.hud_font.as_ref() {
+                    if gpu.hud_metrics.map_or(true, |m| m.font_px != scale) {
+                        gpu.hud_metrics = Some(LabelMetrics::measure(font, scale));
+                    }
+                }
+                let layout: Option<HudLayout> = gpu
+                    .hud_metrics
+                    .map(|m| hud::layout(gpu.config.width, window_scale_factor, &m, gpu.hud_enabled && needs_settings));
+                if let Some(layout) = layout {
+                    gpu.calibrate_btn = layout.calibrate;
+                }
+                gpu.settings_btn = layout.and_then(|l| l.settings);
                 if gpu.hud_enabled {
-                    if let Some(gb) = gpu.glyph_brush.as_mut() {
-                        for line in &gpu.hud_text {
-                            gb.queue(Section {
-                                screen_position: (pad, y_cursor),
-                                bounds: (gpu.config.width as f32, gpu.config.height as f32),
-                                text: vec![
-                                    Text::new(line)
-                                        .with_color([0.95, 0.95, 0.97, 1.0])
-                                        .with_scale(scale),
-                                ],
-                                ..Section::default()
-                            });
-                            y_cursor += scale + 4.0;
-                        }
+                    if let (Some(gb), Some(layout)) = (gpu.glyph_brush.as_mut(), layout.as_ref()) {
+                        let toast = now_ns < gpu.show_calibrated_toast_until_ns;
+                        hud::queue_hud(gb, layout, &gpu.hud_text, toast, gpu.config.width, gpu.config.height);
                     }
                 }
 
-                // Calibrate button
-                let btn_text = "Calibrate";
-                let btn_w = 110.0 * window_scale_factor;
-                let btn_h = 28.0 * window_scale_factor;
-                let btn_x = (gpu.config.width as f32) - btn_w - pad;
-                let btn_y = pad;
-                gpu.calibrate_btn = Rect { x: btn_x, y: btn_y, w: btn_w, h: btn_h };
-
-                if gpu.hud_enabled {
-                    if let Some(gb) = gpu.glyph_brush.as_mut() {
-                        gb.queue(Section {
-                            screen_position: (btn_x + 10.0, btn_y + btn_h * 0.25),
-                            bounds: (gpu.config.width as f32, gpu.config.height as f32),
-                            text: vec![
-                                Text::new(btn_text)
-                                    .with_color([0.9, 0.9, 0.2, 1.0])
-                                    .with_scale(scale),
-                            ],
-                            ..Section::default()
-                        });
-                    }
-                }
-
-                // Toast after calibration
-                if gpu.hud_enabled && now_ns < gpu.show_calibrated_toast_until_ns {
-                    if let Some(gb) = gpu.glyph_brush.as_mut() {
-                        gb.queue(Section {
-                            screen_position: (pad, y_cursor + 8.0),
-                            bounds: (gpu.config.width as f32, gpu.config.height as f32),
-                            text: vec![
-                                Text::new("Calibrated")
-                                    .with_color([0.2, 0.9, 0.3, 1.0])
-                                    .with_scale(scale),
-                            ],
-                            ..Section::default()
-                        });
-                    }
-                }
-
-                // Screen capture problems: a "Screen Recording settings" button under Calibrate,
-                // and a hint in the middle of the window (over the still-black virtual screen).
+                // Screen capture problems: besides the settings button (in the layout above), a
+                // hint in the middle of the window (over the still-black virtual screen).
                 #[cfg(target_os = "macos")]
                 {
-                    let status = capture_status();
-                    let needs_settings = matches!(status, CaptureStatus::NoPermission | CaptureStatus::Failed);
-                    gpu.settings_btn = None;
-                    if gpu.hud_enabled && needs_settings {
-                        let label = "Screen Recording settings (P)";
-                        // Rough text width: wide enough to cover the label for click hit-testing.
-                        let w = label.len() as f32 * scale * 0.55 + 20.0 * window_scale_factor;
-                        let rect = Rect { x: (gpu.config.width as f32) - w - pad, y: btn_y + btn_h + 6.0 * window_scale_factor, w, h: btn_h };
-                        gpu.settings_btn = Some(rect);
-                        if let Some(gb) = gpu.glyph_brush.as_mut() {
-                            gb.queue(Section {
-                                screen_position: (rect.x + 10.0, rect.y + rect.h * 0.25),
-                                bounds: (gpu.config.width as f32, gpu.config.height as f32),
-                                text: vec![Text::new(label).with_color([0.4, 0.75, 1.0, 1.0]).with_scale(scale)],
-                                ..Section::default()
-                            });
-                        }
-                    }
-                    let hint: Option<&str> = match status {
+                    let hint: Option<&str> = match capture {
                         CaptureStatus::NoPermission => Some(&capture_hints.0),
                         CaptureStatus::Failed => Some(&capture_hints.1),
                         _ => None,
