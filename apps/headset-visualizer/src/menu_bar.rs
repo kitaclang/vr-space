@@ -39,6 +39,7 @@ pub struct MenuBar {
     display_menu: Submenu,
     fullscreen_menu: Submenu,
     hud_item: CheckMenuItem,
+    login_item: Option<CheckMenuItem>,
     displays: Vec<u32>,
     shown: u32,
     fullscreen: Option<u32>,
@@ -49,12 +50,14 @@ impl MenuBar {
     /// thread after the event loop has started (winit's `StartCause::Init`).
     ///
     /// `shown` is the captured display, `fullscreen` the display the window is fullscreen on.
+    /// `open_at_login` is `None` when that setting isn't available (not running as an app).
     pub fn new(
         proxy: EventLoopProxy<Command>,
         shown: u32,
         fullscreen: Option<u32>,
         hud_on: bool,
         hud_available: bool,
+        open_at_login: Option<bool>,
     ) -> anyhow::Result<Self> {
         let screen_menu = Submenu::new("Screen", true);
         for (code, _, id, label) in &SHORTCUTS[1..] {
@@ -73,10 +76,13 @@ impl MenuBar {
             Some(Accelerator::new(shortcut_mods(), recenter_code)),
         );
         let settings = MenuItem::with_id("settings", "Screen Recording settings…", true, None);
+        // Only when running as vr-space.app on macOS 13 or later.
+        let login_item = open_at_login
+            .map(|on| CheckMenuItem::with_id("login", "Open at Login", true, on, None));
         let quit = MenuItem::with_id("quit", "Quit vr-space", true, None);
 
         let menu = Menu::new();
-        let items: [&dyn IsMenuItem; 10] = [
+        let items: [&dyn IsMenuItem; 8] = [
             &recenter,
             &screen_menu,
             &PredefinedMenuItem::separator(),
@@ -85,10 +91,12 @@ impl MenuBar {
             &hud_item,
             &PredefinedMenuItem::separator(),
             &settings,
-            &PredefinedMenuItem::separator(),
-            &quit,
         ];
         menu.append_items(&items)?;
+        if let Some(item) = &login_item {
+            menu.append(item)?;
+        }
+        menu.append_items(&[&PredefinedMenuItem::separator(), &quit])?;
 
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -115,6 +123,7 @@ impl MenuBar {
             display_menu,
             fullscreen_menu,
             hud_item,
+            login_item,
             displays: Vec::new(),
             shown,
             fullscreen,
@@ -140,6 +149,13 @@ impl MenuBar {
             self.shown = shown;
             self.fullscreen = fullscreen;
             self.rebuild_display_menus();
+        }
+    }
+
+    /// Update the Open at Login check mark (`None`: the setting couldn't be read).
+    pub fn set_open_at_login(&mut self, on: Option<bool>) {
+        if let (Some(item), Some(on)) = (&self.login_item, on) {
+            item.set_checked(on);
         }
     }
 
@@ -214,6 +230,7 @@ fn command_for_menu_id(id: &str) -> Option<Command> {
     match id {
         "hud" => Some(Command::ToggleHud),
         "settings" => Some(Command::OpenScreenSettings),
+        "login" => Some(Command::ToggleOpenAtLogin),
         "quit" => Some(Command::Quit),
         "fullscreen:window" => Some(Command::FullscreenOn(None)),
         _ => {

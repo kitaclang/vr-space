@@ -22,10 +22,36 @@ Head tracking comes from [`ar-drivers`](https://github.com/3rl-io/headset-utils)
 - macOS 12.3 or later (ScreenCaptureKit)
 - Rust (stable), installed with [rustup](https://rustup.rs)
 - Supported AR glasses connected over USB
-- **Screen Recording permission** for your terminal app: System Settings → Privacy & Security → Screen Recording
+- **Screen Recording permission** for vr-space.app, or for your terminal app if you run it with `cargo run`: System Settings → Privacy & Security → Screen Recording
 - Optional, for `capture-check --mp4-out`: `ffmpeg` on your `PATH`
 
 ## Usage
+
+### As a Mac app
+
+Build `vr-space.app` and copy it to `~/Applications`:
+
+```bash
+scripts/bundle-macos.sh --install
+```
+
+Then open vr-space from Finder, Spotlight or Launchpad. It appears in the menu bar (there's no Dock icon). Choose **Open at Login** from its menu to start it when you log in (macOS 13 or later). Without `--install`, the app is left at `target/release/vr-space.app`.
+
+Run as an app, vr-space gets the Screen Recording permission itself, so you allow **vr-space** in System Settings instead of your terminal. Its log goes to `~/Library/Logs/vr-space.log`.
+
+The script signs the app with an ad-hoc signature, which changes with every build, so macOS forgets the Screen Recording permission after you rebuild. To keep it between builds, sign with a certificate from your keychain (`security find-identity -v -p codesigning` lists them):
+
+```bash
+VR_SPACE_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" scripts/bundle-macos.sh --install
+```
+
+Opened from Finder, the app starts with the default options. Use the menu bar icon to choose the display and go fullscreen on the glasses. To pass options to the app, use `open`:
+
+```bash
+open ~/Applications/vr-space.app --args --screen-distance 3
+```
+
+### From a terminal
 
 Run the visualizer (release build recommended for lowest latency):
 
@@ -35,7 +61,7 @@ cargo run --release -p headset-visualizer
 
 Put the glasses on, look straight ahead and click **Calibrate** in the HUD (or press `C`, or `⌃⌥C` from any app) to set the forward direction. If the glasses aren't connected yet, plug them in: the app keeps looking for them every second. Press `Esc` or close the window to quit.
 
-The HUD's `screen:` line shows whether screen capture is working. If Screen Recording permission is missing, the app asks macOS for it, shows a hint over the virtual screen, and adds a **Screen Recording settings** button. Press `P` (or click the button) to open System Settings at the right page. Allow your terminal app there, then quit and reopen the terminal: macOS only applies the permission after a restart.
+The HUD's `screen:` line shows whether screen capture is working. If Screen Recording permission is missing, the app asks macOS for it, shows a hint over the virtual screen, and adds a **Screen Recording settings** button. Press `P` (or click the button) to open System Settings at the right page. Allow vr-space there (or your terminal app, if you started it from a terminal), then quit and reopen it: macOS only applies the permission after a restart.
 
 ### Using it with the glasses
 
@@ -62,7 +88,7 @@ The glasses only track rotation (3DoF), not position, so leaning or moving in yo
 
 ### Controls
 
-vr-space lives in the menu bar (it has no Dock icon). While it runs, its glasses icon has the controls: recenter, move and resize the screen, choose which display to show and which display to go fullscreen on (the glasses), show or hide the HUD, open Screen Recording settings, and quit. The display lists update when you plug in or remove a display.
+vr-space lives in the menu bar (it has no Dock icon). While it runs, its glasses icon has the controls: recenter, move and resize the screen, choose which display to show and which display to go fullscreen on (the glasses), show or hide the HUD, open Screen Recording settings, open at login (when run as vr-space.app), and quit. The display lists update when you plug in or remove a display.
 
 These shortcuts work from any app, so you can adjust the screen while you work:
 
@@ -132,6 +158,6 @@ Third-party components keep their own licenses:
 
 - **Noto Sans** (`apps/headset-visualizer/assets/NotoSans-Regular.ttf`, embedded in the app binary): SIL Open Font License 1.1, see [`OFL.txt`](apps/headset-visualizer/assets/OFL.txt).
 - **Rust dependencies** are fetched by Cargo and are almost all MIT, Apache-2.0, BSD, ISC or Zlib licensed. `serialport` is MPL-2.0.
-- **libusb** (LGPL-2.1) is compiled statically into the binary through `rusb`/`libusb1-sys`. This repository ships source only. If you distribute compiled binaries, you need to meet the LGPL's terms for libusb (for example, by providing its source and allowing it to be relinked).
+- **libusb** (LGPL-2.1) is compiled statically into the binary through `rusb`/`libusb1-sys`. This repository ships source only. If you distribute compiled binaries (including a `vr-space.app` built with `scripts/bundle-macos.sh`), you need to meet the LGPL's terms for libusb (for example, by providing its source and allowing it to be relinked).
 
 Rokid, XREAL, Nreal and other product names are trademarks of their respective owners and are used only to describe compatibility. This project is not affiliated with or endorsed by them.

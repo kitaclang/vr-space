@@ -17,8 +17,11 @@ Cargo workspace with two crates:
   - `src/menu_bar.rs`: menu bar icon and menu (`tray-icon`) and shortcuts that work from any app (`global-hotkey`). Both send a `Command` to the winit event loop through an `EventLoopProxy`; the window's own keys produce the same `Command`s, and one `match` in the event loop carries them out. The icon is drawn in code.
   - The app runs without a Dock icon (`ActivationPolicy::Accessory`). Because of that, and because macOS native fullscreen is unreliable on a secondary display, fullscreen on macOS is done by hand in `apply_fullscreen`: no border, the window covers the display and sits above the menu bar (`set_above_menu_bar`, via `objc2`). Don't switch it back to winit's `Fullscreen`. It's applied at `StartCause::Init`, and `Event::LoopDestroyed` stops the capture for every way of quitting.
   - `src/macos_capture.rs`: ScreenCaptureKit stream (`start_stream`, `take_latest_bgra`, `stop_stream`, and `switch_display` to capture another display). Captures at the display's native pixel size and keeps only the newest frame. The capture callback and renderer hand frames over by swapping buffers (no per-frame copy or allocation), and a sequence counter lets the renderer skip the upload when nothing new arrived. It also checks Screen Recording permission (`has_screen_recording_permission`, `open_screen_recording_settings`) and exposes `capture_status()`, which the HUD reads every frame (atomics only).
+  - `src/macos_app.rs`: what changes when running as `vr-space.app` (`in_bundle()`): the log goes to `~/Library/Logs/vr-space.log` when there's no terminal, permission messages name vr-space instead of the terminal (`permission_holder()`), Finder's `-psn_` argument is dropped before `clap` parses, and the menu bar's Open at Login uses `SMAppService` (macOS 13+, via `objc2`; `None` when unavailable).
+  - `macos/Info.plist`: template for the app bundle (`LSUIElement`, bundle ID `io.github.kitaclang.vr-space`); `@VERSION@` is filled in from `Cargo.toml`.
   - `src/shader.wgsl`: shader for the grid scene. The textured screen quad's shader is inline in `main.rs`.
   - `assets/NotoSans-Regular.ttf`: HUD font, embedded with `include_bytes!`. Licensed SIL OFL 1.1 (`assets/OFL.txt`).
+- `scripts/bundle-macos.sh`: builds the release binary and wraps it in `target/release/vr-space.app` (executable `Contents/MacOS/vr-space`), signs it (ad-hoc unless `VR_SPACE_SIGN_IDENTITY` is set) and with `--install` copies it to `~/Applications`.
 - `capture-check/`: standalone tool that checks ScreenCaptureKit works and records raw BGRA frames (32-byte `BGR4` header, see `write_header`), with optional MP4 output through `ffmpeg`.
 
 Libraries come from Cargo, not from this repo:
@@ -56,7 +59,11 @@ cargo run --release -p headset-visualizer -- --help
 cargo run --release -p capture-check -- --seconds 5 --out capture.bgra
 ```
 
-Unit tests (`#[cfg(test)]` modules at the end of `main.rs` and `macos_capture.rs`) cover what doesn't need hardware: the axis mapping, recentering, camera and neck model, screen placement, CLI validation, and the capture frame handoff (through `publish_frame`, the part of the capture callback that doesn't touch ScreenCaptureKit). To verify a change, at minimum build the workspace, run `cargo test --workspace` and run each binary with `--help`. Add or update tests when you change those parts. Real behaviour needs AR glasses over USB and Screen Recording permission for the terminal, which an agent usually can't provide. Say so rather than claiming a change works on hardware.
+```bash
+scripts/bundle-macos.sh
+```
+
+Unit tests (`#[cfg(test)]` modules at the end of `main.rs` and `macos_capture.rs`) cover what doesn't need hardware: the axis mapping, recentering, camera and neck model, screen placement, CLI validation, app bundle detection and `-psn_` filtering, and the capture frame handoff (through `publish_frame`, the part of the capture callback that doesn't touch ScreenCaptureKit). To verify a change, at minimum build the workspace, run `cargo test --workspace` and run each binary with `--help`. Add or update tests when you change those parts. Real behaviour needs AR glasses over USB and Screen Recording permission for the terminal, which an agent usually can't provide. Say so rather than claiming a change works on hardware.
 
 The workspace crates build with no warnings. Cargo still prints a future-incompatibility note for the `block` dependency, which comes from upstream. Don't introduce new warnings.
 

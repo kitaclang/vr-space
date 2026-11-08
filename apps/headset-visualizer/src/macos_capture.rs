@@ -35,7 +35,8 @@ use core_graphics::display::{CGDirectDisplayID, CGDisplay};
 pub enum CaptureStatus {
     /// `start_stream` hasn't finished yet.
     Starting,
-    /// macOS hasn't granted Screen Recording to this process (in practice, to the terminal app).
+    /// macOS hasn't granted Screen Recording to this process (to vr-space.app, or to the
+    /// terminal app it was started from).
     NoPermission,
     /// The stream failed to start for another reason; the log has details.
     Failed,
@@ -62,9 +63,9 @@ pub fn capture_status() -> CaptureStatus {
     }
 }
 
-/// Whether macOS currently allows this process to record the screen. For a command-line app
-/// the permission belongs to the terminal it runs in, and a newly granted permission only
-/// takes effect after that terminal is restarted.
+/// Whether macOS currently allows this process to record the screen. Run as vr-space.app,
+/// the permission belongs to the app; run from a terminal, it belongs to the terminal. Either
+/// way a newly granted permission only takes effect after that app is restarted.
 pub fn has_screen_recording_permission() -> bool {
     ScreenCaptureAccess.preflight()
 }
@@ -105,8 +106,9 @@ static STREAM_HANDLE: OnceLock<Mutex<Option<SCStream>>> = OnceLock::new();
 
 fn shareable_content() -> anyhow::Result<SCShareableContent> {
     SCShareableContent::get().map_err(|e| anyhow::anyhow!(
-        "Can't list displays: {e:?}. If this is a permission error, grant Screen Recording to your \
-         terminal app in System Settings > Privacy & Security > Screen Recording, then restart it."
+        "Can't list displays: {e:?}. If this is a permission error, grant Screen Recording to {} \
+         in System Settings > Privacy & Security > Screen Recording, then restart it.",
+        crate::macos_app::permission_holder(),
     ))
 }
 
@@ -256,8 +258,10 @@ fn start_stream_inner(display_id: u32, show_cursor: bool) -> anyhow::Result<()> 
     if !has_screen_recording_permission() {
         ScreenCaptureAccess.request();
         anyhow::bail!(
-            "Screen Recording permission is not granted. Allow your terminal app in System Settings > \
-             Privacy & Security > Screen Recording (press P in the app to open it), then restart the terminal."
+            "Screen Recording permission is not granted. Allow {} in System Settings > \
+             Privacy & Security > Screen Recording (press P in the app to open it), then restart {}.",
+            crate::macos_app::permission_holder(),
+            crate::macos_app::restart_target(),
         );
     }
 

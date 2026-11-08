@@ -11,7 +11,7 @@ What's planned for vr-space, grouped by priority rather than dates. vr-space is 
 
 ## Next
 
-- **A proper macOS app.** Package vr-space as a `.app` you open from Finder or at login, without a terminal. Screen Recording permission would then belong to vr-space instead of your terminal app.
+- **Finish the macOS app.** `scripts/bundle-macos.sh` now builds `vr-space.app`, which opens from Finder, can open at login, holds its own Screen Recording permission and logs to `~/Library/Logs/vr-space.log`. Still to do: an app icon, confirming Open at Login across a real logout and login, and a signed, notarized download (which also needs the libusb LGPL terms to be met, see the README).
 - **Survive unplugged glasses.** Today the app waits for glasses that are missing at startup, but unplugging them mid-session quits the app: `ar-drivers` calls `exit(0)` on a USB read error. Fixing it needs `ar-drivers` to return errors from `Fusion::update()` instead of exiting, which means a change upstream in [headset-utils](https://github.com/3rl-io/headset-utils).
 - **Capture a single window** instead of a whole display, using ScreenCaptureKit's window filters.
 

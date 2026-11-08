@@ -40,6 +40,10 @@ mod macos_capture;
 #[cfg(target_os = "macos")]
 mod menu_bar;
 
+// Running as vr-space.app: log file, opening at login, permission wording
+#[cfg(target_os = "macos")]
+mod macos_app;
+
 /// Something the user asked for, from a key in the window, the menu bar or a global shortcut.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
@@ -56,6 +60,8 @@ pub(crate) enum Command {
     ShowDisplay(u32),
     ToggleHud,
     OpenScreenSettings,
+    /// Turn opening at login on or off (only offered when running as vr-space.app).
+    ToggleOpenAtLogin,
     Quit,
 }
 
@@ -1004,11 +1010,22 @@ fn main() -> anyhow::Result<()> {
 
     // App logs at info; wgpu/naga logs at warn, since their info level logs every buffer it creates.
     // RUST_LOG overrides this (for example RUST_LOG=debug).
-    env_logger::Builder::from_env(
+    let mut logger = env_logger::Builder::from_env(
         Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn,wgpu=warn,naga=warn"),
-    )
-    .init();
+    );
+    // Opened from Finder or at login there's no terminal to show the log, so write it to a file.
+    #[cfg(target_os = "macos")]
+    if macos_app::in_bundle() && !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        if let Some(file) = macos_app::log_file_path().and_then(|p| std::fs::File::create(p).ok()) {
+            logger.target(env_logger::Target::Pipe(Box::new(file)));
+        }
+    }
+    logger.init();
 
+    // Older macOS versions pass a -psn_ argument to apps opened from Finder.
+    #[cfg(target_os = "macos")]
+    let cli = Cli::parse_from(macos_app::without_psn_args(std::env::args_os()));
+    #[cfg(not(target_os = "macos"))]
     let cli = Cli::parse();
     cli.validate()?;
 
@@ -1192,6 +1209,27 @@ fn main() -> anyhow::Result<()> {
     let mut menu_bar: Option<MenuBar> = None;
     let mut last_display_check = Instant::now();
 
+    // Hints shown over the virtual screen when capture isn't working. Built once: who holds the
+    // permission depends on whether we run as vr-space.app or from a terminal.
+    #[cfg(target_os = "macos")]
+    let capture_hints: (String, String) = (
+        format!(
+            "Screen Recording permission needed\n\n\
+             Press P (or click the button at the top right) to open System Settings,\n\
+             allow {} under Screen Recording, then quit and reopen {}.",
+            macos_app::permission_holder(),
+            macos_app::restart_target(),
+        ),
+        if macos_app::in_bundle() {
+            format!(
+                "Screen capture failed to start. See the log for details:\n{}",
+                macos_app::log_file_path().map(|p| p.display().to_string()).unwrap_or_default(),
+            )
+        } else {
+            "Screen capture failed to start. See the terminal log for details.".to_string()
+        },
+    );
+
     // Event loop / render (winit 0.28 API)
     event_loop.run(move |event, _, control_flow| {
         use winit::event_loop::ControlFlow;
@@ -1285,6 +1323,7 @@ fn main() -> anyhow::Result<()> {
                     fullscreen_on,
                     gpu.hud_enabled,
                     gpu.glyph_brush.is_some(),
+                    macos_app::open_at_login(),
                 ) {
                     Ok(bar) => menu_bar = Some(bar),
                     Err(e) => warn!("Menu bar icon unavailable: {e}"),
@@ -1535,12 +1574,8 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     let hint: Option<&str> = match status {
-                        CaptureStatus::NoPermission => Some(
-                            "Screen Recording permission needed\n\n\
-                             Press P (or click the button at the top right) to open System Settings,\n\
-                             allow your terminal app under Screen Recording, then quit and reopen the terminal.",
-                        ),
-                        CaptureStatus::Failed => Some("Screen capture failed to start. See the terminal log for details."),
+                        CaptureStatus::NoPermission => Some(&capture_hints.0),
+                        CaptureStatus::Failed => Some(&capture_hints.1),
                         _ => None,
                     };
                     if let (true, Some(hint), Some(gb)) = (gpu.hud_enabled, hint, gpu.glyph_brush.as_mut()) {
@@ -1622,6 +1657,15 @@ fn main() -> anyhow::Result<()> {
                 Command::OpenScreenSettings => {
                     #[cfg(target_os = "macos")]
                     open_screen_recording_settings();
+                }
+                Command::ToggleOpenAtLogin => {
+                    #[cfg(target_os = "macos")]
+                    if let Some(on) = macos_app::open_at_login() {
+                        let now = macos_app::set_open_at_login(!on);
+                        if let Some(bar) = menu_bar.as_mut() {
+                            bar.set_open_at_login(now);
+                        }
+                    }
                 }
             }
             if matches!(
