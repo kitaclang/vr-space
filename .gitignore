@@ -11,3 +11,6 @@
 # Local clones of upstream libraries (now fetched by Cargo instead)
 /headset-utils/
 /screencapturekit-rs/
+
+# Notes from a session with the glasses (docs/glasses-checklist.md)
+glasses-session.log

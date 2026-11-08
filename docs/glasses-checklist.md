@@ -6,7 +6,7 @@ Everything that still needs real AR glasses to check, in an order that fits one 
 
 - Build the release app: `cargo build --release -p headset-visualizer` (or `scripts/bundle-macos.sh --install` to also check the app bundle).
 - Make sure Screen Recording is allowed for the terminal (or vr-space.app).
-- Run with a log you can keep: `RUST_LOG=info target/release/headset-visualizer --fullscreen <id> 2>&1 | tee glasses-session.log` (`--list-displays` shows the glasses' display ID).
+- Run with a log you can keep: `target/release/headset-visualizer --fullscreen <id> --display <id> 2>&1 | grep --line-buffered -v "can't find" | tee glasses-session.log`. It logs at info already; `RUST_LOG=info` would also turn on wgpu's own logging and bury the useful lines. The `grep` drops the probes for other glasses models, and `--line-buffered` keeps the log appearing as it happens (`--list-displays` shows the glasses' display ID).
 - Keep the HUD on (`H`). The shortcuts below work from any app with `⌃⌥` (Control-Option), or as plain keys while the vr-space window has focus.
 
 ## 1. Basics (main)
