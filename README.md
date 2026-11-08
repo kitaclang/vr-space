@@ -84,11 +84,21 @@ The glasses show up on your Mac as an extra display. To get a virtual monitor th
 
 You can also start without `--fullscreen` and pick the glasses under **Fullscreen on** in the menu bar icon.
 
+### Showing a single window
+
+Instead of a whole display, the virtual screen can show one window, for example a browser or an editor. Choose it under **Show window** in the menu bar icon, or start with `--window`:
+
+```bash
+cargo run --release -p headset-visualizer -- --window Safari --fullscreen <glasses ID>
+```
+
+`--window` takes a window ID from `--list-windows`, an app name, or part of a window title. The window is shown on its own, even when other windows cover it, it's minimised, or it's on another Space. If you resize it, the capture restarts at the new size within a couple of seconds. If you close it, the virtual screen goes back to the last display shown.
+
 The glasses only track rotation (3DoF), not position, so leaning or moving in your seat isn't tracked. The neck model (`--neck-model`, on by default) adds the small eye movement that comes from turning your head around your neck, which makes the screen feel more solidly placed.
 
 ### Controls
 
-vr-space lives in the menu bar (it has no Dock icon). While it runs, its glasses icon has the controls: recenter, move and resize the screen, choose which display to show and which display to go fullscreen on (the glasses), show or hide the HUD, open Screen Recording settings, open at login (when run as vr-space.app), and quit. The display lists update when you plug in or remove a display.
+vr-space lives in the menu bar (it has no Dock icon). While it runs, its glasses icon has the controls: recenter, move and resize the screen, choose which display or window to show and which display to go fullscreen on (the glasses), show or hide the HUD, open Screen Recording settings, open at login (when run as vr-space.app), and quit. The display lists update when you plug in or remove a display, and the window list updates as windows open and close.
 
 These shortcuts work from any app, so you can adjust the screen while you work:
 
@@ -128,6 +138,8 @@ Options:
 | `--hud-size <px>` | 16 | HUD font size |
 | `--display <id>` | 0 (main display) | Which display to show on the virtual screen |
 | `--list-displays` | | List display IDs and resolutions, then exit |
+| `--window <id\|name>` | off | Show a single window instead of a display: a window ID, an app name or part of a window title. Can't be combined with `--display` |
+| `--list-windows` | | List the windows that can be shown, then exit |
 | `--screen-height <units>` | 1.4 | Height of the virtual screen (one grid square = 1 unit) |
 | `--screen-distance <units>` | 4 | Distance from your eyes to the virtual screen |
 | `--fov <deg>` | 60 | Vertical field of view |

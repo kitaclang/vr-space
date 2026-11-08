@@ -23,8 +23,9 @@ use wgpu_glyph::{GlyphBrush, GlyphBrushBuilder, HorizontalAlign, Layout, Section
 // On macOS, pull capture helpers into scope (now using screencapturekit crate under the hood)
 #[cfg(target_os = "macos")]
 use crate::macos_capture::{
-    capture_status, list_displays, open_screen_recording_settings, resolve_display_id, start_stream, stop_stream,
-    switch_display, take_latest_bgra, CaptureStatus,
+    capture_status, find_window, list_displays, list_windows, open_screen_recording_settings, resolve_display_id,
+    start_stream, start_window_watcher, stop_stream, switch_source, take_latest_bgra, take_window_event,
+    CaptureSource, CaptureStatus, CapturedWindowEvent,
 };
 #[cfg(target_os = "macos")]
 use crate::menu_bar::MenuBar;
@@ -58,6 +59,8 @@ pub(crate) enum Command {
     FullscreenOn(Option<u32>),
     /// Capture this display instead.
     ShowDisplay(u32),
+    /// Capture this window instead, by window ID.
+    ShowWindow(u32),
     ToggleHud,
     OpenScreenSettings,
     /// Turn opening at login on or off (only offered when running as vr-space.app).
@@ -109,6 +112,15 @@ struct Cli {
     /// List the displays that can be captured, then exit
     #[arg(long, default_value_t = false)]
     list_displays: bool,
+
+    /// Show a single window instead of a display: a window ID from --list-windows, or an app
+    /// name or part of a window title (for example Safari)
+    #[arg(long, value_name = "ID|NAME", conflicts_with = "display")]
+    window: Option<String>,
+
+    /// List the windows that can be captured, then exit
+    #[arg(long, default_value_t = false)]
+    list_windows: bool,
 
     /// Height of the virtual screen in scene units (one grid square = 1 unit)
     #[arg(long, default_value_t = 1.4)]
@@ -951,15 +963,19 @@ fn set_above_menu_bar(window: &Window, on: bool) {
 }
 
 // HUD line describing the screen capture.
-fn screen_status_line(tex_size: (u32, u32)) -> String {
+fn screen_status_line(tex_size: (u32, u32), #[cfg(target_os = "macos")] source: CaptureSource) -> String {
     #[cfg(target_os = "macos")]
     {
+        let what = match source {
+            CaptureSource::Display(id) => format!("display {id}"),
+            CaptureSource::Window(id) => format!("window {id}"),
+        };
         match capture_status() {
             CaptureStatus::Starting => "screen: starting".to_string(),
             CaptureStatus::NoPermission => "screen: no Screen Recording permission".to_string(),
             CaptureStatus::Failed => "screen: capture failed (see log)".to_string(),
             CaptureStatus::WaitingForFrames => "screen: waiting for first frame".to_string(),
-            CaptureStatus::Capturing => format!("screen: capturing {}x{}", tex_size.0, tex_size.1),
+            CaptureStatus::Capturing => format!("screen: {what}, {}x{}", tex_size.0, tex_size.1),
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -1054,6 +1070,19 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    #[cfg(target_os = "macos")]
+    if cli.list_windows {
+        let windows = list_windows()?;
+        if windows.is_empty() {
+            println!("No windows found (is Screen Recording permission granted?)");
+        }
+        for w in windows {
+            println!("{:>10}  {:>4}x{:<4} pt  {}", w.id, w.width, w.height, w.label());
+        }
+        println!("Show a window with --window <ID>, or --window <app name>.");
+        return Ok(());
+    }
+
     info!(
         "vsync={}, invert=({},{},{}), poll_ms={}, no_hud={}, hud_size={}, max_fps={}",
         cli.vsync, cli.invert_x, cli.invert_y, cli.invert_z, cli.poll_ms, cli.no_hud, cli.hud_size, cli.max_fps
@@ -1083,7 +1112,7 @@ fn main() -> anyhow::Result<()> {
                     use winit::platform::macos::MonitorHandleExtMacOS;
                     let main_id = window.primary_monitor().map(|m| m.native_id());
                     let resolve = |d: u32| if d == 0 { main_id } else { Some(d) };
-                    if resolve(id).is_some() && resolve(id) == resolve(cli.display) {
+                    if cli.window.is_none() && resolve(id).is_some() && resolve(id) == resolve(cli.display) {
                         warn!(
                             "--fullscreen and --display are the same display, so the virtual screen will show \
                              the app itself. Use --display for the screen you want to see and --fullscreen for the glasses."
@@ -1187,16 +1216,29 @@ fn main() -> anyhow::Result<()> {
     // GPU init
     let mut gpu = pollster::block_on(init_gpu(&window, &cli, &grid_vertices))?;
 
-    // The captured display, as a real ID (0 on the command line means the main display).
+    // What's on the virtual screen: a display (as a real ID; 0 on the command line means the
+    // main display) or a window. `last_display` is where to go back to if the window closes.
     #[cfg(target_os = "macos")]
-    let mut shown_display = resolve_display_id(cli.display);
+    let mut last_display = resolve_display_id(cli.display);
+    #[cfg(target_os = "macos")]
+    let mut shown = match cli.window.as_deref().map(find_window) {
+        Some(Ok(id)) => CaptureSource::Window(id),
+        Some(Err(e)) => {
+            warn!("{e} Showing display {last_display} instead.");
+            CaptureSource::Display(last_display)
+        }
+        None => CaptureSource::Display(last_display),
+    };
 
     // Start virtual monitor stream (macOS) via screencapturekit-rs
     #[cfg(target_os = "macos")]
     {
-        if let Err(e) = start_stream(shown_display, !cli.no_cursor) {
+        if let Err(e) = start_stream(shown, !cli.no_cursor) {
             warn!("Screen capture failed to start: {e}");
         }
+        // Keeps the menu's window list current and notices when the shown window is resized
+        // or closed.
+        start_window_watcher();
     }
 
     // FPS meter
@@ -1310,8 +1352,25 @@ fn main() -> anyhow::Result<()> {
                 #[cfg(target_os = "macos")]
                 if last_display_check.elapsed() >= Duration::from_secs(2) {
                     last_display_check = Instant::now();
+                    // The shown window was resized (restart at the new size) or closed.
+                    match take_window_event() {
+                        Some(CapturedWindowEvent::Resized) => {
+                            if let Err(e) = switch_source(shown, !cli.no_cursor) {
+                                warn!("Couldn't restart the window capture: {e}");
+                            }
+                        }
+                        Some(CapturedWindowEvent::Closed) => {
+                            info!("The shown window was closed; showing display {last_display}.");
+                            shown = CaptureSource::Display(last_display);
+                            if let Err(e) = switch_source(shown, !cli.no_cursor) {
+                                warn!("Couldn't switch to display {last_display}: {e}");
+                            }
+                        }
+                        None => {}
+                    }
                     if let Some(bar) = menu_bar.as_mut() {
-                        bar.refresh_displays();
+                        bar.refresh();
+                        bar.set_state(shown, fullscreen_on, gpu.hud_enabled);
                     }
                 }
             }
@@ -1319,7 +1378,7 @@ fn main() -> anyhow::Result<()> {
                 #[cfg(target_os = "macos")]
                 match MenuBar::new(
                     proxy.clone(),
-                    shown_display,
+                    shown,
                     fullscreen_on,
                     gpu.hud_enabled,
                     gpu.glyph_brush.is_some(),
@@ -1477,13 +1536,17 @@ fn main() -> anyhow::Result<()> {
                     && (gpu.hud_text.is_empty() || now_ns.saturating_sub(gpu.hud_text_updated_ns) >= HUD_REFRESH_NS)
                 {
                     let dev = if has { "connected" } else { "not-found" };
+                    #[cfg(target_os = "macos")]
+                    let screen_line = screen_status_line(gpu.tex_size, shown);
+                    #[cfg(not(target_os = "macos"))]
+                    let screen_line = screen_status_line(gpu.tex_size);
                     gpu.hud_text = vec![
                         format!("device: {dev}"),
                         format!("fps: {:.1}", fps.fps.max(0.0)),
                         format!("latency: {:.2} ms", latency_ms),
                         format!("euler(rad) r={:.3} p={:.3} y={:.3}", r, p, y),
                         format!("invert=({},{},{}) vsync={}", cli.invert_x, cli.invert_y, cli.invert_z, cli.vsync),
-                        screen_status_line(gpu.tex_size),
+                        screen_line,
                         format!("distance: {:.2}  height: {:.2}", gpu.screen.distance, gpu.screen.height),
                     ];
                     gpu.hud_text_updated_ns = now_ns;
@@ -1638,11 +1701,25 @@ fn main() -> anyhow::Result<()> {
                 Command::FullscreenOn(id) => fullscreen_on = apply_fullscreen(&window, fullscreen_on, id),
                 Command::ShowDisplay(id) => {
                     #[cfg(target_os = "macos")]
-                    if id != shown_display {
+                    if shown != CaptureSource::Display(id) {
                         // Restarting the capture blocks briefly; fine for a menu click.
-                        match switch_display(id, !cli.no_cursor) {
-                            Ok(()) => shown_display = id,
+                        match switch_source(CaptureSource::Display(id), !cli.no_cursor) {
+                            Ok(()) => {
+                                shown = CaptureSource::Display(id);
+                                last_display = id;
+                            }
                             Err(e) => warn!("Couldn't switch to display {id}: {e}"),
+                        }
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = id;
+                }
+                Command::ShowWindow(id) => {
+                    #[cfg(target_os = "macos")]
+                    if shown != CaptureSource::Window(id) {
+                        match switch_source(CaptureSource::Window(id), !cli.no_cursor) {
+                            Ok(()) => shown = CaptureSource::Window(id),
+                            Err(e) => warn!("Couldn't switch to window {id}: {e}"),
                         }
                     }
                     #[cfg(not(target_os = "macos"))]
@@ -1677,7 +1754,7 @@ fn main() -> anyhow::Result<()> {
             gpu.hud_text.clear(); // refresh the HUD's text now
             #[cfg(target_os = "macos")]
             if let Some(bar) = menu_bar.as_mut() {
-                bar.set_state(shown_display, fullscreen_on, gpu.hud_enabled);
+                bar.set_state(shown, fullscreen_on, gpu.hud_enabled);
             }
         }
     });
@@ -1901,6 +1978,12 @@ mod tests {
     fn default_flags_are_valid() {
         let cli = parse(&[]).unwrap();
         assert!(!cli.recenter_yaw_only);
+    }
+
+    #[test]
+    fn window_and_display_are_exclusive() {
+        assert_eq!(parse(&["--window", "Safari"]).unwrap().window.as_deref(), Some("Safari"));
+        assert!(parse(&["--window", "Safari", "--display", "2"]).is_err());
     }
 
     #[test]

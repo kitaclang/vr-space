@@ -2,8 +2,9 @@
 //!
 //! Both turn into `Command`s that are sent to the winit event loop through an
 //! `EventLoopProxy`, so the render loop handles them like its own key presses. Nothing here
-//! runs per frame: menu clicks and shortcuts are rare, and the display list is checked every
-//! couple of seconds.
+//! runs per frame: menu clicks and shortcuts are rare, and the display and window lists are
+//! checked every couple of seconds (the window list is fetched by a background thread in
+//! `macos_capture`).
 
 use std::sync::Mutex;
 
@@ -16,7 +17,13 @@ use tray_icon::menu::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, Pred
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use winit::event_loop::EventLoopProxy;
 
+use crate::macos_capture::{windows_if_changed, CaptureSource, WindowInfo};
 use crate::Command;
+
+/// Longest window label in the menu; longer titles are cut with an ellipsis.
+const MAX_LABEL_CHARS: usize = 60;
+/// Most windows listed, so the menu stays usable with many windows open.
+const MAX_WINDOWS: usize = 40;
 
 /// Shortcuts that work from any app: Control-Option plus a key.
 fn shortcut_mods() -> Modifiers {
@@ -37,11 +44,14 @@ pub struct MenuBar {
     _tray: TrayIcon,
     _hotkeys: Option<GlobalHotKeyManager>,
     display_menu: Submenu,
+    window_menu: Submenu,
     fullscreen_menu: Submenu,
     hud_item: CheckMenuItem,
     login_item: Option<CheckMenuItem>,
     displays: Vec<u32>,
-    shown: u32,
+    windows: Vec<WindowInfo>,
+    windows_seq: u64,
+    shown: CaptureSource,
     fullscreen: Option<u32>,
 }
 
@@ -49,11 +59,12 @@ impl MenuBar {
     /// Create the menu bar icon and register the shortcuts. On macOS this must run on the main
     /// thread after the event loop has started (winit's `StartCause::Init`).
     ///
-    /// `shown` is the captured display, `fullscreen` the display the window is fullscreen on.
+    /// `shown` is the captured display or window, `fullscreen` the display the window is
+    /// fullscreen on.
     /// `open_at_login` is `None` when that setting isn't available (not running as an app).
     pub fn new(
         proxy: EventLoopProxy<Command>,
-        shown: u32,
+        shown: CaptureSource,
         fullscreen: Option<u32>,
         hud_on: bool,
         hud_available: bool,
@@ -66,6 +77,7 @@ impl MenuBar {
         }
 
         let display_menu = Submenu::new("Show display", true);
+        let window_menu = Submenu::new("Show window", true);
         let fullscreen_menu = Submenu::new("Fullscreen on", true);
         let hud_item = CheckMenuItem::with_id("hud", "Show HUD", hud_available, hud_on, None);
         let (recenter_code, _, recenter_id, recenter_label) = SHORTCUTS[0];
@@ -82,11 +94,12 @@ impl MenuBar {
         let quit = MenuItem::with_id("quit", "Quit vr-space", true, None);
 
         let menu = Menu::new();
-        let items: [&dyn IsMenuItem; 8] = [
+        let items: [&dyn IsMenuItem; 9] = [
             &recenter,
             &screen_menu,
             &PredefinedMenuItem::separator(),
             &display_menu,
+            &window_menu,
             &fullscreen_menu,
             &hud_item,
             &PredefinedMenuItem::separator(),
@@ -121,34 +134,69 @@ impl MenuBar {
             _tray: tray,
             _hotkeys: hotkeys,
             display_menu,
+            window_menu,
             fullscreen_menu,
             hud_item,
             login_item,
             displays: Vec::new(),
+            windows: Vec::new(),
+            windows_seq: 0,
             shown,
             fullscreen,
         };
-        bar.refresh_displays();
+        bar.refresh();
+        bar.rebuild_window_menu();
         Ok(bar)
     }
 
     /// Rebuild the display submenus if a display was connected or removed (for example the
-    /// glasses being plugged in). Cheap; call it every second or two.
-    pub fn refresh_displays(&mut self) {
+    /// glasses being plugged in), and the window submenu if windows opened, closed or changed
+    /// title. Cheap and never blocks; call it every second or two.
+    pub fn refresh(&mut self) {
         let ids = CGDisplay::active_displays().unwrap_or_default();
         if ids != self.displays {
             self.displays = ids;
             self.rebuild_display_menus();
         }
+        if let Some(windows) = windows_if_changed(&mut self.windows_seq) {
+            self.windows = windows;
+            self.rebuild_window_menu();
+        }
     }
 
     /// Update the check marks after the app's state changed.
-    pub fn set_state(&mut self, shown: u32, fullscreen: Option<u32>, hud_on: bool) {
+    pub fn set_state(&mut self, shown: CaptureSource, fullscreen: Option<u32>, hud_on: bool) {
         self.hud_item.set_checked(hud_on);
         if (shown, fullscreen) != (self.shown, self.fullscreen) {
+            let window_changed = matches!(shown, CaptureSource::Window(_)) || matches!(self.shown, CaptureSource::Window(_));
             self.shown = shown;
             self.fullscreen = fullscreen;
             self.rebuild_display_menus();
+            if window_changed {
+                self.rebuild_window_menu();
+            }
+        }
+    }
+
+    fn rebuild_window_menu(&self) {
+        let menu = &self.window_menu;
+        while menu.remove_at(0).is_some() {}
+        if self.windows.is_empty() {
+            let _ = menu.append(&MenuItem::new("No windows to show", false, None));
+            return;
+        }
+        for w in self.windows.iter().take(MAX_WINDOWS) {
+            let _ = menu.append(&CheckMenuItem::with_id(
+                format!("window:{}", w.id),
+                shorten(&w.label(), MAX_LABEL_CHARS),
+                true,
+                self.shown == CaptureSource::Window(w.id),
+                None,
+            ));
+        }
+        if self.windows.len() > MAX_WINDOWS {
+            let more = format!("{} more (use --list-windows)", self.windows.len() - MAX_WINDOWS);
+            let _ = menu.append(&MenuItem::new(more, false, None));
         }
     }
 
@@ -170,7 +218,7 @@ impl MenuBar {
                 format!("display:{id}"),
                 &label,
                 true,
-                id == self.shown,
+                self.shown == CaptureSource::Display(id),
                 None,
             ));
             let _ = self.fullscreen_menu.append(&CheckMenuItem::with_id(
@@ -236,6 +284,8 @@ fn command_for_menu_id(id: &str) -> Option<Command> {
         _ => {
             if let Some(n) = id.strip_prefix("display:") {
                 n.parse().ok().map(Command::ShowDisplay)
+            } else if let Some(n) = id.strip_prefix("window:") {
+                n.parse().ok().map(Command::ShowWindow)
             } else if let Some(n) = id.strip_prefix("fullscreen:") {
                 n.parse().ok().map(|n| Command::FullscreenOn(Some(n)))
             } else {
@@ -243,6 +293,16 @@ fn command_for_menu_id(id: &str) -> Option<Command> {
             }
         }
     }
+}
+
+/// Cut `label` to at most `max` characters, ending with an ellipsis if it was cut.
+fn shorten(label: &str, max: usize) -> String {
+    if label.chars().count() <= max {
+        return label.to_string();
+    }
+    let mut cut: String = label.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
 }
 
 fn display_label(id: u32, main_id: u32) -> String {
@@ -282,4 +342,25 @@ fn menu_bar_icon() -> anyhow::Result<Icon> {
         }
     }
     Ok(Icon::from_rgba(rgba, W as u32, H as u32)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menu_ids_map_to_commands() {
+        assert_eq!(command_for_menu_id("window:123"), Some(Command::ShowWindow(123)));
+        assert_eq!(command_for_menu_id("display:7"), Some(Command::ShowDisplay(7)));
+        assert_eq!(command_for_menu_id("fullscreen:7"), Some(Command::FullscreenOn(Some(7))));
+        assert_eq!(command_for_menu_id("fullscreen:window"), Some(Command::FullscreenOn(None)));
+        assert_eq!(command_for_menu_id("window:abc"), None);
+    }
+
+    #[test]
+    fn long_labels_are_shortened() {
+        assert_eq!(shorten("Safari: Docs", 60), "Safari: Docs");
+        assert_eq!(shorten("abcdef", 4), "abc…");
+        assert_eq!(shorten("ไทยภาษา", 4), "ไทย…", "counts characters, not bytes");
+    }
 }
