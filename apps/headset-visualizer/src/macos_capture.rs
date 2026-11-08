@@ -91,6 +91,8 @@ pub struct CapturedFrame {
     pub width: u32,
     pub height: u32,
     pub bytes_per_row: u32,
+    /// When this image was on the Mac's display, in mach absolute time (0 if unknown).
+    pub displayed_at: u64,
 }
 
 // SAFETY: a CVPixelBuffer is a reference-counted CoreFoundation object, safe to retain and
@@ -500,7 +502,7 @@ impl screencapturekit::stream::output_trait::SCStreamOutputTrait for ScreenOutpu
         static FRAMES: AtomicUsize = AtomicUsize::new(0);
 
         // Only process complete frames. Idle frames (screen unchanged) carry no new pixels.
-        match SCStreamFrameInfo::from_sample_buffer(&sample_buffer) {
+        let displayed_at = match SCStreamFrameInfo::from_sample_buffer(&sample_buffer) {
             Ok(info) => {
                 let status = info.status();
                 if status != SCFrameStatus::Complete {
@@ -509,12 +511,13 @@ impl screencapturekit::stream::output_trait::SCStreamOutputTrait for ScreenOutpu
                     }
                     return;
                 }
+                info.display_time()
             }
             Err(e) => {
                 log_limited(&SKIPPED, || warn!("SCStreamFrameInfo::from_sample_buffer failed: {:?}", e));
                 return;
             }
-        }
+        };
 
         let pixel_buffer = match sample_buffer.get_pixel_buffer() {
             Ok(pb) => pb,
@@ -534,7 +537,7 @@ impl screencapturekit::stream::output_trait::SCStreamOutputTrait for ScreenOutpu
         }
 
         // Keep the pixel buffer (a retain, not a copy) and hand it over.
-        LATEST.publish(CapturedFrame { buffer: pixel_buffer, width, height, bytes_per_row: stride });
+        LATEST.publish(CapturedFrame { buffer: pixel_buffer, width, height, bytes_per_row: stride, displayed_at });
 
         log_limited(&FRAMES, || info!("Captured BGRA frame: {}x{} stride={}", width, height, stride));
     }

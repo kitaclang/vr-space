@@ -37,6 +37,9 @@ use ar_drivers::{any_fusion, any_glasses};
 #[cfg(target_os = "macos")]
 mod macos_capture;
 
+// Latency measurements for the HUD and the log
+mod latency;
+
 // Captured frames shown in place on the GPU (IOSurface -> Metal texture)
 #[cfg(target_os = "macos")]
 mod iosurface;
@@ -330,6 +333,9 @@ fn now_ns_from_start() -> u64 {
 
 // How often the HUD's text is re-formatted (it is still drawn every frame).
 const HUD_REFRESH_NS: u64 = 100_000_000;
+
+// How often the latency figures go to the log.
+const LATENCY_LOG_NS: u64 = 10_000_000_000;
 
 // Head orientation sample, as published by the tracking thread.
 #[derive(Debug, Clone, Copy)]
@@ -1096,6 +1102,8 @@ fn main() -> anyhow::Result<()> {
 
     // FPS meter
     let mut fps = FpsMeter::new();
+    let mut latency_meter = latency::LatencyMeter::default();
+    let mut latency_logged_ns = 0u64;
 
     // Menu bar icon: created once the event loop runs (macOS requires that). Its menu and the
     // global shortcuts send Commands to this loop through the proxy.
@@ -1307,11 +1315,13 @@ fn main() -> anyhow::Result<()> {
                 // Show the newest screen frame (macOS only). Skips entirely when no new frame
                 // has arrived.
                 #[cfg(target_os = "macos")]
-                {
-                    if let Some(frame) = take_latest_frame(&mut gpu.frame_seq) {
-                        show_captured_frame(&mut gpu, frame);
-                    }
-                }
+                let new_frame_displayed_at = take_latest_frame(&mut gpu.frame_seq).map(|frame| {
+                    let displayed_at = frame.displayed_at;
+                    let started = Instant::now();
+                    show_captured_frame(&mut gpu, frame);
+                    latency_meter.upload.push_ns(started.elapsed().as_nanos() as u64);
+                    displayed_at
+                });
 
                 // Render 3D scene
                 let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("encoder") });
@@ -1320,7 +1330,6 @@ fn main() -> anyhow::Result<()> {
                 // FPS update
                 fps.on_frame();
                 let now_ns = now_ns_from_start();
-                let latency_ms = ((now_ns.saturating_sub(t_ns)) as f64) / 1_000_000.0;
 
                 // Refresh the HUD strings at most every 100 ms: readable, and it avoids formatting
                 // (and allocating) strings every frame. Skipped entirely when the HUD is off.
@@ -1335,7 +1344,11 @@ fn main() -> anyhow::Result<()> {
                     gpu.hud_text = vec![
                         format!("device: {dev}"),
                         format!("fps: {:.1}", fps.fps.max(0.0)),
-                        format!("latency: {:.2} ms", latency_ms),
+                        latency::describe("pose->submit", latency_meter.pose_to_submit.summary()),
+                        #[cfg(target_os = "macos")]
+                        latency::describe("capture->submit", latency_meter.capture_to_submit.summary()),
+                        #[cfg(target_os = "macos")]
+                        latency::describe("frame upload", latency_meter.upload.summary()),
                         format!("euler(rad) r={:.3} p={:.3} y={:.3}", r, p, y),
                         format!(
                             "invert=({},{},{}) vsync={} frames={}",
@@ -1462,6 +1475,19 @@ fn main() -> anyhow::Result<()> {
                     sb.finish();
                 }
                 gpu.queue.submit(Some(encoder.finish()));
+                // Without glasses there's no pose sample to measure from.
+                if has && t_ns > 0 {
+                    latency_meter.pose_to_submit.push_ns(now_ns_from_start().saturating_sub(t_ns));
+                }
+                #[cfg(target_os = "macos")]
+                if let Some(displayed_at) = new_frame_displayed_at.filter(|&t| t != 0) {
+                    let ns = latency::mach::ns_between(displayed_at, latency::mach::now());
+                    latency_meter.capture_to_submit.push_ns(ns);
+                }
+                if now_ns.saturating_sub(latency_logged_ns) >= LATENCY_LOG_NS {
+                    latency_logged_ns = now_ns;
+                    info!("Latency: {}", latency_meter.log_line());
+                }
                 // Return the HUD's staging buffers for reuse once the GPU is done with them.
                 // Without this the belt creates a new buffer every frame and memory keeps growing.
                 if let Some(sb) = gpu.staging_belt.as_mut() {

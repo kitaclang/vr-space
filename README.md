@@ -63,6 +63,18 @@ Put the glasses on, look straight ahead and click **Calibrate** in the HUD (or p
 
 The HUD's `screen:` line shows whether screen capture is working. If Screen Recording permission is missing, the app asks macOS for it, shows a hint over the virtual screen, and adds a **Screen Recording settings** button. Press `P` (or click the button) to open System Settings at the right page. Allow vr-space there (or your terminal app, if you started it from a terminal), then quit and reopen it: macOS only applies the permission after a restart.
 
+### Latency
+
+The HUD shows where the time goes, as a mean with the 95th percentile and maximum over the last 512 samples, and the same figures go to the log every 10 seconds (with the median and sample count):
+
+| Line | Measures |
+|---|---|
+| `pose->submit` | From the newest head-tracking sample to the frame drawn with it being handed to the GPU. Shown once glasses are connected |
+| `capture->submit` | From when macOS says a screen image was on the Mac's display to the first frame showing it being handed to the GPU |
+| `frame upload` | Time spent putting each new screen image on the virtual screen: tiny when the GPU reads it in place, more with `--copy-frames` |
+
+These stop where the frame is handed to the GPU. The GPU's drawing time and the wait for the glasses to show the frame (up to one refresh) aren't included: wgpu 0.17 doesn't expose what would report them. To compare frame sharing with copying, run once with and once without `--copy-frames` and compare the log lines.
+
 ### Using it with the glasses
 
 The glasses show up on your Mac as an extra display. To get a virtual monitor that stays in place while you turn your head:
