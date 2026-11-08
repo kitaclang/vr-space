@@ -9,7 +9,6 @@ use env_logger::Env;
 use log::{info, warn};
 
 use glam::{Mat4, Quat, Vec3};
-use wgpu::util::DeviceExt;
 use winit::event::{ElementState, Event, KeyboardInput, MouseButton, VirtualKeyCode, WindowEvent};
 use winit::event::StartCause;
 use winit::event_loop::{EventLoop, EventLoopBuilder};
@@ -51,6 +50,10 @@ mod settings;
 
 // App and menu bar icons, drawn in code
 mod icon;
+
+// The grid and the virtual screen, drawn without needing a window
+mod scene;
+use crate::scene::{Scene, TVertex, Vertex};
 use crate::settings::{SavedWindow, Settings, SettingsStore};
 
 /// Something the user asked for, from a key in the window, the menu bar or a global shortcut.
@@ -327,59 +330,7 @@ struct PoseCopy {
     yaw: f32,
 }
 
-// ================= GPU Types =================
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    position: [f32; 3],
-    color: [f32; 3],
-}
-
-impl Vertex {
-    const ATTRS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
-
-    fn desc() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &Self::ATTRS,
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Uniforms {
-    view_proj: [[f32; 4]; 4],
-}
-
-// Textured quad vertex
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct TVertex {
-    pos: [f32; 3],
-    uv: [f32; 2],
-}
-impl TVertex {
-    const ATTRS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2];
-    fn desc() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<TVertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &Self::ATTRS,
-        }
-    }
-}
-
-impl Uniforms {
-    fn new() -> Self {
-        Self { view_proj: Mat4::IDENTITY.to_cols_array_2d() }
-    }
-    fn update(&mut self, vp: Mat4) {
-        self.view_proj = vp.to_cols_array_2d();
-    }
-}
+// ================= GPU =================
 
 // Simple rectangle hitbox
 #[derive(Clone, Copy, Debug)]
@@ -401,18 +352,8 @@ struct Gpu {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
 
-    // Grid
-    pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    vertex_count: u32,
-
-    // Camera uniforms
-    uniform: Uniforms,
-    uniform_buffer: wgpu::Buffer,
-    uniform_bind_group: wgpu::BindGroup,
-
-    // Optional pre-recorded render bundle for static scene
-    render_bundle: Option<wgpu::RenderBundle>,
+    // Grid and virtual screen
+    scene: Scene,
 
     // HUD
     glyph_brush: Option<GlyphBrush<()>>,
@@ -429,21 +370,9 @@ struct Gpu {
     hud_text: Vec<String>,
     hud_text_updated_ns: u64,
 
-    // Virtual monitor: textured quad and texture/sampler
-    quad_pipeline: wgpu::RenderPipeline,
-    quad_vb: wgpu::Buffer,
-    quad_ib: wgpu::Buffer,
-    quad_index_count: u32,
-    quad_bgl: wgpu::BindGroupLayout,
-    quad_sampler: wgpu::Sampler,
-    // Screen texture; recreated (rarely) when the captured frame size changes.
-    tex: wgpu::Texture,
-    tex_size: (u32, u32),
-    quad_bind_group: wgpu::BindGroup,
     // CPU-side frame buffer swapped with the capture module (no per-frame copy or allocation).
     frame_buf: Vec<u8>,
     frame_seq: u64,
-    screen: ScreenPlacement,
 }
 
 /// Where the virtual screen sits: straight ahead of the eye at the calibrated "forward".
@@ -491,43 +420,6 @@ fn quad_vertices(screen: ScreenPlacement, aspect: f32) -> [TVertex; 4] {
 }
 
 /// Rewrite the screen quad after its placement or the captured frame's aspect ratio changed.
-fn write_quad(gpu: &Gpu) {
-    let (w, h) = gpu.tex_size;
-    let aspect = if w > 0 && h > 0 { w as f32 / h as f32 } else { 1.6 };
-    let verts = quad_vertices(gpu.screen, aspect);
-    gpu.queue.write_buffer(&gpu.quad_vb, 0, bytemuck::cast_slice(&verts));
-}
-
-/// Create the BGRA screen texture and its bind group. BGRA8Unorm matches ScreenCaptureKit
-/// output, so no swizzle is needed.
-fn create_screen_texture(
-    device: &wgpu::Device,
-    bgl: &wgpu::BindGroupLayout,
-    sampler: &wgpu::Sampler,
-    width: u32,
-    height: u32,
-) -> (wgpu::Texture, wgpu::BindGroup) {
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("capture-texture"),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Bgra8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("quad-bg"),
-        layout: bgl,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Sampler(sampler) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
-        ],
-    });
-    (tex, bind_group)
-}
 
 async fn init_gpu(window: &Window, cli: &Cli, vertices: &[Vertex]) -> anyhow::Result<Gpu> {
     let (vsync, hud_forced_off, hud_size) = (cli.vsync, cli.no_hud, cli.hud_size);
@@ -592,183 +484,7 @@ async fn init_gpu(window: &Window, cli: &Cli, vertices: &[Vertex]) -> anyhow::Re
     };
     surface.configure(&device, &config);
 
-    // Shaders
-    let shader_src = include_str!("shader.wgsl");
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("grid-shader"),
-        source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-    });
-
-    // Uniforms
-    let uniform = Uniforms::new();
-    let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("uniform-buffer"),
-        contents: bytemuck::bytes_of(&uniform),
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-    });
-
-    let uniform_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("uniform-bgl"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-    });
-
-    let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("uniform-bg"),
-        layout: &uniform_bind_group_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: uniform_buffer.as_entire_binding(),
-        }],
-    });
-
-    // Pipeline
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("pipeline-layout"),
-        bind_group_layouts: &[&uniform_bind_group_layout],
-        push_constant_ranges: &[],
-    });
-
-    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("grid-vertices"),
-        contents: bytemuck::cast_slice(vertices),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
-
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("grid-pipeline"),
-        layout: Some(&pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: "vs_main",
-            buffers: &[Vertex::desc()],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: "fs_main",
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::LineList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
-            unclipped_depth: false,
-            polygon_mode: wgpu::PolygonMode::Fill,
-            conservative: false,
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
-        multiview: None,
-    });
-
-    // Textured quad pipeline (uses same uniform_bgl)
-    let quad_shader_src = r#"
-struct Uniforms { view_proj: mat4x4<f32>, };
-@group(0) @binding(0) var<uniform> ubo: Uniforms;
-
-@group(1) @binding(0) var samp: sampler;
-@group(1) @binding(1) var tex0: texture_2d<f32>;
-
-struct VsIn { @location(0) pos: vec3<f32>, @location(1) uv: vec2<f32>, };
-struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, };
-
-@vertex
-fn vs_main_q(in: VsIn) -> VsOut {
- var o: VsOut;
- o.pos = ubo.view_proj * vec4<f32>(in.pos, 1.0);
- o.uv = in.uv; // v = 0 is the top row, matching quad_vertices
- return o;
-}
-
-@fragment
-fn fs_main_q(in: VsOut) -> @location(0) vec4<f32> {
- let c = textureSample(tex0, samp, in.uv);
- return vec4<f32>(c.rgb, 1.0);
-}"#;
-    let quad_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("quad-shader"),
-        source: wgpu::ShaderSource::Wgsl(quad_shader_src.into()),
-    });
-    let quad_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("quad-sampler"),
-        address_mode_u: wgpu::AddressMode::ClampToEdge,
-        address_mode_v: wgpu::AddressMode::ClampToEdge,
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
-        mipmap_filter: wgpu::FilterMode::Nearest,
-        ..Default::default()
-    });
-    let quad_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("quad-bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    multisampled: false,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                },
-                count: None,
-            },
-        ],
-    });
-    let quad_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("quad-pl"),
-        bind_group_layouts: &[&uniform_bind_group_layout, &quad_bgl],
-        push_constant_ranges: &[],
-    });
-    let quad_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("quad-pipeline"),
-        layout: Some(&quad_pl_layout),
-        vertex: wgpu::VertexState { module: &quad_shader, entry_point: "vs_main_q", buffers: &[TVertex::desc()] },
-        fragment: Some(wgpu::FragmentState {
-            module: &quad_shader,
-            entry_point: "fs_main_q",
-            targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
-        }),
-        primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
-        multiview: None,
-    });
-
-    // Placeholder 1x1 (black) screen texture until the first captured frame sets the real size.
-    let tex_size = (1u32, 1u32);
-    let (tex, quad_bind_group) = create_screen_texture(&device, &quad_bgl, &quad_sampler, tex_size.0, tex_size.1);
-
-    // Quad VB/IB centered at origin. Starts at 16:10 and is resized to the capture's aspect ratio.
-    let quad_indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
-    let quad_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("quad-vb"),
-        contents: bytemuck::cast_slice(&quad_vertices(screen, 1.6)),
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-    });
-    let quad_ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("quad-ib"),
-        contents: bytemuck::cast_slice(&quad_indices),
-        usage: wgpu::BufferUsages::INDEX,
-    });
-    let quad_index_count = quad_indices.len() as u32;
+    let scene = Scene::new(&device, format, vertices, screen);
 
     // HUD: Noto Sans (SIL OFL 1.1, see assets/OFL.txt) is embedded in the binary; if it fails to parse, disable HUD text.
     static EMBED_FONT: &[u8] = include_bytes!("../assets/NotoSans-Regular.ttf");
@@ -798,36 +514,12 @@ fn fs_main_q(in: VsOut) -> @location(0) vec4<f32> {
     let calibrate_btn = Rect { x: 0.0, y: 0.0, w: 110.0, h: 28.0 };
     let show_calibrated_toast_until_ns = 0;
 
-    // Record a render bundle for the static grid to reduce per-frame encoder work
-    let render_bundle: Option<wgpu::RenderBundle> = {
-        let mut encoder = device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
-            label: Some("grid-bundle-encoder"),
-            color_formats: &[Some(format)],
-            depth_stencil: None,
-            sample_count: 1,
-            multiview: None,
-        });
-        encoder.set_pipeline(&pipeline);
-        encoder.set_bind_group(0, &uniform_bind_group, &[]);
-        encoder.set_vertex_buffer(0, vertex_buffer.slice(..));
-        encoder.draw(0..vertices.len() as u32, 0..1);
-        Some(encoder.finish(&wgpu::RenderBundleDescriptor {
-            label: Some("grid-bundle"),
-        }))
-    };
-
     Ok(Gpu {
         surface,
         device,
         queue,
         config,
-        pipeline,
-        vertex_buffer,
-        vertex_count: vertices.len() as u32,
-        uniform,
-        uniform_buffer,
-        uniform_bind_group,
-        render_bundle,
+        scene,
         glyph_brush,
         staging_belt,
         hud_enabled,
@@ -838,18 +530,8 @@ fn fs_main_q(in: VsOut) -> @location(0) vec4<f32> {
         show_calibrated_toast_until_ns,
         hud_text: Vec::new(),
         hud_text_updated_ns: 0,
-        quad_pipeline,
-        quad_vb,
-        quad_ib,
-        quad_index_count,
-        quad_bgl,
-        quad_sampler,
-        tex,
-        tex_size,
-        quad_bind_group,
         frame_buf: Vec::new(),
         frame_seq: 0,
-        screen,
     })
 }
 
@@ -1322,9 +1004,9 @@ fn main() -> anyhow::Result<()> {
 
     // GPU init
     let mut gpu = pollster::block_on(init_gpu(&window, &cli, &grid_vertices))?;
-    gpu.screen = plan.screen;
+    gpu.scene.screen = plan.screen;
     gpu.hud_enabled &= plan.hud;
-    write_quad(&gpu);
+    gpu.scene.write_quad(&gpu.queue);
 
     // What's on the virtual screen: a display (as a real ID; 0 on the command line means the
     // main display) or a window. `last_display` is where to go back to if the window closes.
@@ -1570,89 +1252,21 @@ fn main() -> anyhow::Result<()> {
                     let proj = make_proj(gpu.config.width, gpu.config.height, cli.fov);
                     proj * view_m
                 };
-                gpu.uniform.update(vp);
-                gpu.queue.write_buffer(&gpu.uniform_buffer, 0, bytemuck::bytes_of(&gpu.uniform));
+                gpu.scene.set_view_proj(&gpu.queue, vp);
 
                 // Upload the newest screen frame (macOS only). Skips entirely when no new frame
                 // has arrived; the frame buffer is swapped in, not copied.
                 #[cfg(target_os = "macos")]
                 {
                     if let Some(info) = take_latest_bgra(&mut gpu.frame_buf, &mut gpu.frame_seq) {
-                        let (w, h, bpr) = (info.width, info.height, info.bytes_per_row);
-                        let max_dim = gpu.device.limits().max_texture_dimension_2d;
-                        let fits = w <= max_dim && h <= max_dim && gpu.frame_buf.len() >= (bpr as usize) * (h as usize);
-                        if fits {
-                            if gpu.tex_size != (w, h) {
-                                // Rare: first frame, or the display resolution changed.
-                                info!("Screen texture resized to {w}x{h}");
-                                let (tex, bg) = create_screen_texture(&gpu.device, &gpu.quad_bgl, &gpu.quad_sampler, w, h);
-                                gpu.tex = tex;
-                                gpu.quad_bind_group = bg;
-                                gpu.tex_size = (w, h);
-                                write_quad(&gpu);
-                            }
-                            gpu.queue.write_texture(
-                                wgpu::ImageCopyTexture {
-                                    texture: &gpu.tex,
-                                    mip_level: 0,
-                                    origin: wgpu::Origin3d::ZERO,
-                                    aspect: wgpu::TextureAspect::All,
-                                },
-                                &gpu.frame_buf[..(bpr as usize) * (h as usize)],
-                                wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) },
-                                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                            );
-                        } else if gpu.tex_size != (0, 0) {
-                            warn!("Captured frame {w}x{h} exceeds GPU texture limit {max_dim}; not displayed");
-                            gpu.tex_size = (0, 0); // log once until a frame fits again
-                        }
+                        let Gpu { device, queue, scene, frame_buf, .. } = &mut gpu;
+                        scene.upload_frame(device, queue, info.width, info.height, info.bytes_per_row, frame_buf);
                     }
                 }
 
                 // Render 3D scene
                 let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("encoder") });
-                {
-                    let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("grid-pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.03, a: 1.0 }),
-                                store: true,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                    });
-
-                    if let Some(bundle) = &gpu.render_bundle {
-                        rpass.execute_bundles(std::iter::once(bundle));
-                    } else {
-                        rpass.set_pipeline(&gpu.pipeline);
-                        rpass.set_bind_group(0, &gpu.uniform_bind_group, &[]);
-                        rpass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
-                        rpass.draw(0..gpu.vertex_count, 0..1);
-                    }
-                }
-
-                // Draw virtual monitor quad in front of camera (translate forward)
-                {
-                    let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("quad-pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            resolve_target: None,
-                            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: true },
-                        })],
-                        depth_stencil_attachment: None,
-                    });
-                    rpass.set_pipeline(&gpu.quad_pipeline);
-                    rpass.set_bind_group(0, &gpu.uniform_bind_group, &[]);
-                    rpass.set_bind_group(1, &gpu.quad_bind_group, &[]);
-                    rpass.set_vertex_buffer(0, gpu.quad_vb.slice(..));
-                    rpass.set_index_buffer(gpu.quad_ib.slice(..), wgpu::IndexFormat::Uint16);
-                    rpass.draw_indexed(0..gpu.quad_index_count, 0, 0..1);
-                }
+                gpu.scene.encode(&mut encoder, &view);
 
                 // FPS update
                 fps.on_frame();
@@ -1666,9 +1280,9 @@ fn main() -> anyhow::Result<()> {
                 {
                     let dev = if has { "connected" } else { "not-found" };
                     #[cfg(target_os = "macos")]
-                    let screen_line = screen_status_line(gpu.tex_size, shown);
+                    let screen_line = screen_status_line(gpu.scene.tex_size, shown);
                     #[cfg(not(target_os = "macos"))]
-                    let screen_line = screen_status_line(gpu.tex_size);
+                    let screen_line = screen_status_line(gpu.scene.tex_size);
                     gpu.hud_text = vec![
                         format!("device: {dev}"),
                         format!("fps: {:.1}", fps.fps.max(0.0)),
@@ -1676,7 +1290,7 @@ fn main() -> anyhow::Result<()> {
                         format!("euler(rad) r={:.3} p={:.3} y={:.3}", r, p, y),
                         format!("invert=({},{},{}) vsync={}", cli.invert_x, cli.invert_y, cli.invert_z, cli.vsync),
                         screen_line,
-                        format!("distance: {:.2}  height: {:.2}", gpu.screen.distance, gpu.screen.height),
+                        format!("distance: {:.2}  height: {:.2}", gpu.scene.screen.distance, gpu.scene.screen.height),
                     ];
                     gpu.hud_text_updated_ns = now_ns;
                 }
@@ -1813,11 +1427,11 @@ fn main() -> anyhow::Result<()> {
                     *control_flow = ControlFlow::Exit;
                 }
                 Command::Recenter => calibrate_pending = true,
-                Command::Further => gpu.screen.scale_distance(SCREEN_STEP),
-                Command::Closer => gpu.screen.scale_distance(1.0 / SCREEN_STEP),
-                Command::Bigger => gpu.screen.scale_height(SCREEN_STEP),
-                Command::Smaller => gpu.screen.scale_height(1.0 / SCREEN_STEP),
-                Command::ResetScreen => gpu.screen = ScreenPlacement::from_cli(&cli),
+                Command::Further => gpu.scene.screen.scale_distance(SCREEN_STEP),
+                Command::Closer => gpu.scene.screen.scale_distance(1.0 / SCREEN_STEP),
+                Command::Bigger => gpu.scene.screen.scale_height(SCREEN_STEP),
+                Command::Smaller => gpu.scene.screen.scale_height(1.0 / SCREEN_STEP),
+                Command::ResetScreen => gpu.scene.screen = ScreenPlacement::from_cli(&cli),
                 Command::ToggleFullscreen => {
                     // Fullscreen on whichever display the window is on, or back to a window.
                     let target = if fullscreen_on.is_some() {
@@ -1878,14 +1492,14 @@ fn main() -> anyhow::Result<()> {
                 cmd,
                 Command::Further | Command::Closer | Command::Bigger | Command::Smaller | Command::ResetScreen
             ) {
-                write_quad(&gpu);
+                gpu.scene.write_quad(&gpu.queue);
             }
             // Remember what was changed for next time. Only what you change is saved, so a
             // window that isn't open at startup is still remembered.
             match cmd {
                 Command::Further | Command::Closer | Command::Bigger | Command::Smaller => {
-                    settings.screen_distance = Some(gpu.screen.distance);
-                    settings.screen_height = Some(gpu.screen.height);
+                    settings.screen_distance = Some(gpu.scene.screen.distance);
+                    settings.screen_height = Some(gpu.scene.screen.height);
                 }
                 // Back to the command-line values, and keep following them.
                 Command::ResetScreen => {

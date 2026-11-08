@@ -18,7 +18,7 @@ What's planned for vr-space, grouped by priority rather than dates. vr-space is 
 
 ## Later
 
-- **More automated tests**, for example running the renderer on a headless GPU to check what it draws.
+- **More automated tests.** The scene is now rendered offscreen on the GPU in `cargo test` and its pixels checked. Still to cover: the HUD (text and button positions) and the window and fullscreen handling, which need a real window.
 - **Reduce latency further.** Upload frames straight from the capture's IOSurface instead of copying them through the CPU, and measure real motion-to-photon latency rather than the age of the last sample.
 - **Curved or multiple virtual screens.**
 
