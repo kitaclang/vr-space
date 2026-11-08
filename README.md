@@ -182,6 +182,7 @@ vr-space is released under the [MIT License](LICENSE).
 
 Third-party components keep their own licenses:
 
+- **App and menu bar icons** are drawn in code (`apps/headset-visualizer/src/icon.rs`) and are part of vr-space's MIT-licensed source.
 - **Noto Sans** (`apps/headset-visualizer/assets/NotoSans-Regular.ttf`, embedded in the app binary): SIL Open Font License 1.1, see [`OFL.txt`](apps/headset-visualizer/assets/OFL.txt).
 - **Rust dependencies** are fetched by Cargo and are almost all MIT, Apache-2.0, BSD, ISC or Zlib licensed. `serialport` is MPL-2.0.
 - **libusb** (LGPL-2.1) is compiled statically into the binary through `rusb`/`libusb1-sys`. This repository ships source only. If you distribute compiled binaries (including a `vr-space.app` built with `scripts/bundle-macos.sh`), you need to meet the LGPL's terms for libusb (for example, by providing its source and allowing it to be relinked).

@@ -49,6 +49,12 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$TARGET_DIR/release/headset-visualizer" "$APP/Contents/MacOS/vr-space"
 sed "s/@VERSION@/$VERSION/g" "$CRATE/macos/Info.plist" > "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
+
+# App icon: drawn by the app itself (no image asset), turned into an .icns by iconutil.
+ICONSET="$(mktemp -d)/AppIcon.iconset"
+"$APP/Contents/MacOS/vr-space" --write-iconset "$ICONSET" > /dev/null
+iconutil --convert icns --output "$APP/Contents/Resources/AppIcon.icns" "$ICONSET"
+rm -rf "$(dirname "$ICONSET")"
 plutil -lint -s "$APP/Contents/Info.plist"
 
 echo "Signing (${IDENTITY/#-/ad-hoc})…"

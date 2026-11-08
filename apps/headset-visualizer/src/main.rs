@@ -48,6 +48,9 @@ mod macos_app;
 
 // Settings saved between runs
 mod settings;
+
+// App and menu bar icons, drawn in code
+mod icon;
 use crate::settings::{SavedWindow, Settings, SettingsStore};
 
 /// Something the user asked for, from a key in the window, the menu bar or a global shortcut.
@@ -162,6 +165,11 @@ struct Cli {
     /// HUD) in ~/Library/Application Support/vr-space/settings.json
     #[arg(long)]
     ignore_settings: bool,
+
+    /// Write the app icon as PNGs into this .iconset folder, then exit (used by
+    /// scripts/bundle-macos.sh)
+    #[arg(long, value_name = "DIR", hide = true)]
+    write_iconset: Option<std::path::PathBuf>,
 }
 
 /// Which of the flags that saved settings can stand in for were given on the command line.
@@ -1123,6 +1131,12 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     cli.validate()?;
     let explicit = ExplicitFlags::from_matches(&matches);
+
+    if let Some(dir) = &cli.write_iconset {
+        icon::write_iconset(dir)?;
+        println!("Wrote the app icon to {}", dir.display());
+        return Ok(());
+    }
 
     #[cfg(target_os = "macos")]
     if cli.list_displays {

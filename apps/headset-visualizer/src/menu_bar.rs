@@ -314,29 +314,15 @@ fn display_label(id: u32, main_id: u32) -> String {
     format!("Display {id}: {w}x{h}{main}")
 }
 
-/// A small pair of glasses, drawn in code so there's no image asset to license. It's a
+/// A small pair of glasses, drawn in code (see `icon.rs`) so there's no image asset to license. It's a
 /// template image, so macOS colours it to match the menu bar. 80x44 px = 40x22 pt on Retina.
 fn menu_bar_icon() -> anyhow::Result<Icon> {
-    const W: usize = 80;
-    const H: usize = 44;
-    // Signed distance to a rounded rectangle centred at (cx, cy).
-    fn rounded_rect(x: f32, y: f32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32) -> f32 {
-        let qx = (x - cx).abs() - (hw - r);
-        let qy = (y - cy).abs() - (hh - r);
-        let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
-        outside + qx.max(qy).min(0.0) - r
-    }
+    const W: usize = crate::icon::GLASSES_SIZE.0 as usize;
+    const H: usize = crate::icon::GLASSES_SIZE.1 as usize;
     let mut rgba = vec![0u8; W * H * 4];
     for y in 0..H {
         for x in 0..W {
-            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-            let lenses = rounded_rect(px, py, 24.0, 24.0, 15.0, 10.0, 7.0)
-                .min(rounded_rect(px, py, 56.0, 24.0, 15.0, 10.0, 7.0));
-            // Hollow lenses: keep a 3.5 px rim.
-            let rims = lenses.max(-(lenses + 3.5));
-            let bridge = rounded_rect(px, py, 40.0, 19.0, 3.0, 2.0, 1.0);
-            let top_bar = rounded_rect(px, py, 40.0, 13.0, 31.0, 1.75, 1.75);
-            let d = rims.min(bridge).min(top_bar);
+            let (d, _) = crate::icon::glasses(x as f32 + 0.5, y as f32 + 0.5);
             let alpha = (0.5 - d).clamp(0.0, 1.0);
             rgba[(y * W + x) * 4 + 3] = (alpha * 255.0) as u8;
         }
