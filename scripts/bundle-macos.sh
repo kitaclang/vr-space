@@ -16,6 +16,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CRATE="$ROOT/apps/headset-visualizer"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+[[ "$TARGET_DIR" = /* ]] || TARGET_DIR="$ROOT/$TARGET_DIR"
 APP="$TARGET_DIR/release/vr-space.app"
 IDENTITY="${VR_SPACE_SIGN_IDENTITY:--}"
 BUNDLE_ID="io.github.kitaclang.vr-space"
@@ -41,7 +42,7 @@ if [[ -z "$VERSION" ]]; then
 fi
 
 echo "Building headset-visualizer $VERSION (release)…"
-cargo build --release -p headset-visualizer --manifest-path "$ROOT/Cargo.toml"
+"$ROOT/scripts/cargo.sh" build --release -p headset-visualizer
 
 echo "Assembling $APP"
 rm -rf "$APP"

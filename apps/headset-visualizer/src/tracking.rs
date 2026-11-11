@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ar_drivers::{any_fusion, any_glasses};
+use ar_drivers::try_any_fusion;
 use log::{info, warn};
 
 // ================= Low-latency Pose (Atomics) =================
@@ -21,6 +21,7 @@ pub struct PoseAtomic {
     pub roll_bits: AtomicU32,
     pub pitch_bits: AtomicU32,
     pub yaw_bits: AtomicU32,
+    connection_id: AtomicU64,
     pub has_device: AtomicU32,     // 0/1
     pub sample_time_ns: AtomicU64, // monotonic timestamp of last sample (Instant::now() - START), as nanoseconds
 }
@@ -31,6 +32,7 @@ impl PoseAtomic {
             roll_bits: AtomicU32::new(f32_to_u32(0.0)),
             pitch_bits: AtomicU32::new(f32_to_u32(0.0)),
             yaw_bits: AtomicU32::new(f32_to_u32(0.0)),
+            connection_id: AtomicU64::new(0),
             has_device: AtomicU32::new(0),
             sample_time_ns: AtomicU64::new(0),
         }
@@ -41,6 +43,10 @@ impl PoseAtomic {
         self.yaw_bits.store(f32_to_u32(yaw), Ordering::Relaxed);
         self.has_device.store(if has { 1 } else { 0 }, Ordering::Relaxed);
         self.sample_time_ns.store(now_ns, Ordering::Relaxed);
+    }
+    /// Changes for every fusion, even if the renderer misses the disconnected interval.
+    pub fn connection_id(&self) -> u64 {
+        self.connection_id.load(Ordering::Relaxed)
     }
     pub fn read(&self) -> (f32, f32, f32, bool, u64) {
         let r = u32_to_f32(self.roll_bits.load(Ordering::Relaxed));
@@ -89,54 +95,65 @@ pub fn spawn_tracking_thread(pose: Arc<PoseAtomic>, poll_ms: u64) {
             let _ = pthread_set_qos_class_self_np(0x21, 0);
         }
 
-        // Connect to fusion, retrying until glasses are plugged in. The renderer keeps
-        // running meanwhile and the HUD shows "device: not-found".
-        let mut warned = false;
-        let mut fusion = loop {
-            // Probe with any_glasses() first: ar_drivers::any_fusion() calls
-            // any_glasses_or_fail(), which exits the whole process when no glasses are found.
-            // any_glasses() returns an error instead. Drop the probe to release the device,
-            // then let any_fusion() open it again.
-            let probe = any_glasses().map(drop);
-            match probe.and_then(|()| any_fusion()) {
-                Ok(f) => {
-                    info!("Headset connected");
-                    pose.write(0.0, 0.0, 0.0, true, now_ns_from_start());
-                    break f;
-                }
-                Err(e) => {
-                    if !warned {
-                        warn!("No headset device found: {e}. Retrying every second.");
-                        warned = true;
-                    }
-                    pose.write(0.0, 0.0, 0.0, false, now_ns_from_start());
-                    thread::sleep(Duration::from_secs(1));
-                }
-            }
-        };
-
-        let mut last = Instant::now();
+        // Both connection and reads must return errors: the older driver APIs exit the app.
         loop {
-            fusion.update();
-            let frd = fusion.attitude_frd_rad();
-
-            // Publish the raw pose; calibration is applied on the render thread.
-            let now_ns = now_ns_from_start();
-            pose.write(frd[0], frd[1], frd[2], true, now_ns);
-
-            if let Some(dt) = poll_interval {
-                let now = Instant::now();
-                if now - last < dt {
-                    let sleep_for = dt - (now - last);
-                    thread::sleep(sleep_for);
+            let mut warned = false;
+            let mut fusion = loop {
+                match try_any_fusion() {
+                    Ok(f) => {
+                        info!("Headset connected");
+                        // Don't publish a connected pose until the first successful update.
+                        break f;
+                    }
+                    Err(e) => {
+                        if !warned {
+                            warn!("No headset device found: {e}. Retrying every second.");
+                            warned = true;
+                        }
+                        thread::sleep(Duration::from_secs(1));
+                    }
                 }
-                last = Instant::now();
-            } else {
-                // run as fast as possible, but yield cooperatively
-                thread::yield_now();
-            }
+            };
+
+            let error = track_session(&pose, poll_interval, || {
+                fusion.try_update()?;
+                let frd = fusion.attitude_frd_rad();
+                Ok([frd[0], frd[1], frd[2]])
+            });
+            warn!("Lost the headset ({error}). Waiting for it to be plugged in again.");
+            // Release USB handles before trying to open the glasses again.
+            drop(fusion);
+            thread::sleep(Duration::from_secs(1));
         }
     });
+}
+
+/// Publish samples until a read fails. A fresh fusion starts a new session after reconnecting.
+fn track_session(
+    pose: &PoseAtomic,
+    poll_interval: Option<Duration>,
+    mut read: impl FnMut() -> Result<[f32; 3], ar_drivers::Error>,
+) -> ar_drivers::Error {
+    pose.connection_id.fetch_add(1, Ordering::Relaxed);
+    let mut last = Instant::now();
+    loop {
+        match read() {
+            Ok([r, p, y]) => pose.write(r, p, y, true, now_ns_from_start()),
+            Err(error) => {
+                pose.write(0.0, 0.0, 0.0, false, now_ns_from_start());
+                return error;
+            }
+        }
+        if let Some(dt) = poll_interval {
+            let elapsed = last.elapsed();
+            if elapsed < dt {
+                thread::sleep(dt - elapsed);
+            }
+            last = Instant::now();
+        } else {
+            thread::yield_now();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -149,5 +166,30 @@ mod tests {
         assert_eq!(p.read(), (0.0, 0.0, 0.0, false, 0));
         p.write(0.1, -0.2, 3.0, true, 42);
         assert_eq!(p.read(), (0.1, -0.2, 3.0, true, 42));
+    }
+
+    #[test]
+    fn failed_read_disconnects_and_a_new_session_publishes_again() {
+        let pose = PoseAtomic::new();
+        assert_eq!(pose.connection_id(), 0);
+        for (index, sample) in [[0.1, -0.2, 3.0], [-0.4, 0.5, -1.0]].into_iter().enumerate() {
+            assert!(!pose.read().3);
+            let mut reads = 0;
+            let error = track_session(&pose, None, || {
+                reads += 1;
+                if reads == 1 {
+                    Ok(sample)
+                } else {
+                    let (r, p, y, connected, _) = pose.read();
+                    assert_eq!((r, p, y, connected), (sample[0], sample[1], sample[2], true));
+                    Err(ar_drivers::Error::NotFound)
+                }
+            });
+            assert!(matches!(error, ar_drivers::Error::NotFound));
+            assert_eq!(reads, 2);
+            assert_eq!(pose.connection_id(), index as u64 + 1);
+            let (r, p, y, connected, _) = pose.read();
+            assert_eq!((r, p, y, connected), (0.0, 0.0, 0.0, false));
+        }
     }
 }

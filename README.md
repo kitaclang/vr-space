@@ -22,7 +22,7 @@ Head tracking comes from [`ar-drivers`](https://github.com/3rl-io/headset-utils)
 - macOS 12.3 or later (ScreenCaptureKit)
 - Rust (stable), installed with [rustup](https://rustup.rs)
 - Supported AR glasses connected over USB
-- **Screen Recording permission** for vr-space.app, or for your terminal app if you run it with `cargo run`: System Settings → Privacy & Security → Screen Recording
+- **Screen Recording permission** for vr-space.app, or for your terminal app if you run it with `scripts/cargo.sh run`: System Settings → Privacy & Security → Screen Recording
 - Optional, for `capture-check --mp4-out`: `ffmpeg` on your `PATH`
 
 ## Usage
@@ -53,13 +53,15 @@ open ~/Applications/vr-space.app --args --screen-distance 3
 
 ### From a terminal
 
+Use `scripts/cargo.sh` instead of plain `cargo` for builds, tests and runs. It fetches the pinned driver and applies our reconnect patch locally under ignored `target/patched-drivers/`; no fork or upstream PR is needed. The first invocation needs Git and network access. See [patches/README.md](patches/README.md).
+
 Run the visualizer (release build recommended for lowest latency):
 
 ```bash
-cargo run --release -p headset-visualizer
+scripts/cargo.sh run --release -p headset-visualizer
 ```
 
-Put the glasses on, look straight ahead and click **Calibrate** in the HUD (or press `C`, or `⌃⌥C` from any app) to set the forward direction. If the glasses aren't connected yet, plug them in: the app keeps looking for them every second. Press `Esc` or close the window to quit.
+Put the glasses on, look straight ahead and click **Calibrate** in the HUD (or press `C`, or `⌃⌥C` from any app) to set the forward direction. If the glasses aren't connected yet, plug them in: the app keeps looking for them every second. If you unplug the glasses, the app waits and reconnects when they return. Recenter again after reconnecting: the new tracking session resets calibration. Press `Esc` or close the window to quit.
 
 The HUD's `screen:` line shows whether screen capture is working. If Screen Recording permission is missing, the app asks macOS for it, shows a hint over the virtual screen, and adds a **Screen Recording settings** button. Press `P` (or click the button) to open System Settings at the right page. Allow vr-space there (or your terminal app, if you started it from a terminal), then quit and reopen it: macOS only applies the permission after a restart.
 
@@ -85,13 +87,13 @@ The glasses show up on your Mac as an extra display. To get a virtual monitor th
 2. Find the display IDs. With the glasses plugged in, they appear as an extra display in the list:
 
    ```bash
-   cargo run --release -p headset-visualizer -- --list-displays
+   scripts/cargo.sh run --release -p headset-visualizer -- --list-displays
    ```
 
 3. Run the app with `--display` set to the screen you want to see and `--fullscreen` set to the glasses:
 
    ```bash
-   cargo run --release -p headset-visualizer -- --display <screen ID> --fullscreen <glasses ID>
+   scripts/cargo.sh run --release -p headset-visualizer -- --display <screen ID> --fullscreen <glasses ID>
    ```
 
 4. Put the glasses on, look straight ahead and press `⌃⌥C` (or choose **Recenter** from the menu bar icon).
@@ -103,7 +105,7 @@ You can also start without `--fullscreen` and pick the glasses under **Fullscree
 Instead of a whole display, the virtual screen can show one window, for example a browser or an editor. Choose it under **Show window** in the menu bar icon, or start with `--window`:
 
 ```bash
-cargo run --release -p headset-visualizer -- --window Safari --fullscreen <glasses ID>
+scripts/cargo.sh run --release -p headset-visualizer -- --window Safari --fullscreen <glasses ID>
 ```
 
 `--window` takes a window ID from `--list-windows`, an app name, or part of a window title. The window is shown on its own, even when other windows cover it, it's minimised, or it's on another Space. If you resize it, the capture restarts at the new size within a couple of seconds. If you close it, the virtual screen goes back to the last display shown.
@@ -189,7 +191,7 @@ Options:
 Check screen capture on its own:
 
 ```bash
-cargo run --release -p capture-check -- --seconds 5 --out capture.bgra
+scripts/cargo.sh run --release -p capture-check -- --seconds 5 --out capture.bgra
 ```
 
 `capture.bgra` starts with a 32-byte header (magic `BGR4`, version, width, height, stride, bytes per pixel, frame count), followed by raw BGRA frames. Add `--mp4-out capture.mp4` to also encode an H.264 video with ffmpeg. Run with `--help` for all options.

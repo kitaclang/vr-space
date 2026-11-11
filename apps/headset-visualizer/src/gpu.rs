@@ -56,6 +56,14 @@ pub struct Gpu {
     pub shown_frames: [Option<CapturedFrame>; 3],
 }
 
+/// wgpu 0.17's surface configuration drops pending map callbacks instead of firing them.
+/// Drain them first (the HUD's staging belt maps buffers after each submit). This waits
+/// only on resize/surface recovery, never on the normal frame path.
+pub fn configure_surface(surface: &wgpu::Surface, device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) {
+    device.poll(wgpu::Maintain::Wait);
+    surface.configure(device, config);
+}
+
 pub async fn init_gpu(window: &Window, cli: &Cli, vertices: &[Vertex]) -> anyhow::Result<Gpu> {
     let (vsync, hud_forced_off, hud_size) = (cli.vsync, cli.no_hud, cli.hud_size);
     let screen = ScreenPlacement::from_cli(cli);
@@ -117,7 +125,7 @@ pub async fn init_gpu(window: &Window, cli: &Cli, vertices: &[Vertex]) -> anyhow
         alpha_mode: caps.alpha_modes[0],
         view_formats: vec![],
     };
-    surface.configure(&device, &config);
+    configure_surface(&surface, &device, &config);
 
     let mut scene = Scene::new(&device, format, vertices, screen);
     scene.curve = cli.curve;
@@ -210,4 +218,66 @@ pub fn show_captured_frame(gpu: &mut Gpu, frame: CapturedFrame) {
     shown_frames.rotate_right(1);
     shown_frames[0] = None;
     frame.with_bytes(|bytes| scene.upload_frame(device, queue, frame.width, frame.height, frame.bytes_per_row, bytes));
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::configure_surface;
+    use metal::foreign_types::ForeignType;
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+    #[test]
+    fn surface_reconfiguration_fires_pending_map_callbacks() {
+        let layer = metal::MetalLayer::new();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::METAL,
+            ..Default::default()
+        });
+        // SAFETY: the CAMetalLayer is valid and stays alive longer than the surface.
+        // No drawable is acquired, so this needs neither a window nor a connected display.
+        let surface = unsafe { instance.create_surface_from_core_animation_layer(layer.as_ptr().cast()) };
+        let Some(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            compatible_surface: Some(&surface),
+            ..Default::default()
+        })) else {
+            eprintln!("no Metal adapter; skipping surface reconfiguration test");
+            return;
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: None,
+                features: wgpu::Features::empty(),
+                limits: adapter.limits(),
+            },
+            None,
+        )).expect("test device");
+        let caps = surface.get_capabilities(&adapter);
+        let mut config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: caps.formats[0],
+            width: 64,
+            height: 64,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+        };
+        configure_surface(&surface, &device, &config);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pending HUD-style mapping"),
+            size: 256,
+            usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        queue.submit(std::iter::empty());
+        let called = Arc::new(AtomicBool::new(false));
+        let callback_called = called.clone();
+        buffer.slice(..).map_async(wgpu::MapMode::Write, move |result| {
+            result.expect("map buffer before reconfiguration");
+            callback_called.store(true, Ordering::SeqCst);
+        });
+        config.width = 128;
+        configure_surface(&surface, &device, &config);
+        assert!(called.load(Ordering::SeqCst), "map callback must fire before configure returns");
+        buffer.unmap();
+    }
 }

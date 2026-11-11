@@ -4,7 +4,7 @@ Everything that still needs real AR glasses to check, in an order that fits one 
 
 ## Before you start
 
-- Build the release app: `cargo build --release -p headset-visualizer` (or `scripts/bundle-macos.sh --install` to also check the app bundle).
+- Build the release app: `scripts/cargo.sh build --release -p headset-visualizer` (or `scripts/bundle-macos.sh --install` to also check the app bundle).
 - Make sure Screen Recording is allowed for the terminal (or vr-space.app).
 - Run with a log you can keep: `target/release/headset-visualizer --fullscreen <id> --display <id> 2>&1 | grep --line-buffered -v "can't find" | tee glasses-session.log`. It logs at info already; `RUST_LOG=info` would also turn on wgpu's own logging and bury the useful lines. The `grep` drops the probes for other glasses models, and `--line-buffered` keeps the log appearing as it happens (`--list-displays` shows the glasses' display ID).
 - Keep the HUD on (`H`). The shortcuts below work from any app with `⌃⌥` (Control-Option), or as plain keys while the vr-space window has focus.
@@ -69,12 +69,14 @@ If a still screen shimmers at the amount that's right for turning, the smoothing
 |---|---|---|
 | | | |
 
-## 6. Unplugging (`local/unplug-fix` branch)
+## 6. Unplugging
 
-This needs the locally patched `ar-drivers` described in that branch's `patches/README.md`.
+The build wrapper applies the required driver patch automatically; see [patches/README.md](../patches/README.md).
 
-- [ ] Unplug the glasses mid-session: the app keeps running and the HUD shows `device: not-found`.
-- [ ] Plug them back in: tracking resumes without restarting the app.
+- [x] Unplug the glasses mid-session: the app keeps running (confirmed by the same process and disconnect/retry logs).
+- [ ] While unplugged, visually confirm the HUD shows `device: not-found`.
+- [x] Plug them back in: tracking resumes without restarting the app. The old calibration is cleared; recenter with `⌃⌥C` and confirm the screen stays in place.
+- [ ] Repeat with prediction enabled: no stale velocity or wild jump after reconnecting. **Failed on the second unplug cycle with prediction at 20 ms:** tracking logged the disconnect, then the main thread panicked in wgpu-core 0.17.1 (`Map callback was leaked`). Backtrace confirmed wgpu surface reconfiguration dropped pending map callbacks. A workaround now drains them before configuring, with a regression test. One post-fix unplug/replug cycle with the window moved onto the glasses display passed: the same process survived and reconnected; the user confirmed recovery after recentering. Prediction-enabled recovery still needs explicit confirmation. Prediction itself was not identified as the cause. Crash log: `/tmp/vr-space-reconnect-crash.log` (temporary local file).
 - [ ] Repeat a few times, including unplugging while turning your head.
 
 ## 7. The app bundle

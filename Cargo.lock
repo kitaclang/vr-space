@@ -161,7 +161,6 @@ dependencies = [
 [[package]]
 name = "ar-drivers"
 version = "0.4.3"
-source = "git+https://github.com/3rl-io/headset-utils?rev=1d14c9d529c1a3a85eb614805fca20f3b9028d0a#1d14c9d529c1a3a85eb614805fca20f3b9028d0a"
 dependencies = [
  "bytemuck",
  "byteorder",

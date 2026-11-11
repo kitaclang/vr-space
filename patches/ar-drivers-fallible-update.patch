@@ -1,0 +1,148 @@
+From 7f509e8ac90a7875ed6bdf152445f45c02e712aa Mon Sep 17 00:00:00 2001
+From: KC <kitaclang@gmail.com>
+Date: Sun, 8 Nov 2026 09:53:04 +0700
+Subject: [PATCH] Add try_update and try_any_fusion that return errors instead
+ of exiting
+
+Fusion::update() and any_fusion() call std::process::exit(0) when the
+glasses can't be found or reading from them fails, for example when
+they are unplugged. That ends the whole host app.
+
+Add fallible versions next to them:
+
+- Fusion::try_update() returns the read error. Its default
+  implementation calls update(), so existing Fusion implementations
+  keep compiling. NaiveCF and FusionWithOffset implement it properly.
+- try_any_fusion() uses any_glasses() instead of
+  any_glasses_or_fail(), so it returns NotFound instead of exiting.
+
+update() and any_fusion() behave as before. The one change in behaviour
+is that NaiveCF::new() now returns a read error during its start-up
+wait instead of exiting; it already returned a Result.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/lib.rs      | 29 +++++++++++++++++++++++++++++
+ src/naive_cf.rs | 25 ++++++++++---------------
+ 2 files changed, 39 insertions(+), 15 deletions(-)
+
+diff --git a/src/lib.rs b/src/lib.rs
+index 6a85b6a..ccdd587 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -121,7 +121,21 @@ pub trait Fusion: Send {
+     /// use FRD frame as error in Quaternion is multiplicative & is over-defined
+     fn inconsistency_frd(&self) -> f32;
+ 
++    /// Read the next event from the glasses and update the estimate. Blocks.
++    ///
++    /// Exits the process if reading fails, for example when the glasses are unplugged.
++    /// Use [`Fusion::try_update`] to handle that instead.
+     fn update(&mut self) -> ();
++
++    /// Like [`Fusion::update`], but returns the error instead of exiting the process when
++    /// reading from the glasses fails (for example when they are unplugged), so the caller
++    /// can drop this fusion and reconnect with [`try_any_fusion`].
++    ///
++    /// The default implementation calls [`Fusion::update`] and never returns an error.
++    fn try_update(&mut self) -> Result<()> {
++        self.update();
++        Ok(())
++    }
+ }
+ 
+ impl dyn Fusion {
+@@ -153,6 +167,10 @@ impl Fusion for FusionWithOffset {
+         self.fusion.update()
+     }
+ 
++    fn try_update(&mut self) -> Result<()> {
++        self.fusion.try_update()
++    }
++
+     fn attitude_quaternion(&self) -> UnitQuaternion<f32> {
+         let original = self.fusion.attitude_quaternion();
+         let corrected = self.offset * original;
+@@ -160,12 +178,23 @@ impl Fusion for FusionWithOffset {
+     }
+ }
+ 
++/// Connect to any supported glasses and start sensor fusion.
++///
++/// Exits the process if no glasses are found. Use [`try_any_fusion`] to get an error instead.
+ pub fn any_fusion() -> Result<Box<dyn Fusion>> {
+     // let glasses = any_glasses()?;
+     let glasses = any_glasses_or_fail()?;
+     Ok(Box::new(NaiveCF::new(glasses)?))
+ }
+ 
++/// Like [`any_fusion`], but returns an error instead of exiting the process when no glasses
++/// are found or reading from them fails, so the caller can retry (for example until the
++/// glasses are plugged in). Pair it with [`Fusion::try_update`].
++pub fn try_any_fusion() -> Result<Box<dyn Fusion>> {
++    let glasses = any_glasses()?;
++    Ok(Box::new(NaiveCF::new(glasses)?))
++}
++
+ type Rw<T> = Arc<Mutex<T>>;
+ 
+ fn rw<T>(v: T) -> Rw<T> {
+diff --git a/src/naive_cf.rs b/src/naive_cf.rs
+index 9acb6e7..5bf736b 100644
+--- a/src/naive_cf.rs
++++ b/src/naive_cf.rs
+@@ -87,7 +87,7 @@ impl NaiveCF {
+ 
+         loop {
+             //wait for the first non-zero gyro reading
+-            let next_event = fusion.next_event();
++            let next_event = fusion.glasses.read_event()?;
+             match next_event {
+                 GlassesEvent::AccGyro {
+                     accelerometer: _,
+@@ -104,19 +104,6 @@ impl NaiveCF {
+         }
+     }
+ 
+-    ///read until next valid event. Blocks.
+-    fn next_event(&mut self) -> GlassesEvent {
+-        loop {
+-            match self.glasses.read_event() {
+-                Ok(event) => return event,
+-                Err(e) => {
+-                    println!("Error reading event: {}", e);
+-                    std::process::exit(0);
+-                }
+-            }
+-        }
+-    }
+-
+     fn rub_to_frd(v: &Vector3<f32>) -> Vector3<f32> {
+         let result = Vector3::new(-v.z, v.x, -v.y);
+         result
+@@ -318,7 +305,14 @@ impl Fusion for NaiveCF {
+     }
+ 
+     fn update(&mut self) -> () {
+-        let event = self.next_event();
++        if let Err(e) = self.try_update() {
++            println!("Error reading event: {}", e);
++            std::process::exit(0);
++        }
++    }
++
++    fn try_update(&mut self) -> Result<()> {
++        let event = self.glasses.read_event()?;
+         match event {
+             GlassesEvent::AccGyro {
+                 accelerometer,
+@@ -334,5 +328,6 @@ impl Fusion for NaiveCF {
+                 //TODO: add magnetometer event etc
+             }
+         }
++        Ok(())
+     }
+ }
+-- 
+2.53.0
+

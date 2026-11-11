@@ -41,7 +41,7 @@ Cargo workspace with two crates:
 
 Libraries come from Cargo, not from this repo:
 
-- `ar-drivers` (head tracking): git dependency on `github.com/3rl-io/headset-utils`, pinned to a commit `rev`. Entry point: `ar_drivers::any_fusion()`, then `fusion.update()` and `fusion.attitude_frd_rad()`. Careful: `any_fusion()` calls `std::process::exit(0)` when no glasses are found, so always probe with `ar_drivers::any_glasses()` first (it returns an error instead). A USB read error inside `update()` also exits the process; that's upstream behaviour.
+- `ar-drivers` (head tracking): git dependency on `github.com/3rl-io/headset-utils`, pinned to a commit `rev`. The app uses patched `try_any_fusion()` and `Fusion::try_update()` to reconnect after read failures; use `scripts/cargo.sh` for builds, tests and runs (see `patches/README.md`). The pinned upstream lacks these APIs: its `any_fusion()` exits when no glasses are found and `update()` exits on a USB read error. The wrapper fetches the pinned revision and applies the bundled patch under ignored `target/patched-drivers/`; no public fork or PR is required.
 - `screencapturekit` 0.3.5 from crates.io.
 - `metal` 0.26 (MIT OR Apache-2.0), the version `wgpu-hal` 0.17 uses, for the IOSurface textures; `wgpu::hal` itself comes through `wgpu`. Upgrade it together with `wgpu`.
 - `tray-icon` 0.26 (with `muda` for menus) and `global-hotkey` 0.9 from crates.io, both MIT OR Apache-2.0. On macOS the tray icon must be created after the event loop starts (`StartCause::Init`).
@@ -50,7 +50,7 @@ Libraries come from Cargo, not from this repo:
 
 ## How the visualizer works
 
-1. A reader thread probes with `any_glasses()` every second until glasses are found, then calls `any_fusion()`, polls the fusion as fast as `--poll-ms` allows and publishes the raw roll/pitch/yaw into `PoseAtomic` (`f32` stored as `u32` bits in atomics), so the render loop never waits on a lock.
+1. A reader thread retries `try_any_fusion()` every second until glasses are found, then polls the fusion with `try_update()` as fast as `--poll-ms` allows and publishes the raw roll/pitch/yaw into `PoseAtomic` (`f32` stored as `u32` bits in atomics), so the render loop never waits on a lock. A failed read clears availability, drops the fusion and retries; a connection generation resets calibration and prediction on the render thread.
 2. The winit event loop reads the latest pose, turns it into a head rotation (`head_rotation_from_pose`), with `--predict-ms` turns it forward to where it's expected to be (`PosePredictor`), applies the calibration and builds the view matrix (`camera_view`). When a new captured frame is available, `show_captured_frame` passes its IOSurface to `Scene::show_external` (keyed by `IOSurfaceGetID`, so each of the capture's few surfaces is imported once) and keeps the frame in `shown_frames`, the current frame and the two before it, because the capture mustn't write into a surface the GPU may still be drawing. If the device isn't Metal, `--copy-frames` is given, or an import fails, frames go to `Scene::upload_frame` instead, which copies them with `queue.write_texture`. Either way the quad is resized if the frame size changed. Then `Scene::encode` draws the grid and screen quad, and the HUD is drawn on top.
 3. Calibration lives on the render thread: clicking the HUD's Calibrate button (hit-tested in physical pixels), pressing `C`, or the menu bar's Recenter or `⌃⌥C` sends `Command::Recenter`, which sets `calibrate_pending`, and the next frame stores the inverse of the current head rotation as a quaternion (`calib_inv`), or with `--recenter-yaw-only` the inverse of just its heading (`recenter_calibration`).
 4. Present mode prefers Mailbox, then Immediate, then Fifo, unless `--vsync` is passed.
@@ -60,28 +60,28 @@ When changing the hot path (pose reading, frame upload, rendering), don't add lo
 ## Commands
 
 ```bash
-cargo build --workspace
+scripts/cargo.sh build --workspace
 ```
 
 ```bash
-cargo test --workspace
+scripts/cargo.sh test --workspace
 ```
 
 ```bash
-cargo run --release -p headset-visualizer -- --help
+scripts/cargo.sh run --release -p headset-visualizer -- --help
 ```
 
 ```bash
-cargo run --release -p capture-check -- --seconds 5 --out capture.bgra
+scripts/cargo.sh run --release -p capture-check -- --seconds 5 --out capture.bgra
 ```
 
 ```bash
 scripts/bundle-macos.sh
 ```
 
-Unit tests (`#[cfg(test)]` modules at the end of `camera.rs`, `cli.rs`, `command.rs`, `tracking.rs`, `window_placement.rs`, `hud.rs`, `macos_capture.rs`, `menu_bar.rs`, `macos_app.rs`, `settings.rs`, `icon.rs`, `latency.rs`, `prediction.rs` and `scene.rs`, using `iosurface.rs`'s `test_surface`) cover what doesn't need hardware: the axis mapping, recentering, camera and neck model, screen placement, CLI validation, app bundle detection and `-psn_` filtering, window matching for `--window` and saved windows, fullscreen covering the captured display, menu IDs and window keys, saved settings (parsing, saving, and how they combine with flags), the app icon and iconset, what the scene draws (rendered offscreen on the GPU: the screen is upright and not mirrored, takes the frame's aspect ratio and row stride, moves the right way when you turn, rejects frames that don't fit, looks taller towards its edges when curved; skipped with a note when there's no GPU adapter), and the capture frame handoff (`Latest`, the part of the capture callback that doesn't touch ScreenCaptureKit), the HUD layout (buttons cover their labels at any `--hud-size` and scale, sit where they should and don't overlap; drawn offscreen with wgpu_glyph to check each label lands inside its box), the latency statistics and mach time conversion, head-pose prediction (speed estimates at different sample rates, stopping, glitches, the sign flip at half a turn), and showing IOSurfaces in place (made in the test, written after import to check that the GPU reads them without a copy). To verify a change, at minimum build the workspace, run `cargo test --workspace` and run each binary with `--help`. Add or update tests when you change those parts. Real behaviour needs AR glasses over USB and Screen Recording permission for the terminal, which an agent usually can't provide. Say so rather than claiming a change works on hardware.
+Unit tests (`#[cfg(test)]` modules at the end of `camera.rs`, `cli.rs`, `command.rs`, `tracking.rs`, `window_placement.rs`, `hud.rs`, `macos_capture.rs`, `menu_bar.rs`, `macos_app.rs`, `settings.rs`, `icon.rs`, `latency.rs`, `prediction.rs`, `gpu.rs` and `scene.rs`, using `iosurface.rs`'s `test_surface`) cover what doesn't need hardware: the axis mapping, recentering, camera and neck model, screen placement, CLI validation, app bundle detection and `-psn_` filtering, window matching for `--window` and saved windows, fullscreen covering the captured display, menu IDs and window keys, saved settings (parsing, saving, and how they combine with flags), the app icon and iconset, what the scene draws (rendered offscreen on the GPU: the screen is upright and not mirrored, takes the frame's aspect ratio and row stride, moves the right way when you turn, rejects frames that don't fit, looks taller towards its edges when curved; skipped with a note when there's no GPU adapter), and the capture frame handoff (`Latest`, the part of the capture callback that doesn't touch ScreenCaptureKit), the HUD layout (buttons cover their labels at any `--hud-size` and scale, sit where they should and don't overlap; drawn offscreen with wgpu_glyph to check each label lands inside its box), the latency statistics and mach time conversion, head-pose prediction (speed estimates at different sample rates, stopping, glitches, the sign flip at half a turn), and showing IOSurfaces in place (made in the test, written after import to check that the GPU reads them without a copy). To verify a change, at minimum build the workspace, run `scripts/cargo.sh test --workspace` and run each binary with `--help`. Add or update tests when you change those parts. Real behaviour needs AR glasses over USB and Screen Recording permission for the terminal, which an agent usually can't provide. Say so rather than claiming a change works on hardware.
 
-The workspace crates build with no warnings. Cargo still prints a future-incompatibility note for the `block` dependency, which comes from upstream. Don't introduce new warnings.
+The workspace crates build with no warnings; the locally patched upstream driver currently emits six existing warnings. Cargo still prints a future-incompatibility note for the `block` dependency, which comes from upstream. Don't introduce new warnings.
 
 ## Dependency constraints
 

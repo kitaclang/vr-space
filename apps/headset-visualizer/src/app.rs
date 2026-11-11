@@ -23,7 +23,7 @@ use winit::window::Window;
 use crate::camera::{camera_view, head_rotation_from_pose, make_proj, recenter_calibration};
 use crate::cli::Cli;
 use crate::command::{command_for_key, Command};
-use crate::gpu::Gpu;
+use crate::gpu::{configure_surface, Gpu};
 use crate::hud::{self, screen_status_line, HudLayout, LabelMetrics};
 use crate::latency::{self, FpsMeter, LatencyMeter};
 use crate::prediction::{self, Lead, PosePredictor};
@@ -83,6 +83,7 @@ pub struct App {
     // rotation (not per-axis Euler subtraction) stays correct with pitch/roll and across ±180°.
     calibrate_pending: bool,
     calib_inv: Quat,
+    connection_id: u64,
 
     // Mouse position and the window's scale, both for the HUD's buttons (physical pixels).
     cursor_px: (f32, f32),
@@ -132,6 +133,7 @@ impl App {
             proxy,
             calibrate_pending: false,
             calib_inv: Quat::IDENTITY,
+            connection_id: 0,
             cursor_px: (-1.0, -1.0),
             scale_factor,
             fullscreen_on: fullscreen.on,
@@ -227,7 +229,7 @@ impl App {
                 if new_size.width > 0 && new_size.height > 0 {
                     gpu.config.width = new_size.width;
                     gpu.config.height = new_size.height;
-                    gpu.surface.configure(&gpu.device, &gpu.config);
+                    configure_surface(&gpu.surface, &gpu.device, &gpu.config);
                 }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -236,7 +238,7 @@ impl App {
                 if size.width > 0 && size.height > 0 {
                     gpu.config.width = size.width;
                     gpu.config.height = size.height;
-                    gpu.surface.configure(&gpu.device, &gpu.config);
+                    configure_surface(&gpu.surface, &gpu.device, &gpu.config);
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
@@ -331,7 +333,7 @@ impl App {
             Err(wgpu::SurfaceError::Lost) => {
                 // Surface lost; reconfigure then try next frame
                 warn!("Surface lost, reconfiguring.");
-                gpu.surface.configure(&gpu.device, &gpu.config);
+                configure_surface(&gpu.surface, &gpu.device, &gpu.config);
                 return true;
             }
             Err(wgpu::SurfaceError::OutOfMemory) => {
@@ -342,7 +344,7 @@ impl App {
             Err(e) => {
                 // Other errors: Timeout/Outdated - reconfigure and skip this frame
                 warn!("Surface acquire error: {e}. Reconfiguring surface.");
-                gpu.surface.configure(&gpu.device, &gpu.config);
+                configure_surface(&gpu.surface, &gpu.device, &gpu.config);
                 return true;
             }
         };
@@ -350,6 +352,13 @@ impl App {
 
         // Read pose
         let (r, p, y, has, t_ns) = self.pose.read();
+        let connection_id = self.pose.connection_id();
+        if has && connection_id != self.connection_id {
+            // A new fusion has a new reference frame; the old calibration no longer applies.
+            self.calib_inv = Quat::IDENTITY;
+            self.predictor.reset();
+            self.connection_id = connection_id;
+        }
         let head = head_rotation_from_pose(PoseCopy { roll: r, pitch: p, yaw: y }, (cli.invert_x, cli.invert_y, cli.invert_z));
 
         // Recenter: make the current head orientation (or its heading) the new "forward".
