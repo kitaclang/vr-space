@@ -20,7 +20,7 @@ use winit::event::{ElementState, Event, KeyboardInput, MouseButton, StartCause, 
 use winit::event_loop::{ControlFlow, EventLoopProxy};
 use winit::window::Window;
 
-use crate::camera::{camera_view, head_rotation_from_pose, make_proj, recenter_calibration};
+use crate::camera::{camera_view, head_rotation_from_pose, make_proj, recenter_calibration, upright_roll_correction};
 use crate::cli::Cli;
 use crate::command::{command_for_key, Command};
 use crate::gpu::{configure_surface, Gpu};
@@ -81,8 +81,11 @@ pub struct App {
     // Calibration lives on the render thread only, so no shared state or lock is needed.
     // `calib_inv` is the inverse of the head orientation at the last recenter; applying it as a
     // rotation (not per-axis Euler subtraction) stays correct with pitch/roll and across ±180°.
-    calibrate_pending: bool,
+    calibrate_pending: Option<u64>,
     calib_inv: Quat,
+    upright_roll: Option<Quat>,
+    reference_dirty: bool,
+    roll_trim_tenths: i32,
     connection_id: u64,
 
     // Mouse position and the window's scale, both for the HUD's buttons (physical pixels).
@@ -110,6 +113,27 @@ pub struct App {
     settings: Settings,
 }
 
+fn take_recenter_request(pending: &mut Option<u64>, connected: bool, connection_id: u64) -> bool {
+    pending.take().is_some_and(|id| connected && id == connection_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::take_recenter_request;
+
+    #[test]
+    fn recenter_request_cannot_cross_a_disconnect_or_reconnect() {
+        let mut pending = Some(1);
+        assert!(!take_recenter_request(&mut pending, false, 1));
+        assert!(!take_recenter_request(&mut pending, true, 2));
+        pending = Some(1);
+        assert!(!take_recenter_request(&mut pending, true, 2));
+        pending = Some(2);
+        assert!(take_recenter_request(&mut pending, true, 2));
+        assert!(!take_recenter_request(&mut pending, true, 2));
+    }
+}
+
 impl App {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -125,14 +149,18 @@ impl App {
         settings: Settings,
     ) -> Self {
         let scale_factor = window.scale_factor() as f32;
+        let roll_trim_tenths = settings.roll_trim_tenths.unwrap_or(0);
         Self {
             cli,
             window,
             gpu,
             pose,
             proxy,
-            calibrate_pending: false,
+            calibrate_pending: None,
             calib_inv: Quat::IDENTITY,
+            upright_roll: None,
+            reference_dirty: false,
+            roll_trim_tenths,
             connection_id: 0,
             cursor_px: (-1.0, -1.0),
             scale_factor,
@@ -311,6 +339,7 @@ impl App {
         ) {
             Ok(mut bar) => {
                 bar.set_latency(self.predict_lead.ms, !self.gpu.zero_copy, self.gpu.zero_copy_available);
+                bar.set_horizon(self.cli.recenter_yaw_only);
                 self.menu_bar = Some(bar);
             }
             Err(e) => warn!("Menu bar icon unavailable: {e}"),
@@ -356,14 +385,34 @@ impl App {
         if has && connection_id != self.connection_id {
             // A new fusion has a new reference frame; the old calibration no longer applies.
             self.calib_inv = Quat::IDENTITY;
+            self.upright_roll = None;
             self.predictor.reset();
             self.connection_id = connection_id;
         }
-        let head = head_rotation_from_pose(PoseCopy { roll: r, pitch: p, yaw: y }, (cli.invert_x, cli.invert_y, cli.invert_z));
+        let mut head = head_rotation_from_pose(PoseCopy { roll: r, pitch: p, yaw: y }, (cli.invert_x, cli.invert_y, cli.invert_z));
+        // A recenter belongs only to the connection on which it was requested.
+        let recenter = take_recenter_request(&mut self.calibrate_pending, has, connection_id);
+        // Apply a mode change only on the next connected recenter, avoiding a sudden jump.
+        if recenter && self.reference_dirty {
+            self.upright_roll = None;
+            self.reference_dirty = false;
+            self.predictor.reset();
+        }
+        // In yaw-only mode the first connected recenter establishes upright for this session.
+        if cli.recenter_yaw_only && recenter && self.upright_roll.is_none() {
+            let correction = upright_roll_correction(head);
+            let (yaw, pitch, roll) = head.to_euler(glam::EulerRot::YXZ);
+            info!("Yaw-only upright reference: raw roll/pitch/yaw=[{:.2}, {:.2}, {:.2}] deg; mapped yaw/pitch/roll=[{:.2}, {:.2}, {:.2}] deg; roll correction={:.2} deg",
+                r.to_degrees(), p.to_degrees(), y.to_degrees(), yaw.to_degrees(), pitch.to_degrees(), roll.to_degrees(), -roll.to_degrees());
+            self.upright_roll = Some(correction);
+            self.predictor.reset();
+        }
+        if let Some(correction) = self.upright_roll {
+            head *= correction;
+        }
 
         // Recenter: make the current head orientation (or its heading) the new "forward".
-        if self.calibrate_pending {
-            self.calibrate_pending = false;
+        if recenter {
             self.calib_inv = recenter_calibration(head, cli.recenter_yaw_only);
             gpu.show_calibrated_toast_until_ns = now_ns_from_start() + 1_000_000_000;
         }
@@ -381,7 +430,8 @@ impl App {
             head
         };
 
-        let vp = make_proj(gpu.config.width, gpu.config.height, cli.fov) * camera_view(self.calib_inv * shown_head, cli.neck_model);
+        let trim = Quat::from_rotation_z((self.roll_trim_tenths as f32 / 10.0).to_radians());
+        let vp = make_proj(gpu.config.width, gpu.config.height, cli.fov) * camera_view(self.calib_inv * shown_head * trim, cli.neck_model);
         gpu.scene.set_view_proj(&gpu.queue, vp);
 
         // Show the newest screen frame (macOS only). Skips entirely when no new frame has
@@ -432,7 +482,14 @@ impl App {
                 ),
                 screen_line,
                 format!("distance: {:.2}  height: {:.2}", gpu.scene.screen.distance, gpu.scene.screen.height),
+                format!("roll trim: {:.1}°", self.roll_trim_tenths as f32 / 10.0),
             ];
+            if self.reference_dirty || (cli.recenter_yaw_only && self.upright_roll.is_none()) {
+                gpu.hud_text.push("horizon: recenter upright to set level".into());
+            }
+            if let Some(status) = self.pose.gyro_status(now_ns) {
+                gpu.hud_text.push(status);
+            }
             gpu.hud_text.push(if self.predict_lead.is_on() {
                 format!(
                     "predict: {:.0} ms ahead, head turning {:.0}°/s",
@@ -533,7 +590,15 @@ impl App {
         let gpu = &mut self.gpu;
         match cmd {
             Command::Quit => {}
-            Command::Recenter => self.calibrate_pending = true,
+            Command::Recenter => {
+                self.calibrate_pending = self.pose.read().3.then(|| self.pose.connection_id());
+            }
+            Command::ToggleHorizon => {
+                self.cli.recenter_yaw_only = !self.cli.recenter_yaw_only;
+                self.reference_dirty = true;
+            }
+            Command::RollLeft => self.roll_trim_tenths = (self.roll_trim_tenths - 1).max(-450),
+            Command::RollRight => self.roll_trim_tenths = (self.roll_trim_tenths + 1).min(450),
             Command::Further => gpu.scene.screen.scale_distance(SCREEN_STEP),
             Command::Closer => gpu.scene.screen.scale_distance(1.0 / SCREEN_STEP),
             Command::Bigger => gpu.scene.screen.scale_height(SCREEN_STEP),
@@ -636,6 +701,8 @@ impl App {
                 settings.fullscreen = self.fullscreen_on;
             }
             Command::ToggleHud => settings.hud = Some(self.gpu.hud_enabled),
+            Command::ToggleHorizon => settings.recenter_yaw_only = Some(self.cli.recenter_yaw_only),
+            Command::RollLeft | Command::RollRight => settings.roll_trim_tenths = Some(self.roll_trim_tenths),
             Command::TogglePrediction | Command::PredictMore | Command::PredictLess => {
                 settings.predict_ms = Some(self.predict_lead.ms);
                 info!("Head-pose prediction: {} ms ahead", self.predict_lead.ms);
@@ -656,6 +723,7 @@ impl App {
         #[cfg(target_os = "macos")]
         if let Some(bar) = self.menu_bar.as_mut() {
             bar.set_state(self.capture.shown, self.fullscreen_on, self.gpu.hud_enabled);
+            bar.set_horizon(self.cli.recenter_yaw_only);
             bar.set_latency(self.predict_lead.ms, !self.gpu.zero_copy, self.gpu.zero_copy_available);
         }
     }

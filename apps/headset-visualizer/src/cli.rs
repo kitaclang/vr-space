@@ -31,6 +31,10 @@ pub struct Cli {
     #[arg(long, default_value_t = 0)]
     pub poll_ms: u64,
 
+    /// Measure residual gyro bias after a 3-second countdown; keep glasses still for 10 seconds
+    #[arg(long)]
+    pub calibrate_gyro: bool,
+
     /// Disable HUD text to save GPU/CPU
     #[arg(long, default_value_t = false)]
     pub no_hud: bool,
@@ -101,10 +105,14 @@ pub struct Cli {
     #[arg(long)]
     pub copy_frames: bool,
 
-    /// Recenter only the left-right direction (yaw), keeping the horizon level even if
-    /// your head is tilted when you recenter
-    #[arg(long)]
+    /// First recenter upright to set level; subsequent recenters only change left-right (yaw).
+    /// Reconnect resets the upright reference.
+    #[arg(long, conflicts_with = "no_recenter_yaw_only")]
     pub recenter_yaw_only: bool,
+
+    /// Use normal recentering even if Keep horizon level is saved.
+    #[arg(long)]
+    pub no_recenter_yaw_only: bool,
 
     /// Don't load or save settings (screen size and distance, display or window, fullscreen,
     /// HUD) in ~/Library/Application Support/vr-space/settings.json
@@ -162,6 +170,7 @@ pub struct StartupPlan {
     pub fullscreen: Option<u32>,
     pub hud: bool,
     pub predict_ms: f32,
+    pub recenter_yaw_only: bool,
 }
 
 impl StartupPlan {
@@ -182,6 +191,7 @@ impl StartupPlan {
             fullscreen: if explicit.fullscreen { cli.fullscreen } else { saved.fullscreen },
             hud: !cli.no_hud && saved.hud.unwrap_or(true),
             predict_ms: pick(explicit.predict_ms, cli.predict_ms, saved.predict_ms),
+            recenter_yaw_only: !cli.no_recenter_yaw_only && (cli.recenter_yaw_only || saved.recenter_yaw_only.unwrap_or(false)),
         }
     }
 }
@@ -226,6 +236,8 @@ mod tests {
     fn default_flags_are_valid() {
         let cli = parse(&[]).unwrap();
         assert!(!cli.recenter_yaw_only);
+        assert!(!cli.calibrate_gyro);
+        assert!(parse(&["--calibrate-gyro"]).unwrap().calibrate_gyro);
     }
 
     fn plan(args: &[&str], saved: &Settings) -> StartupPlan {
@@ -244,6 +256,8 @@ mod tests {
             fullscreen: Some(9),
             hud: Some(false),
             predict_ms: Some(25.0),
+            recenter_yaw_only: Some(true),
+            roll_trim_tenths: Some(6),
         }
     }
 
@@ -256,12 +270,14 @@ mod tests {
         assert_eq!(p.fullscreen, Some(9));
         assert!(!p.hud);
         assert_eq!(p.predict_ms, 25.0);
+        assert!(p.recenter_yaw_only);
 
         // Nothing saved: the defaults.
         let p = plan(&[], &Settings::default());
         assert_eq!(p.screen, ScreenPlacement { distance: 4.0, height: 1.4 });
         assert_eq!((p.display, p.window, p.fullscreen, p.hud), (0, None, None, true));
         assert_eq!(p.predict_ms, 0.0, "prediction is off by default");
+        assert!(!p.recenter_yaw_only);
     }
 
     #[test]
@@ -279,6 +295,9 @@ mod tests {
         // A flag set to its default value still counts as given.
         assert_eq!(plan(&["--screen-height", "1.4"], &saved_all()).screen.height, 1.4);
         assert_eq!(plan(&["--predict-ms", "0"], &saved_all()).predict_ms, 0.0, "turned off on the command line");
+        assert!(!plan(&["--no-recenter-yaw-only"], &saved_all()).recenter_yaw_only);
+        assert!(plan(&["--recenter-yaw-only"], &Settings { recenter_yaw_only: Some(false), ..Settings::default() }).recenter_yaw_only);
+        assert!(parse(&["--recenter-yaw-only", "--no-recenter-yaw-only"]).is_err());
     }
 
     #[test]

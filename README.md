@@ -35,7 +35,7 @@ Build `vr-space.app` and copy it to `~/Applications`:
 scripts/bundle-macos.sh --install
 ```
 
-Then open vr-space from Finder, Spotlight or Launchpad. It appears in the menu bar (there's no Dock icon). Choose **Open at Login** from its menu to start it when you log in (macOS 13 or later). Without `--install`, the app is left at `target/release/vr-space.app`.
+Then open vr-space from Finder, Spotlight or Launchpad. It appears in the Dock and Command–Tab, with standard macOS application and Window menus. Choose **Open at Login** from its menu to start it when you log in (macOS 13 or later). Without `--install`, the app is left at `target/release/vr-space.app`.
 
 Run as an app, vr-space gets the Screen Recording permission itself, so you allow **vr-space** in System Settings instead of your terminal. Its log goes to `~/Library/Logs/vr-space.log`.
 
@@ -77,6 +77,10 @@ The HUD shows where the time goes, as a mean with the 95th percentile and maximu
 
 These stop where the frame is handed to the GPU. The GPU's drawing time and the wait for the glasses to show the frame (up to one refresh) aren't included: wgpu 0.17 doesn't expose what would report them. To compare frame sharing with copying, run once with and once without `--copy-frames` and compare the log lines.
 
+For an explicit residual gyro calibration, run with `--calibrate-gyro` and rest the glasses **untouched on a stable surface** after each connection: there is a 3-second countdown followed by 10 seconds of measurement (longer with `--poll-ms`). The HUD shows the countdown and result. Wait for `Gyro calibration applied` in the HUD or log, then put them on and recenter. The measured FRD offset is subtracted before sensor fusion; it is not saved and reconnecting starts a fresh measurement. Obvious motion, non-finite samples, or timestamp gaps reject calibration without applying a correction; restart or reconnect to retry. Slow constant rotation cannot be distinguished from bias, so do not calibrate while wearing or holding the glasses. This is opt-in: a stationary hardware run substantially reduced measured yaw drift, and the user reported no visible slide afterward; normal head movement was also confirmed after correcting the camera rotation order; temperature changes may require recalibration. The HUD’s Calibrate button remains orientation recentering only.
+
+For stationary drift diagnosis, run with `RUST_LOG=warn,headset_visualizer=info,headset_visualizer::tracking::drift=debug`. Every 10 seconds of device time, the log reports calibrated gyro means, extrema and standard deviations (FRD axes, degrees/second) and the fused yaw slope. Rest the glasses on a stable surface: these diagnostics do not detect stillness or correct drift. Gyro means remain factory-calibrated readings **before** the optional residual correction; compare fused yaw slope before and after calibration, not a reduction in the logged gyro means. Duplicate samples are skipped; timestamp reversals and stalls over one second reset the measurement. Gyro axes are body-relative, so the third rate is only directly comparable to yaw slope when the glasses are level.
+
 `--predict-ms` hides some of this delay. The app estimates how fast your head is turning and draws it where it will be, the given number of milliseconds after the frame is drawn (plus the age of the head-tracking sample). Too little and the screen still trails behind when you turn; too much and it overshoots and springs back when you stop. A good starting point is `pose->submit` plus one refresh of the glasses (about 17 ms at 60 Hz). The HUD's `predict:` line shows the amount and how fast your head is turning. To find the right amount, turn prediction on and off with `⌃⌥X` and step it with `⌃⌥]` and `⌃⌥[` while you wear the glasses; the amount you leave it at is saved. `⌃⌥Z` switches frame copying the same way. [docs/glasses-checklist.md](docs/glasses-checklist.md) walks through trying all of this on the glasses.
 
 ### Using it with the glasses
@@ -114,13 +118,16 @@ The glasses only track rotation (3DoF), not position, so leaning or moving in yo
 
 ### Controls
 
-vr-space lives in the menu bar (it has no Dock icon). While it runs, its glasses icon has the controls: recenter, move and resize the screen, choose which display or window to show and which display to go fullscreen on (the glasses), show or hide the HUD, the latency switches (head-pose prediction and frame copying, under **Latency**), open Screen Recording settings, open at login (when run as vr-space.app), and quit. The display lists update when you plug in or remove a display, and the window list updates as windows open and close.
+vr-space is a regular Mac app with a Dock icon and Command–Tab support. Its **Controls** menu and menu bar glasses icon share the controls: recenter, move and resize the screen, choose which display or window to show and which display to go fullscreen on (the glasses), show or hide the HUD, the latency switches (head-pose prediction and frame copying, under **Latency**), open Screen Recording settings, open at login (when run as vr-space.app), and quit. The display lists update when you plug in or remove a display, and the window list updates as windows open and close.
+
+**Keep horizon level** switches to yaw-only recentering. After turning it on, recenter with your head upright to set the level; later recenters only change heading. Recenter upright again after reconnecting. Switching the mode takes effect on the next recenter. The roll trim controls under **Screen** adjust the visible view; trim may need readjustment after reconnecting.
 
 These shortcuts work from any app, so you can adjust the screen while you work:
 
 | Shortcut | Action |
 |---|---|
 | `⌃⌥C` | Recenter (look straight ahead first) |
+| `⌃⌥←` / `⌃⌥→` | Tilt the view left / right by 0.1° to compensate for glasses alignment; saved between runs |
 | `⌃⌥↑` / `⌃⌥↓` | Move the screen further away / closer (it keeps its size, so closer looks bigger) |
 | `⌃⌥=` / `⌃⌥-` | Make the screen bigger / smaller |
 | `⌃⌥R` | Reset distance and size to the `--screen-distance` and `--screen-height` values (or their defaults) |
@@ -135,6 +142,7 @@ When the vr-space window has focus, plain keys work too:
 | Key | Action |
 |---|---|
 | `C` | Recenter |
+| `←` / `→` | Tilt the view left / right by 0.1° |
 | `↑` / `↓` | Further away / closer |
 | `+` / `-` | Bigger / smaller |
 | `R` | Reset distance and size |
@@ -157,6 +165,7 @@ vr-space remembers what you change while it runs and starts that way next time:
 - the display it's fullscreen on (the glasses), or that it's a window
 - whether the HUD is shown
 - how far ahead head movement is predicted (or that prediction is off)
+- Keep horizon level and the roll trim
 
 A saved window is found again by its app and title, or any window of that app if the title changed. If the app isn't open, the virtual screen shows the saved display instead, and the window stays remembered. If the glasses aren't plugged in at startup, vr-space goes fullscreen on them as soon as they are, so you can open it at login before connecting them.
 
@@ -169,6 +178,7 @@ Options:
 | `--vsync` | off | Enable vsync (off gives the lowest latency) |
 | `--max-fps <n>` | 0 (unlimited) | Cap the frame rate when vsync is off |
 | `--poll-ms <ms>` | 0 (as fast as possible) | How often to read head tracking |
+| `--calibrate-gyro` | off | After a 3-second countdown, measure residual gyro bias for 10 stationary seconds after each connection; keep glasses on a stable surface until the HUD or log confirms completion. Not saved |
 | `--invert-x` / `--invert-y` / `--invert-z` | off | Flip roll / pitch / yaw |
 | `--no-hud` | off | Hide the text overlay |
 | `--hud-size <px>` | 16 | HUD font size |
@@ -185,7 +195,8 @@ Options:
 | `--curve <0..1>` | 0 (flat) | Curve the virtual screen around you; 1 puts every part of it the same distance from your eyes, like a curved monitor wrapped around your head |
 | `--predict-ms <ms>` | 0 (off) | Predict head movement this far ahead of when a frame is drawn, so the screen doesn't trail behind when you turn your head (up to 100; try 10 to 30). See [Latency](#latency) |
 | `--copy-frames` | off | Copy each captured frame through the CPU instead of letting the GPU read it in place (slower; for comparison, or if the screen looks wrong). The HUD shows `frames=shared` or `frames=copied` |
-| `--recenter-yaw-only` | off | Recenter only left-right, so the horizon stays level even if your head is tilted |
+| `--recenter-yaw-only` | off | Enable Keep horizon level, overriding the saved setting; first recenter upright to set level, and again after reconnecting |
+| `--no-recenter-yaw-only` | off | Use normal recentering, overriding a saved Keep horizon level setting |
 | `--ignore-settings` | off | Don't load or save [saved settings](#saved-settings) |
 
 Check screen capture on its own:

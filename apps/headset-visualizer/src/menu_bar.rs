@@ -31,13 +31,15 @@ fn shortcut_mods() -> Modifiers {
 }
 
 /// (key, command, menu item id, menu label) for everything that has a global shortcut.
-const SHORTCUTS: [(Code, Command, &str, &str); 6] = [
+const SHORTCUTS: [(Code, Command, &str, &str); 8] = [
     (Code::KeyC, Command::Recenter, "recenter", "Recenter"),
     (Code::ArrowUp, Command::Further, "further", "Further away"),
     (Code::ArrowDown, Command::Closer, "closer", "Closer"),
     (Code::Equal, Command::Bigger, "bigger", "Bigger"),
     (Code::Minus, Command::Smaller, "smaller", "Smaller"),
     (Code::KeyR, Command::ResetScreen, "reset", "Reset size and distance"),
+    (Code::ArrowLeft, Command::RollLeft, "roll:left", "Tilt view left"),
+    (Code::ArrowRight, Command::RollRight, "roll:right", "Tilt view right"),
 ];
 
 /// The same for the Latency submenu: switches for trying latency settings on the glasses.
@@ -50,11 +52,13 @@ const LATENCY_SHORTCUTS: [(Code, Command, &str, &str); 4] = [
 
 pub struct MenuBar {
     _tray: TrayIcon,
+    _app_menu: Menu,
     _hotkeys: Option<GlobalHotKeyManager>,
     display_menu: Submenu,
     window_menu: Submenu,
     fullscreen_menu: Submenu,
     hud_item: CheckMenuItem,
+    horizon_item: CheckMenuItem,
     predict_item: CheckMenuItem,
     copy_item: CheckMenuItem,
     login_item: Option<CheckMenuItem>,
@@ -112,6 +116,7 @@ impl MenuBar {
             true,
             Some(Accelerator::new(shortcut_mods(), recenter_code)),
         );
+        let horizon_item = CheckMenuItem::with_id("horizon", "Keep horizon level", true, false, None);
         let settings = MenuItem::with_id("settings", "Screen Recording settings…", true, None);
         // Only when running as vr-space.app on macOS 13 or later.
         let login_item = open_at_login
@@ -119,8 +124,9 @@ impl MenuBar {
         let quit = MenuItem::with_id("quit", "Quit vr-space", true, None);
 
         let menu = Menu::new();
-        let items: [&dyn IsMenuItem; 10] = [
+        let items: [&dyn IsMenuItem; 11] = [
             &recenter,
+            &horizon_item,
             &screen_menu,
             &PredefinedMenuItem::separator(),
             &display_menu,
@@ -136,6 +142,33 @@ impl MenuBar {
             menu.append(item)?;
         }
         menu.append_items(&[&PredefinedMenuItem::separator(), &quit])?;
+
+        // Reuse the same controls so tray and application menus stay in sync.
+        let app_menu = Menu::new();
+        let application = Submenu::new("vr-space", true);
+        application.append_items(&[
+            &PredefinedMenuItem::hide(Some("Hide vr-space")),
+            &PredefinedMenuItem::hide_others(None),
+            &PredefinedMenuItem::show_all(None),
+            &PredefinedMenuItem::separator(),
+            &MenuItem::with_id("quit", "Quit vr-space", true,
+                Some(Accelerator::new(Modifiers::META, Code::KeyQ))),
+        ])?;
+        let controls = Submenu::new("Controls", true);
+        controls.append_items(&items)?;
+        if let Some(item) = &login_item {
+            controls.append(item)?;
+        }
+        let windows = Submenu::new("Window", true);
+        windows.append_items(&[
+            &PredefinedMenuItem::minimize(None),
+            &PredefinedMenuItem::zoom(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::bring_all_to_front(None),
+        ])?;
+        app_menu.append_items(&[&application, &controls, &windows])?;
+        app_menu.init_for_nsapp();
+        windows.set_as_windows_menu_for_nsapp();
 
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -158,11 +191,13 @@ impl MenuBar {
 
         let mut bar = Self {
             _tray: tray,
+            _app_menu: app_menu,
             _hotkeys: hotkeys,
             display_menu,
             window_menu,
             fullscreen_menu,
             hud_item,
+            horizon_item,
             predict_item,
             copy_item,
             login_item,
@@ -226,6 +261,10 @@ impl MenuBar {
             let more = format!("{} more (use --list-windows)", self.windows.len() - MAX_WINDOWS);
             let _ = menu.append(&MenuItem::new(more, false, None));
         }
+    }
+
+    pub fn set_horizon(&mut self, on: bool) {
+        self.horizon_item.set_checked(on);
     }
 
     /// Update the Latency submenu: the prediction lead in ms (0 = off), whether frames are
@@ -314,6 +353,7 @@ fn command_for_menu_id(id: &str) -> Option<Command> {
     }
     match id {
         "hud" => Some(Command::ToggleHud),
+        "horizon" => Some(Command::ToggleHorizon),
         "settings" => Some(Command::OpenScreenSettings),
         "login" => Some(Command::ToggleOpenAtLogin),
         "quit" => Some(Command::Quit),
@@ -383,6 +423,8 @@ mod tests {
 
     #[test]
     fn menu_ids_map_to_commands() {
+        assert_eq!(command_for_menu_id("quit"), Some(Command::Quit));
+        assert_eq!(command_for_menu_id("horizon"), Some(Command::ToggleHorizon));
         assert_eq!(command_for_menu_id("window:123"), Some(Command::ShowWindow(123)));
         assert_eq!(command_for_menu_id("display:7"), Some(Command::ShowDisplay(7)));
         assert_eq!(command_for_menu_id("fullscreen:7"), Some(Command::FullscreenOn(Some(7))));

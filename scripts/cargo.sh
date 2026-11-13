@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Cargo with the repository's private, locally applied ar-drivers patch.
-# Usage: scripts/cargo.sh build --workspace (or test, run, etc.)
+# Usage: scripts/cargo.sh build --workspace (or test, run, etc.; test-driver for driver tests)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,6 +32,12 @@ fi
 git -C "$DRIVER" apply --reverse --check "$PATCH"
 
 cd "$ROOT"
+# The dependency is not a workspace member, so test its patched fusion separately.
+if [[ "${1:-}" == "test-driver" ]]; then
+  shift
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+  exec cargo test --manifest-path "$DRIVER/Cargo.toml" --lib "$@"
+fi
 # Escape the absolute path for Cargo's TOML --config value.
 DRIVER="${DRIVER//\\/\\\\}"
 DRIVER="${DRIVER//\"/\\\"}"

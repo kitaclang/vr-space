@@ -20,20 +20,40 @@ update() and any_fusion() behave as before. The one change in behaviour
 is that NaiveCF::new() now returns a read error during its start-up
 wait instead of exiting; it already returned a Result.
 
+Also expose the latest calibrated FRD gyro sample and device timestamp for
+opt-in drift diagnostics. Allow an explicitly measured residual body-frame gyro
+bias to be subtracted before integration (zero by default). Fix the initial
+gyro sample to use FRD too, and test the correction with synthetic samples.
+
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- src/lib.rs      | 29 +++++++++++++++++++++++++++++
- src/naive_cf.rs | 25 ++++++++++---------------
- 2 files changed, 39 insertions(+), 15 deletions(-)
-
+diff --git a/Cargo.toml b/Cargo.toml
+index 22ef41e..5cf3a1a 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -46 +46,4 @@ clap = { version = "4.3", features = ["derive"] }
+ crate-type = ["cdylib", "rlib"]
++
++# Keep the cached checkout independently testable inside another workspace.
++[workspace]
 diff --git a/src/lib.rs b/src/lib.rs
-index 6a85b6a..ccdd587 100644
+index 6a85b6a..a0c80c1 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -121,7 +121,21 @@ pub trait Fusion: Send {
-     /// use FRD frame as error in Quaternion is multiplicative & is over-defined
-     fn inconsistency_frd(&self) -> f32;
+@@ -123,3 +123,29 @@ pub trait Fusion: Send {
  
++    /// Latest calibrated gyro rate in FRD radians/second and device timestamp in microseconds.
++    /// Diagnostic access only; unsupported fusion implementations return None.
++    fn gyro_sample_frd(&self) -> Option<([f32; 3], u64)> {
++        None
++    }
++
++    /// Set a stationary, body-relative residual gyro bias (FRD radians/second).
++    /// Replaces the previous bias; unsupported fusion implementations return an error.
++    fn set_gyro_bias_frd(&mut self, _bias: [f32; 3]) -> Result<()> {
++        Err(Error::NotImplemented)
++    }
++
 +    /// Read the next event from the glasses and update the estimate. Blocks.
 +    ///
 +    /// Exits the process if reading fails, for example when the glasses are unplugged.
@@ -50,31 +70,28 @@ index 6a85b6a..ccdd587 100644
 +        Ok(())
 +    }
  }
- 
- impl dyn Fusion {
-@@ -153,6 +167,10 @@ impl Fusion for FusionWithOffset {
-         self.fusion.update()
-     }
+@@ -155,2 +181,14 @@ impl Fusion for FusionWithOffset {
  
 +    fn try_update(&mut self) -> Result<()> {
 +        self.fusion.try_update()
 +    }
 +
++    fn gyro_sample_frd(&self) -> Option<([f32; 3], u64)> {
++        self.fusion.gyro_sample_frd()
++    }
++
++    fn set_gyro_bias_frd(&mut self, bias: [f32; 3]) -> Result<()> {
++        self.fusion.set_gyro_bias_frd(bias)
++    }
++
      fn attitude_quaternion(&self) -> UnitQuaternion<f32> {
-         let original = self.fusion.attitude_quaternion();
-         let corrected = self.offset * original;
-@@ -160,12 +178,23 @@ impl Fusion for FusionWithOffset {
-     }
- }
+@@ -162,2 +200,5 @@ impl Fusion for FusionWithOffset {
  
 +/// Connect to any supported glasses and start sensor fusion.
 +///
 +/// Exits the process if no glasses are found. Use [`try_any_fusion`] to get an error instead.
  pub fn any_fusion() -> Result<Box<dyn Fusion>> {
-     // let glasses = any_glasses()?;
-     let glasses = any_glasses_or_fail()?;
-     Ok(Box::new(NaiveCF::new(glasses)?))
- }
+@@ -168,2 +209,10 @@ pub fn any_fusion() -> Result<Box<dyn Fusion>> {
  
 +/// Like [`any_fusion`], but returns an error instead of exiting the process when no glasses
 +/// are found or reading from them fails, so the caller can retry (for example until the
@@ -85,24 +102,34 @@ index 6a85b6a..ccdd587 100644
 +}
 +
  type Rw<T> = Arc<Mutex<T>>;
- 
- fn rw<T>(v: T) -> Rw<T> {
 diff --git a/src/naive_cf.rs b/src/naive_cf.rs
-index 9acb6e7..5bf736b 100644
+index 9acb6e7..be61624 100644
 --- a/src/naive_cf.rs
 +++ b/src/naive_cf.rs
-@@ -87,7 +87,7 @@ impl NaiveCF {
+@@ -30,2 +30,4 @@
+ use nalgebra::{UnitQuaternion, Vector3};
++#[cfg(test)]
++use nalgebra::Unit;
  
-         loop {
+@@ -73,2 +75,3 @@ pub struct NaiveCF {
+     pub inconsistency: f32, //roll, pitch. yaw
++    gyro_bias_frd: Vector3<f32>,
+ }
+@@ -85,2 +88,3 @@ impl NaiveCF {
+             inconsistency: 0.0,
++            gyro_bias_frd: Vector3::zeros(),
+         };
+@@ -89,3 +93,3 @@ impl NaiveCF {
              //wait for the first non-zero gyro reading
 -            let next_event = fusion.next_event();
 +            let next_event = fusion.glasses.read_event()?;
              match next_event {
-                 GlassesEvent::AccGyro {
-                     accelerometer: _,
-@@ -104,19 +104,6 @@ impl NaiveCF {
-         }
-     }
+@@ -97,3 +101,3 @@ impl NaiveCF {
+                     //if gyroscope != Vector3::zeros() {
+-                    fusion.prev_gyro = (gyroscope, timestamp);
++                    fusion.prev_gyro = (Self::rub_to_frd(&gyroscope), timestamp);
+                     return Ok(fusion);
+@@ -106,15 +110,2 @@ impl NaiveCF {
  
 -    ///read until next valid event. Blocks.
 -    fn next_event(&mut self) -> GlassesEvent {
@@ -118,11 +145,28 @@ index 9acb6e7..5bf736b 100644
 -    }
 -
      fn rub_to_frd(v: &Vector3<f32>) -> Vector3<f32> {
-         let result = Vector3::new(-v.z, v.x, -v.y);
-         result
-@@ -318,7 +305,14 @@ impl Fusion for NaiveCF {
-     }
+@@ -144,3 +135,3 @@ impl NaiveCF {
+         let d_t1_f = d_t1 as f32 / Self::GYRO_SPEED_IN_TIMESTAMP_FACTOR;
+-        let d_s1_t1 = d_t1_f * gyro;
++        let d_s1_t1 = d_t1_f * (gyro - self.gyro_bias_frd);
+
+@@ -315,2 +306,15 @@ impl Fusion for NaiveCF {
  
++    fn gyro_sample_frd(&self) -> Option<([f32; 3], u64)> {
++        let (rate, timestamp) = self.prev_gyro;
++        Some(([rate.x, rate.y, rate.z], timestamp))
++    }
++
++    fn set_gyro_bias_frd(&mut self, bias: [f32; 3]) -> Result<()> {
++        if !bias.iter().all(|v| v.is_finite()) {
++            return Err(Error::Other("gyro bias must be finite"));
++        }
++        self.gyro_bias_frd = Vector3::from(bias);
++        Ok(())
++    }
++
+     fn inconsistency_frd(&self) -> f32 {
+@@ -320,3 +324,10 @@ impl Fusion for NaiveCF {
      fn update(&mut self) -> () {
 -        let event = self.next_event();
 +        if let Err(e) = self.try_update() {
@@ -134,15 +178,85 @@ index 9acb6e7..5bf736b 100644
 +    fn try_update(&mut self) -> Result<()> {
 +        let event = self.glasses.read_event()?;
          match event {
-             GlassesEvent::AccGyro {
-                 accelerometer,
-@@ -334,5 +328,6 @@ impl Fusion for NaiveCF {
-                 //TODO: add magnetometer event etc
-             }
+@@ -327,2 +338,5 @@ impl Fusion for NaiveCF {
+             } => {
++                if timestamp < self.prev_gyro.1 || timestamp - self.prev_gyro.1 > 1_000_000 {
++                    return Err(Error::Other("gyro timestamp reversed or stalled"));
++                }
+                 self.update_gyro_rub(&gyroscope, timestamp);
+@@ -336,2 +350,75 @@ impl Fusion for NaiveCF {
          }
 +        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod bias_tests {
++    use super::*;
++    use crate::{DisplayMode, Side};
++    use nalgebra::Isometry3;
++
++    struct StationaryGlasses(u64);
++    impl ARGlasses for StationaryGlasses {
++        fn serial(&mut self) -> Result<String> { Err(Error::NotImplemented) }
++        fn read_event(&mut self) -> Result<GlassesEvent> {
++            Ok(GlassesEvent::AccGyro {
++                accelerometer: Vector3::new(0.0, 9.81, 0.0),
++                gyroscope: Vector3::new(0.002, 0.003, -0.001),
++                timestamp: self.0,
++            })
++        }
++        fn get_display_mode(&mut self) -> Result<DisplayMode> { Err(Error::NotImplemented) }
++        fn set_display_mode(&mut self, _: DisplayMode) -> Result<()> { Err(Error::NotImplemented) }
++        fn display_fov(&self) -> f32 { 0.0 }
++        fn imu_to_display_matrix(&self, _: Side, _: f32) -> Isometry3<f64> { Isometry3::identity() }
++        fn name(&self) -> &'static str { "test" }
++        fn display_delay(&self) -> u64 { 0 }
++    }
++
++    #[test]
++    fn invalid_timestamps_are_rejected_before_integration() {
++        let mut fusion = NaiveCF::new(Box::new(StationaryGlasses(100))).unwrap();
++        let initial = fusion.attitude;
++        fusion.prev_gyro.1 = 101;
++        assert!(fusion.try_update().is_err());
++        assert_eq!(fusion.attitude, initial);
++        fusion.prev_gyro.1 = 0;
++        // A duplicate or normal sample remains valid.
++        assert!(fusion.try_update().is_ok());
++        let mut stalled = NaiveCF::new(Box::new(StationaryGlasses(1_000_001))).unwrap();
++        stalled.prev_gyro.1 = 0;
++        let initial = stalled.attitude;
++        assert!(stalled.try_update().is_err());
++        assert_eq!(stalled.attitude, initial);
++    }
++
++    #[test]
++    fn bias_is_subtracted_in_body_frame_before_integration_and_preserves_motion() {
++        let mut fusion = NaiveCF::new(Box::new(StationaryGlasses(100))).unwrap();
++        let bias = [0.001, 0.002, -0.003]; // RUB -> FRD
++        let (raw, time) = fusion.gyro_sample_frd().unwrap();
++        assert_eq!(raw, bias);
++        assert_eq!(time, 100);
++        fusion.set_gyro_bias_frd(bias).unwrap();
++        let gyro = Vector3::new(0.002, 0.003, -0.001);
++        let initial = UnitQuaternion::from_euler_angles(0.3, -0.4, 0.5);
++        fusion.attitude = initial;
++        for i in 1..=1000 {
++            fusion.update_gyro_rub(&gyro, 100 + i * 1000);
++        }
++        assert!(fusion.attitude.angle_to(&initial) < 1e-6);
++        assert_eq!(fusion.gyro_sample_frd().unwrap().0, bias); // diagnostic stays raw
++        assert!(fusion.set_gyro_bias_frd([f32::NAN; 3]).is_err());
++        fusion.set_gyro_bias_frd(bias).unwrap(); // replacement, not accumulation
++        // Genuine motion on all three axes must remain, including at a tilted attitude.
++        let motion = Vector3::new(0.1, -0.2, 0.3);
++        let moving_rub = gyro + Vector3::new(motion.y, -motion.z, -motion.x);
++        fusion.update_gyro_rub(&moving_rub, 1_010_100);
++        let expected = initial * UnitQuaternion::from_euler_angles(0.001, -0.002, 0.003);
++        assert!(fusion.attitude.angle_to(&expected) < 1e-6);
++        fusion.set_gyro_bias_frd([0.0; 3]).unwrap();
++        assert_eq!(fusion.gyro_bias_frd, Vector3::zeros());
++        let fresh = NaiveCF::new(Box::new(StationaryGlasses(100))).unwrap();
++        assert_eq!(fresh.gyro_bias_frd, Vector3::zeros());
      }
- }
--- 
-2.53.0
-

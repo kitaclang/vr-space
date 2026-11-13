@@ -30,8 +30,17 @@ pub fn head_rotation_from_pose(pose: PoseCopy, invert: (bool, bool, bool)) -> Qu
     if invert.1 { ry = -ry; }
     if invert.2 { rz = -rz; }
 
-    let q = Quat::from_euler(glam::EulerRot::XYZ, rx, ry, rz);
-    q.conjugate()
+    // Fusion's FRD Euler convention is Rz(yaw) * Ry(pitch) * Rx(roll).
+    // Convert axes as a rotation, preserving that order: F -> -Z, R -> X, D -> -Y.
+    // Conjugating remapped XYZ angles reverses the order and mixes roll into pitch
+    // after recentering at a nonzero heading.
+    Quat::from_rotation_y(-ry) * Quat::from_rotation_x(-rx) * Quat::from_rotation_z(-rz)
+}
+
+// When upright, retain the glasses' measured roll as a sensor-to-head mounting correction.
+pub fn upright_roll_correction(head: Quat) -> Quat {
+    let (_, _, roll) = head.to_euler(glam::EulerRot::YXZ);
+    Quat::from_rotation_z(-roll)
 }
 
 // The calibration for a recenter: the inverse of the head orientation, or with `yaw_only` the
@@ -125,6 +134,20 @@ mod tests {
     }
 
     #[test]
+    fn recentered_roll_stays_roll_at_any_heading_and_pitch() {
+        for yaw in [-2.5, -0.8, 0.0, 0.8, 2.5] {
+            for pitch in [-0.6, 0.0, 0.6] {
+                let centred = pose(0.0, pitch, yaw);
+                let tilted = pose(0.3, pitch, yaw);
+                assert_rot_eq(
+                    recenter_calibration(centred, false) * tilted,
+                    Quat::from_rotation_z(-0.3),
+                );
+            }
+        }
+    }
+
+    #[test]
     fn invert_flags_reverse_each_axis() {
         let p = PoseCopy { roll: 0.3, pitch: 0.2, yaw: 0.1 };
         let flipped = PoseCopy { roll: -0.3, pitch: -0.2, yaw: -0.1 };
@@ -171,6 +194,15 @@ mod tests {
     }
 
     #[test]
+    fn upright_roll_reference_survives_yaw_recenters_and_real_tilt() {
+        let correction = upright_roll_correction(head(1.2, 0.2, 0.15));
+        let upright = head(-0.8, -0.1, 0.15) * correction;
+        assert_rot_eq(recenter_calibration(upright, true) * upright, head(0.0, -0.1, 0.0));
+        let tilted = head(-0.8, -0.1, 0.45) * correction;
+        assert_rot_eq(recenter_calibration(tilted, true) * tilted, head(0.0, -0.1, 0.3));
+    }
+
+    #[test]
     fn yaw_only_recenter_works_looking_straight_up_or_down() {
         let half_pi = std::f32::consts::FRAC_PI_2;
         for yaw in [-2.0, 0.0, 1.0] {
@@ -203,6 +235,13 @@ mod tests {
         assert!(eye.distance(CAM_POS) > 0.01);
         // The eye swings around the neck, so it stays at the same height when only turning.
         assert!((eye.y - CAM_POS.y).abs() < EPS);
+    }
+
+    #[test]
+    fn roll_trim_rotates_the_view_in_the_expected_direction() {
+        let right = camera_view(Quat::from_rotation_z(0.1f32.to_radians()), 0.0)
+            .transform_vector3(Vec3::X);
+        assert!(right.y < 0.0, "positive trim tilts the view clockwise");
     }
 
     #[test]

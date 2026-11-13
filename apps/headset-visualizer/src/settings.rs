@@ -43,6 +43,12 @@ pub struct Settings {
     /// How far ahead head movement is predicted, in ms (0 = off).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub predict_ms: Option<f32>,
+    /// Keep the horizon level on recenter; off when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recenter_yaw_only: Option<bool>,
+    /// User roll trim in tenths of a degree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roll_trim_tenths: Option<i32>,
 }
 
 impl Settings {
@@ -53,6 +59,7 @@ impl Settings {
         s.screen_distance = positive(s.screen_distance);
         s.screen_height = positive(s.screen_height);
         s.predict_ms = s.predict_ms.filter(|x| (0.0..=100.0).contains(x));
+        s.roll_trim_tenths = s.roll_trim_tenths.filter(|x| (-450..=450).contains(x));
         if s.window.as_ref().is_some_and(|w| w.app.is_empty()) {
             s.window = None;
         }
@@ -140,6 +147,8 @@ mod tests {
             screen_distance: Some(3.0),
             window: Some(SavedWindow { app: "Safari".into(), title: "Docs".into() }),
             fullscreen: Some(2),
+            recenter_yaw_only: Some(true),
+            roll_trim_tenths: Some(-6),
             ..Settings::default()
         };
         let json = s.to_json();
@@ -158,6 +167,8 @@ mod tests {
         assert!(Settings::from_json("not json").is_err());
         assert_eq!(Settings::from_json(r#"{"predict_ms": -1}"#).unwrap().predict_ms, None);
         assert_eq!(Settings::from_json(r#"{"predict_ms": 15}"#).unwrap().predict_ms, Some(15.0));
+        assert_eq!(Settings::from_json(r#"{"roll_trim_tenths": 451}"#).unwrap().roll_trim_tenths, None);
+        assert_eq!(Settings::from_json(r#"{"roll_trim_tenths": -450}"#).unwrap().roll_trim_tenths, Some(-450));
     }
 
     #[test]

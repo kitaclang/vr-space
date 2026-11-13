@@ -116,7 +116,7 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     // Parsed in two steps to learn which flags were actually given (they beat saved settings).
     let matches = Cli::command().get_matches_from(args);
-    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     cli.validate()?;
     let explicit = ExplicitFlags::from_matches(&matches);
 
@@ -177,16 +177,15 @@ fn main() -> anyhow::Result<()> {
         SettingsStore::open(settings::default_path())
     };
     let plan = StartupPlan::new(&cli, explicit, &settings);
+    cli.recenter_yaw_only = plan.recenter_yaw_only;
 
     // Window and event loop (winit 0.28 API)
     let mut builder = EventLoopBuilder::<Command>::with_user_event();
-    // Live in the menu bar only: no Dock icon (and no Dock menu to quit from by accident).
-    // The window still takes keys when clicked, and fullscreen doesn't need a Dock icon
-    // (see apply_fullscreen).
+    // A regular Mac app: Dock, Command-Tab and an application menu.
     #[cfg(target_os = "macos")]
     {
         use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
-        builder.with_activation_policy(ActivationPolicy::Accessory);
+        builder.with_activation_policy(ActivationPolicy::Regular);
     }
     let event_loop = builder.build();
     let window = Window::new(&event_loop).expect("create window");
@@ -224,7 +223,7 @@ fn main() -> anyhow::Result<()> {
     let pose_shared = Arc::new(PoseAtomic::new());
 
     // Head tracking thread (max cadence by default; optional rate limit via --poll-ms)
-    tracking::spawn_tracking_thread(pose_shared.clone(), cli.poll_ms);
+    tracking::spawn_tracking_thread(pose_shared.clone(), cli.poll_ms, cli.calibrate_gyro);
 
     // GPU init
     let mut gpu = pollster::block_on(init_gpu(&window, &cli, &grid_vertices))?;

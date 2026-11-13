@@ -4,6 +4,9 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Recenter,
+    ToggleHorizon,
+    RollLeft,
+    RollRight,
     Further,
     Closer,
     Bigger,
@@ -37,6 +40,8 @@ pub fn command_for_key(key: winit::event::VirtualKeyCode) -> Option<Command> {
     Some(match key {
         K::Escape => Command::Quit,
         K::C => Command::Recenter,
+        K::Left => Command::RollLeft,
+        K::Right => Command::RollRight,
         K::F => Command::ToggleFullscreen,
         K::H => Command::ToggleHud,
         K::P => Command::OpenScreenSettings,
@@ -63,6 +68,8 @@ mod tests {
         for (key, cmd) in [
             (K::Escape, Command::Quit),
             (K::C, Command::Recenter),
+            (K::Left, Command::RollLeft),
+            (K::Right, Command::RollRight),
             (K::F, Command::ToggleFullscreen),
             (K::H, Command::ToggleHud),
             (K::P, Command::OpenScreenSettings),
