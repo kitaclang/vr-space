@@ -68,6 +68,43 @@ pub enum ControlCommand {
         state: OnOff,
     },
     Quit,
+    /// Synthetic head pose. Only when this binary was built with `--features simulate`.
+    #[cfg(feature = "simulate")]
+    Simulate {
+        #[command(subcommand)]
+        command: SimulateCommand,
+    },
+}
+
+#[cfg(feature = "simulate")]
+#[derive(Debug, Clone, Subcommand)]
+pub enum SimulateCommand {
+    /// Set an absolute pose immediately. Angles are fusion FRD degrees.
+    Pose {
+        #[arg(long, allow_hyphen_values = true)]
+        roll: f32,
+        #[arg(long, allow_hyphen_values = true)]
+        pitch: f32,
+        #[arg(long, allow_hyphen_values = true)]
+        yaw: f32,
+    },
+    /// Move from the current pose to an absolute pose. Accepted does not mean finished.
+    Move {
+        #[arg(long, allow_hyphen_values = true)]
+        roll: f32,
+        #[arg(long, allow_hyphen_values = true)]
+        pitch: f32,
+        #[arg(long, allow_hyphen_values = true)]
+        yaw: f32,
+        #[arg(long)]
+        duration_ms: u64,
+    },
+    Disconnect,
+    Connect,
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -151,7 +188,21 @@ pub enum Action {
         on: bool,
     },
     Quit,
+    #[cfg(feature = "simulate")]
+    SimulatePose { roll: f32, pitch: f32, yaw: f32 },
+    #[cfg(feature = "simulate")]
+    SimulateMove { roll: f32, pitch: f32, yaw: f32, duration_ms: u64 },
+    #[cfg(feature = "simulate")]
+    SimulateDisconnect,
+    #[cfg(feature = "simulate")]
+    SimulateConnect,
+    #[cfg(feature = "simulate")]
+    SimulateStatus,
 }
+
+/// Returned when a simulator command reaches an app that is not simulating.
+#[cfg(feature = "simulate")]
+pub const SIMULATOR_REQUIRED: &str = "not running in glasses simulator mode; launch this binary with --simulate-glasses. Simulator commands were not applied to a normal tracking session";
 
 impl ControlCommand {
     pub fn action(&self) -> anyhow::Result<Action> {
@@ -230,7 +281,63 @@ impl ControlCommand {
                 on: matches!(state, OnOff::On),
             },
             Self::Quit => A::Quit,
+            #[cfg(feature = "simulate")]
+            Self::Simulate { command } => match command {
+                SimulateCommand::Pose { roll, pitch, yaw } => {
+                    validate_simulator_pose(*roll, *pitch, *yaw).map_err(|e| anyhow::anyhow!(e))?;
+                    A::SimulatePose { roll: *roll, pitch: *pitch, yaw: *yaw }
+                }
+                SimulateCommand::Move { roll, pitch, yaw, duration_ms } => {
+                    validate_simulator_pose(*roll, *pitch, *yaw).map_err(|e| anyhow::anyhow!(e))?;
+                    validate_simulator_duration(*duration_ms).map_err(|e| anyhow::anyhow!(e))?;
+                    A::SimulateMove { roll: *roll, pitch: *pitch, yaw: *yaw, duration_ms: *duration_ms }
+                }
+                SimulateCommand::Disconnect => A::SimulateDisconnect,
+                SimulateCommand::Connect => A::SimulateConnect,
+                SimulateCommand::Status { .. } => A::SimulateStatus,
+            },
         })
+    }
+
+    pub fn pretty_status(&self) -> bool {
+        match self {
+            Self::Status { json: true } => true,
+            #[cfg(feature = "simulate")]
+            Self::Simulate { command: SimulateCommand::Status { json: true } } => true,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(feature = "simulate")]
+impl Action {
+    pub fn is_simulator(&self) -> bool {
+        matches!(self, Self::SimulatePose { .. } | Self::SimulateMove { .. } | Self::SimulateDisconnect | Self::SimulateConnect | Self::SimulateStatus)
+    }
+}
+
+#[cfg(feature = "simulate")]
+fn axis_deg(name: &str, value: f32, min: f32, max: f32) -> Result<(), String> {
+    if value.is_finite() && (min..=max).contains(&value) {
+        Ok(())
+    } else {
+        Err(format!("{name} must be finite and between {min} and {max} degrees"))
+    }
+}
+
+#[cfg(feature = "simulate")]
+pub fn validate_simulator_pose(roll: f32, pitch: f32, yaw: f32) -> Result<(), String> {
+    axis_deg("roll", roll, -180.0, 180.0)?;
+    axis_deg("pitch", pitch, -90.0, 90.0)?;
+    axis_deg("yaw", yaw, -180.0, 180.0)
+}
+
+#[cfg(feature = "simulate")]
+pub fn validate_simulator_duration(ms: u64) -> Result<(), String> {
+    if (1..=60_000).contains(&ms) {
+        Ok(())
+    } else {
+        Err("duration-ms must be between 1 and 60000".into())
     }
 }
 
@@ -266,6 +373,14 @@ pub fn decode_request(value: Value) -> Result<Action, String> {
         }
         Action::ShowWindow { id: 0 } | Action::SecondWindow { id: 0 } => {
             return Err("window ID 0 is invalid".into())
+        }
+        #[cfg(feature = "simulate")]
+        Action::SimulatePose { roll, pitch, yaw } | Action::SimulateMove { roll, pitch, yaw, .. } => {
+            validate_simulator_pose(*roll, *pitch, *yaw)?;
+            #[cfg(feature = "simulate")]
+            if let Action::SimulateMove { duration_ms, .. } = &action {
+                validate_simulator_duration(*duration_ms)?;
+            }
         }
         _ => {}
     }
@@ -368,5 +483,25 @@ mod tests {
         assert_eq!(ok["version"], 1);
         assert_eq!(ok["ok"], true);
         assert_eq!(ok["result"]["capture"]["primary"], "waiting_for_frames");
+    }
+
+    #[cfg(feature = "simulate")]
+    #[test]
+    fn simulator_commands_validate_at_the_cli_and_json_boundary() {
+        let cli = TestCli::try_parse_from(["vr-space", "control", "simulate", "pose", "--roll", "0", "--pitch", "0", "--yaw", "30"]).unwrap();
+        let TopCommand::Control(c) = cli.command;
+        let action = c.command.action().unwrap();
+        assert!(action.is_simulator());
+        assert!(!Action::Status.is_simulator());
+        assert!(SIMULATOR_REQUIRED.contains("simulate-glasses") && SIMULATOR_REQUIRED.contains("normal tracking"));
+        assert_eq!(action, Action::SimulatePose { roll: 0.0, pitch: 0.0, yaw: 30.0 });
+        let neg = TestCli::try_parse_from(["vr-space", "control", "simulate", "move", "--roll", "0", "--pitch", "-5", "--yaw", "-30", "--duration-ms", "1000"]).unwrap();
+        let TopCommand::Control(c) = neg.command;
+        assert_eq!(c.command.action().unwrap(), Action::SimulateMove { roll: 0.0, pitch: -5.0, yaw: -30.0, duration_ms: 1000 });
+        let bad = TestCli::try_parse_from(["vr-space", "control", "simulate", "move", "--roll", "0", "--pitch", "0", "--yaw", "1", "--duration-ms", "0"]).unwrap();
+        let TopCommand::Control(c) = bad.command;
+        assert!(c.command.action().is_err());
+        assert!(decode_request(json!({"version":1,"command":{"action":"simulate_pose","roll":0.0,"pitch":91.0,"yaw":0.0}})).is_err());
+        assert!(decode_request(request(Action::SimulateMove { roll: 0.0, pitch: 0.0, yaw: 1.0, duration_ms: 1000 })).is_ok());
     }
 }

@@ -42,6 +42,8 @@ use crate::cli::WindowChoice;
 
 // Head tracking thread and the pose it publishes
 mod tracking;
+#[cfg(feature = "simulate")]
+mod simulator;
 use crate::tracking::{PoseAtomic, START_INSTANT};
 
 // Axis mapping, recentering, neck model, projection
@@ -113,7 +115,7 @@ fn main() -> anyhow::Result<()> {
         let response = crate::control_socket::client(crate::control::request(action));
         match response {
             Ok(value) if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) => {
-                if matches!(args.command, crate::control::ControlCommand::Status { json: true }) {
+                if args.command.pretty_status() {
                     println!("{}", serde_json::to_string_pretty(value.get("result").unwrap_or(&value))?);
                 } else if let Some(result) = value.get("result") {
                     println!("{}", serde_json::to_string(result)?);
@@ -210,8 +212,22 @@ fn main() -> anyhow::Result<()> {
         builder.with_activation_policy(ActivationPolicy::Regular);
     }
     let event_loop = builder.build();
+    let simulating = cli::glasses_simulated(&cli);
+    #[cfg(all(target_os = "macos", feature = "simulate"))]
+    let sim_server = if simulating {
+        let proxy = event_loop.create_proxy();
+        match control_socket::start_server(move |request, reply| {
+            proxy.send_event(UserEvent::Control(request, reply)).map_err(|e| format!("app event loop is unavailable: {e}"))?;
+            Ok(())
+        }) {
+            Ok(server) => Some(server),
+            Err(e) => anyhow::bail!("glasses simulator not started: {e}. Stop the other vr-space first; this launch will not open a simulator window or send commands to the existing app."),
+        }
+    } else {
+        None
+    };
     let window = Window::new(&event_loop).expect("create window");
-    window.set_title("Headset Visualizer");
+    window.set_title(if simulating { "Headset Visualizer (simulated glasses)" } else { "Headset Visualizer" });
 
     // Go fullscreen on the chosen display (normally the glasses). If it isn't connected yet,
     // `pending_fullscreen` goes fullscreen on it once it shows up.
@@ -244,7 +260,18 @@ fn main() -> anyhow::Result<()> {
     // Shared pose (atomic, lock-free)
     let pose_shared = Arc::new(PoseAtomic::new());
 
-    // Head tracking thread (max cadence by default; optional rate limit via --poll-ms)
+    // Head tracking thread, or the simulator. Simulation never opens a headset.
+    #[cfg(all(target_os = "macos", feature = "simulate"))]
+    let sim_handle = if simulating {
+        let proxy = event_loop.create_proxy();
+        Some(simulator::spawn(pose_shared.clone(), move |reply, value| {
+            let _ = proxy.send_event(UserEvent::SimReply(reply, value));
+        }))
+    } else {
+        tracking::spawn_tracking_thread(pose_shared.clone(), cli.poll_ms, cli.calibrate_gyro);
+        None
+    };
+    #[cfg(not(all(target_os = "macos", feature = "simulate")))]
     tracking::spawn_tracking_thread(pose_shared.clone(), cli.poll_ms, cli.calibrate_gyro);
 
     // GPU init
@@ -303,7 +330,21 @@ fn main() -> anyhow::Result<()> {
         settings_store,
         settings,
     );
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "simulate"))]
+    if let Some(server) = sim_server {
+        app.set_control_server(server);
+        if let Some(sim) = sim_handle { app.set_simulator(sim); }
+    } else {
+        let proxy = event_loop.create_proxy();
+        match control_socket::start_server(move |request, reply| {
+            proxy.send_event(UserEvent::Control(request, reply)).map_err(|e| format!("app event loop is unavailable: {e}"))?;
+            Ok(())
+        }) {
+            Ok(server) => app.set_control_server(server),
+            Err(e) => warn!("CLI control server unavailable: {e}"),
+        }
+    }
+    #[cfg(all(target_os = "macos", not(feature = "simulate")))]
     {
         let proxy = event_loop.create_proxy();
         match control_socket::start_server(move |request, reply| {

@@ -39,7 +39,13 @@ use serde_json::{json, Value};
 use crate::control_socket::Server;
 
 #[derive(Debug)]
-pub(crate) enum UserEvent { Command(Command), #[cfg(target_os = "macos")] Control(Value, SyncSender<Value>) }
+pub(crate) enum UserEvent {
+    Command(Command),
+    #[cfg(target_os = "macos")]
+    Control(Value, SyncSender<Value>),
+    #[cfg(all(target_os = "macos", feature = "simulate"))]
+    SimReply(SyncSender<Value>, Value),
+}
 #[cfg(target_os = "macos")]
 use crate::window_placement::warn_if_covering_capture;
 
@@ -124,6 +130,10 @@ pub struct App {
     settings: Settings,
     #[cfg(target_os = "macos")]
     control_server: Option<Server>,
+    #[cfg(all(target_os = "macos", feature = "simulate"))]
+    sim: Option<crate::simulator::Handle>,
+    #[cfg(all(target_os = "macos", feature = "simulate"))]
+    submitted_frames: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -172,17 +182,53 @@ impl App {
     pub fn set_control_server(&mut self, server: Server) { self.control_server = Some(server); }
 
     #[cfg(target_os = "macos")]
-    fn handle_control(&mut self, request: Value) -> Value {
+    fn simulator_enabled(&self) -> bool {
+        #[cfg(feature = "simulate")]
+        { self.sim.is_some() }
+        #[cfg(not(feature = "simulate"))]
+        { false }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn on_control(&mut self, request: Value, reply: SyncSender<Value>) -> bool {
         match crate::control::decode_request(request) {
-            Ok(crate::control::Action::Status) => crate::control::success(self.control_status()),
-            Ok(action) => match self.execute_control(action) {
-                Ok(result) => crate::control::success(result),
-                Err(error) => {
-                    self.refresh_menus();
-                    crate::control::failure(error)
-                },
-            },
-            Err(error) => crate::control::failure(error),
+            #[cfg(feature = "simulate")]
+            Ok(action) if action.is_simulator() => {
+                self.forward_sim(action, reply);
+                false
+            }
+            Ok(crate::control::Action::Status) => {
+                let _ = reply.try_send(crate::control::success(self.control_status()));
+                false
+            }
+            Ok(action) => {
+                let quit = matches!(action, crate::control::Action::Quit);
+                let response = match self.execute_control(action) {
+                    Ok(result) => crate::control::success(result),
+                    Err(error) => {
+                        self.refresh_menus();
+                        crate::control::failure(error)
+                    }
+                };
+                let _ = reply.try_send(response);
+                quit
+            }
+            Err(error) => {
+                let _ = reply.try_send(crate::control::failure(error));
+                false
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "simulate"))]
+    fn forward_sim(&self, action: crate::control::Action, reply: SyncSender<Value>) {
+        let err = if let Some(sim) = &self.sim {
+            sim.forward(action, reply).err()
+        } else {
+            Some((reply, crate::control::SIMULATOR_REQUIRED))
+        };
+        if let Some((reply, error)) = err {
+            let _ = reply.try_send(crate::control::failure(error));
         }
     }
 
@@ -234,6 +280,10 @@ impl App {
             }
             A::Quit => Command::Quit,
             A::Status => unreachable!(),
+            #[cfg(feature = "simulate")]
+            A::SimulatePose { .. } | A::SimulateMove { .. } | A::SimulateDisconnect | A::SimulateConnect | A::SimulateStatus => {
+                anyhow::bail!(crate::control::SIMULATOR_REQUIRED)
+            }
         };
         self.run_command(command)?;
         self.remember(command);
@@ -256,7 +306,7 @@ impl App {
             "roll_trim_degrees":self.roll_trim_tenths as f32 / 10.0,
             "prediction":{"enabled":self.predict_lead.is_on(),"lead_ms":self.predict_lead.ms},
             "frame_copying":{"available":self.gpu.zero_copy_available,"enabled":!self.gpu.zero_copy},
-            "tracking":{"connected":self.pose.read().3},
+            "tracking":{"connected":self.pose.read().3,"simulator":self.simulator_enabled(),"device":if self.simulator_enabled() {"simulated"} else {"glasses"}},
             "capture":{"primary":cap(primary_capture),"primary_source_active":active(primary_capture),"second":self.capture.second.map(|_| cap(capture_status_at(1)))},
             "open_at_login":crate::macos_app::login_status()
         })
@@ -321,7 +371,16 @@ impl App {
             settings,
             #[cfg(target_os = "macos")]
             control_server: None,
+            #[cfg(all(target_os = "macos", feature = "simulate"))]
+            sim: None,
+            #[cfg(all(target_os = "macos", feature = "simulate"))]
+            submitted_frames: 0,
         }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "simulate"))]
+    pub fn set_simulator(&mut self, sim: crate::simulator::Handle) {
+        self.sim = Some(sim);
     }
 
     pub fn handle_event(&mut self, event: Event<'_, UserEvent>, control_flow: &mut ControlFlow) {
@@ -356,18 +415,22 @@ impl App {
             Event::UserEvent(UserEvent::Command(cmd)) => Some(cmd),
             #[cfg(target_os = "macos")]
             Event::UserEvent(UserEvent::Control(request, reply)) => {
-                let quit = matches!(crate::control::decode_request(request.clone()), Ok(crate::control::Action::Quit));
-                let response = self.handle_control(request);
-                let _ = reply.try_send(response);
-                if quit {
+                if self.on_control(request, reply) {
                     stop_stream();
                     *control_flow = ControlFlow::Exit;
                 }
                 None
             }
+            #[cfg(all(target_os = "macos", feature = "simulate"))]
+            Event::UserEvent(UserEvent::SimReply(reply, value)) => {
+                let _ = reply.try_send(value);
+                None
+            }
             Event::LoopDestroyed => {
                 // Every way of quitting ends here: the menu bar, Esc, closing the window, and a
                 // Quit from macOS itself (Cmd-Q, logout), which skips Command::Quit.
+                #[cfg(all(target_os = "macos", feature = "simulate"))]
+                drop(self.sim.take());
                 #[cfg(target_os = "macos")]
                 {
                     stop_stream();
@@ -560,9 +623,19 @@ impl App {
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Read pose
-        let (r, p, y, has, t_ns) = self.pose.read();
-        let connection_id = self.pose.connection_id();
+        // Read pose. In the simulator this is the coherent sample the submission marker records.
+        let pose_read = self.pose.read();
+        let pose_gen = self.pose.connection_id();
+        #[cfg(all(target_os = "macos", feature = "simulate"))]
+        let sim_sample = self.sim.as_ref().map(|sim| sim.sample());
+        #[cfg(all(target_os = "macos", feature = "simulate"))]
+        let (r, p, y, has, t_ns, connection_id) = if let Some(s) = sim_sample {
+            (s.roll, s.pitch, s.yaw, s.connected, s.time_ns, s.generation)
+        } else {
+            (pose_read.0, pose_read.1, pose_read.2, pose_read.3, pose_read.4, pose_gen)
+        };
+        #[cfg(not(all(target_os = "macos", feature = "simulate")))]
+        let (r, p, y, has, t_ns, connection_id) = (pose_read.0, pose_read.1, pose_read.2, pose_read.3, pose_read.4, pose_gen);
         if has && connection_id != self.connection_id {
             // A new fusion has a new reference frame; the old calibration no longer applies.
             self.calib_inv = Quat::IDENTITY;
@@ -642,7 +715,9 @@ impl App {
         // Refresh the HUD strings at most every 100 ms: readable, and it avoids formatting (and
         // allocating) strings every frame. Skipped entirely when the HUD is off.
         if gpu.hud_enabled && (gpu.hud_text.is_empty() || now_ns.saturating_sub(gpu.hud_text_updated_ns) >= HUD_REFRESH_NS) {
-            let dev = if has { "connected" } else { "not-found" };
+            let dev = if crate::cli::glasses_simulated(&self.cli) {
+                if has { "simulated" } else { "simulated, disconnected" }
+            } else if has { "connected" } else { "not-found" };
             #[cfg(target_os = "macos")]
             let screen_line = screen_status_line(gpu.scene.tex_size(), self.capture.shown, 0);
             #[cfg(not(target_os = "macos"))]
@@ -750,6 +825,13 @@ impl App {
             sb.finish();
         }
         gpu.queue.submit(Some(encoder.finish()));
+        #[cfg(all(target_os = "macos", feature = "simulate"))]
+        if let Some(sample) = sim_sample {
+            self.submitted_frames += 1;
+            if let Some(sim) = &self.sim {
+                sim.record_submission(&sample, self.submitted_frames);
+            }
+        }
         // Without glasses there's no pose sample to measure from.
         if has && t_ns > 0 {
             self.latency.pose_to_submit.push_ns(now_ns_from_start().saturating_sub(t_ns));

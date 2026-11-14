@@ -194,19 +194,34 @@ pub fn spawn_tracking_thread(pose: Arc<PoseAtomic>, poll_ms: u64, calibrate_gyro
     });
 }
 
+/// A new fusion or simulated reconnect. The renderer resets calibration even if it missed
+/// the disconnected sample.
+pub fn begin_connection(pose: &PoseAtomic) -> u64 {
+    pose.connection_id.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// The tracking thread's sample write. Disconnected samples are zeros, matching a failed read.
+pub fn publish_sample(pose: &PoseAtomic, roll: f32, pitch: f32, yaw: f32, connected: bool, now_ns: u64) {
+    if connected {
+        pose.write(roll, pitch, yaw, true, now_ns);
+    } else {
+        pose.write(0.0, 0.0, 0.0, false, now_ns);
+    }
+}
+
 /// Publish samples until a read fails. A fresh fusion starts a new session after reconnecting.
 fn track_session(
     pose: &PoseAtomic,
     poll_interval: Option<Duration>,
     mut read: impl FnMut() -> Result<[f32; 3], ar_drivers::Error>,
 ) -> ar_drivers::Error {
-    pose.connection_id.fetch_add(1, Ordering::Relaxed);
+    begin_connection(pose);
     let mut last = Instant::now();
     loop {
         match read() {
-            Ok([r, p, y]) => pose.write(r, p, y, true, now_ns_from_start()),
+            Ok([r, p, y]) => publish_sample(pose, r, p, y, true, now_ns_from_start()),
             Err(error) => {
-                pose.write(0.0, 0.0, 0.0, false, now_ns_from_start());
+                publish_sample(pose, 0.0, 0.0, 0.0, false, now_ns_from_start());
                 return error;
             }
         }

@@ -38,6 +38,12 @@ pub struct Cli {
     #[arg(long)]
     pub calibrate_gyro: bool,
 
+    /// Publish synthetic head orientation instead of opening glasses. Only in a build with
+    /// `--features simulate`. Does not probe USB. Cannot be combined with `--calibrate-gyro`.
+    #[cfg(feature = "simulate")]
+    #[arg(long)]
+    pub simulate_glasses: bool,
+
     /// Disable HUD text to save GPU/CPU
     #[arg(long, default_value_t = false)]
     pub no_hud: bool,
@@ -223,8 +229,24 @@ impl Cli {
         if !(0.0..=100.0).contains(&self.predict_ms) {
             anyhow::bail!("--predict-ms must be between 0 and 100");
         }
+        #[cfg(all(feature = "simulate", not(target_os = "macos")))]
+        if self.simulate_glasses {
+            anyhow::bail!("--simulate-glasses requires macOS");
+        }
+        #[cfg(feature = "simulate")]
+        if self.simulate_glasses && self.calibrate_gyro {
+            anyhow::bail!("--calibrate-gyro cannot be used with --simulate-glasses; synthetic orientation does not exercise gyro calibration");
+        }
         Ok(())
     }
+}
+
+/// True only for a simulator-enabled build launched with `--simulate-glasses`.
+pub fn glasses_simulated(cli: &Cli) -> bool {
+    #[cfg(feature = "simulate")]
+    { cli.simulate_glasses }
+    #[cfg(not(feature = "simulate"))]
+    { let _ = cli; false }
 }
 
 #[cfg(test)]
@@ -245,6 +267,14 @@ mod tests {
         assert!(!cli.recenter_yaw_only);
         assert!(!cli.calibrate_gyro);
         assert!(parse(&["--calibrate-gyro"]).unwrap().calibrate_gyro);
+        assert!(!glasses_simulated(&cli));
+    }
+
+    #[cfg(feature = "simulate")]
+    #[test]
+    fn simulate_glasses_rejects_gyro_calibration() {
+        assert!(parse(&["--simulate-glasses", "--calibrate-gyro"]).is_err());
+        assert!(glasses_simulated(&parse(&["--simulate-glasses"]).unwrap()));
     }
 
     fn plan(args: &[&str], saved: &Settings) -> StartupPlan {

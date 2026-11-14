@@ -63,3 +63,5 @@ metal = "0.26"
 [features]
 # Default to no-vsync for lowest latency; user can override with CLI.
 default = []
+# Opt-in synthetic tracking (`--simulate-glasses`). Default builds keep the real headset path.
+simulate = []

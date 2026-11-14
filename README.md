@@ -228,13 +228,43 @@ The socket protocol uses a versioned envelope: `{"version":1,"ok":true,"result":
 | `roll_trim_degrees` | Current signed trim |
 | `prediction` | `enabled` and `lead_ms` |
 | `frame_copying` | Switch `available` and copying `enabled`; unavailable is not the same as off |
-| `tracking` | `connected` |
+| `tracking` | `connected`, `simulator` (`true` only while `--simulate-glasses` is running), and `device` (`simulated` or `glasses`) |
 | `capture` | `primary` and nullable `second`: `starting`, `no_permission`, `failed`, `waiting_for_frames`, or `capturing`; `primary_source_active` distinguishes an active stream from a failed source switch |
 | `open_at_login` | `unavailable`, `not_registered`, `enabled`, `requires_approval`, or `not_found` |
 
 Exit codes: **0** means handled successfully, **1** means a known error or unavailable action, **2** means invalid CLI syntax, and **3** means an unknown outcome after dispatch. Errors include actionable stderr. Transport failures may include an `outcome` field (`not_dispatched` or `unknown`).
 
 The server uses a local per-user Unix socket, not TCP. The private runtime directory and exclusive lock prevent other users and competing app instances from taking over its socket; another app instance remains usable but logs that CLI control is unavailable for that instance. Any process running as your user can issue commands: filesystem permissions do not defend against malicious processes under the same account. No server means a clear client error, never an automatic app launch.
+
+### Glasses simulator
+
+Opt-in synthetic tracking for the real window, capture, menus and renderer. It does not open or poll a headset, and it is not in the default build or the signed app bundle.
+
+```bash
+scripts/cargo.sh build -p headset-visualizer --features simulate
+target/debug/headset-visualizer --ignore-settings --simulate-glasses
+```
+
+Use the same binary for control. `--ignore-settings` keeps the test launch from reading or writing `settings.json`. Fullscreen stays off unless you ask for it. Screen capture still needs a display and Screen Recording permission; a missing permission is a failed check, not a pass.
+
+```bash
+bin=target/debug/headset-visualizer
+"$bin" control simulate pose --roll 0 --pitch 0 --yaw 30
+"$bin" control simulate move --roll 0 --pitch 0 --yaw -30 --duration-ms 1000
+"$bin" control simulate status --json
+"$bin" control simulate disconnect
+"$bin" control simulate connect
+"$bin" control recenter
+"$bin" control prediction off
+```
+
+Angles are degrees in the fusion FRD convention, converted with `to_radians()` and passed through `head_rotation_from_pose`. Positive pitch looks up. Positive yaw turns gaze toward scene +X (the virtual screen slides the other way). Positive roll tilts. Roll and yaw must be finite and within ±180°; pitch within ±90°. `pose` snaps immediately. `move` interpolates each axis along the shortest path from the current pose to that absolute target; the endpoints are exact, and a 180° delta takes the negative wrap. An in-progress move is cancelled by another pose, move, or disconnect. Duration is 1–60000 ms. Connect and disconnect are idempotent: connecting again does not reset the pose, calibration or connection generation. A real disconnect-then-connect starts at neutral and bumps the generation so recentering and prediction reset. Pose and move fail while disconnected; status still works. Commands fail on an app that was not launched with `--simulate-glasses`.
+
+A successful pose reply means that sample is published. A successful move reply means the start pose, target and duration were accepted, not that the move finished. Do not retry after a timeout or lost reply: resending a move restarts it. Poll `simulate status` first. Each accepted state-changing command gets a monotonic `revision`. Wait until `revision` is still yours, `completed_revision` equals it for a move (or `settled` is true for a pose), and `submitted.revision` equals it with `submitted.settled` and `submitted.sample_time_ns` greater than or equal to that command's sample time (`completed_sample_time_ns` for a move). `submitted.frame` 0 means no frame has been submitted. `cancelled_revision` is a replaced or disconnected in-progress move, not a completion. GPU submission is not presentation; a screenshot still has to wait out the display and capture pipeline. Turn prediction off for an exact final pose. The HUD says `device: simulated` or `device: simulated, disconnected`.
+
+If another vr-space already owns the control socket, a simulator launch exits before opening a window or publishing poses. Stop that app first. Simulator commands are never sent to it.
+
+This does not exercise the IMU, fusion, USB, gyro calibration or lenses. It cannot show optical quality, comfort, motion-to-photon latency or real tracking accuracy.
 
 ### Saved settings
 
@@ -260,6 +290,7 @@ Options:
 | `--max-fps <n>` | 0 (unlimited) | Cap the frame rate when vsync is off |
 | `--poll-ms <ms>` | 0 (as fast as possible) | How often to read head tracking |
 | `--calibrate-gyro` | off | After a 3-second countdown, measure residual gyro bias for 10 stationary seconds after each connection; keep glasses on a stable surface until the HUD or log confirms completion. Not saved |
+| `--simulate-glasses` | off | Simulator builds only (`--features simulate`). Synthetic head pose instead of a headset; see [Glasses simulator](#glasses-simulator). Not saved |
 | `--invert-x` / `--invert-y` / `--invert-z` | off | Flip roll / pitch / yaw |
 | `--no-hud` | off | Hide the text overlay |
 | `--hud-size <px>` | 16 | HUD font size |

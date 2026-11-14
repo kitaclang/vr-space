@@ -1,6 +1,6 @@
 # Glasses checklist
 
-Everything that still needs real AR glasses to check, in an order that fits one session. Tick what works, and note what doesn't (what you did, what you saw). Those notes are what gets fixed next.
+Everything that still needs real AR glasses to check, in an order that fits one session. Tick what works, and note what doesn't (what you did, what you saw). Those notes are what gets fixed next. The glasses simulator does not cover any of this: it never exercises the IMU, USB, fusion or lenses.
 
 ## Before you start
 
