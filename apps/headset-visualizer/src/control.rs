@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum TopCommand {
+    /// Control an already-running vr-space app (does not launch it).
     Control(ControlArgs),
 }
 
@@ -49,12 +50,14 @@ pub enum ControlCommand {
         state: SecondState,
     },
     Fullscreen {
+        /// Connected display ID (0 = main), or window; omitted means window.
         target: Option<String>,
     },
     Hud {
         state: OnOff,
     },
     Prediction {
+        /// Milliseconds (0..100), on, off, toggle, more, or less.
         value: String,
     },
     CopyFrames {
@@ -85,7 +88,10 @@ pub enum ScreenCommand {
     Further,
     Closer,
     Reset,
-    Curvature { value: f32 },
+    Curvature {
+        /// Curve amount from 0 (flat) to 1 (wrapped around the eye).
+        value: f32,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]

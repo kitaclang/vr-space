@@ -203,12 +203,12 @@ vr-space control copy-frames off
 | `fullscreen <ID>` / `fullscreen window` | Choose a fullscreen display or return to a window |
 | `hud on\|off` | Set HUD visibility (unavailable with startup `--no-hud`) |
 | `prediction <0..100\|on\|off\|toggle\|more\|less>` | Set prediction milliseconds, enable/disable it, toggle, or step by 5 ms |
-| `copy-frames on\|off` | Set frame copying (requires the switch to be available) |
+| `copy-frames on\|off` | Set frame copying (`off` requires zero-copy support) |
 | `open-screen-settings` | Open Screen Recording settings |
 | `open-at-login on\|off` | Set native login registration (supported installed bundle only) |
 | `quit` | Request app shutdown |
 
-Use `vr-space --list-displays` and `vr-space --list-windows` to discover source IDs. Live fullscreen requests require a connected display; a saved startup fullscreen target can remain pending until that display connects. `vr-space control --help` lists the live controls. Startup flags still configure a new app; they do not change an existing instance. Control, discovery, help, version and icon-generation invocations do not open or truncate the GUI log, even with stderr redirected.
+Use `vr-space --list-displays` and `vr-space --list-windows` to discover source IDs. Display ID `0` selects the main display; status and saved selections use its actual ID. Live fullscreen requests require a connected display; a saved startup fullscreen target can remain pending until that display connects. `vr-space control --help` lists the live controls. Startup flags still configure a new app; they do not change an existing instance. Control, discovery, help, version and icon-generation invocations do not open or truncate the GUI log, even with stderr redirected.
 
 Commands are handled on the app's event-loop thread before it replies. Recenter acknowledges a request queued for the next connected render, not completed calibration. Starting a capture does not prove a frame has arrived; inspect status. Opening Screen Recording settings cannot grant permission. Quit acknowledges the request before shutdown, not that the process has already exited.
 
