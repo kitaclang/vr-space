@@ -50,7 +50,7 @@ use crate::macos_app;
 #[cfg(target_os = "macos")]
 use crate::macos_capture::{
     capture_status, capture_status_at, open_screen_recording_settings, stop_stream, stop_stream_at, switch_source, take_latest_frame, take_window_event,
-    window_info, CaptureSource, CaptureStatus, CapturedWindowEvent,
+    resolve_display_id, window_info, CaptureSource, CaptureStatus, CapturedWindowEvent,
 };
 #[cfg(target_os = "macos")]
 use crate::menu_bar::MenuBar;
@@ -126,6 +126,11 @@ pub struct App {
     control_server: Option<Server>,
 }
 
+#[cfg(target_os = "macos")]
+fn capture_needs_restart(current: Option<CaptureSource>, requested: CaptureSource, status: CaptureStatus) -> bool {
+    current != Some(requested) || !matches!(status, CaptureStatus::WaitingForFrames | CaptureStatus::Capturing)
+}
+
 fn take_recenter_request(pending: &mut Option<u64>, connected: bool, connection_id: u64) -> bool {
     pending.take().is_some_and(|id| connected && id == connection_id)
 }
@@ -133,6 +138,21 @@ fn take_recenter_request(pending: &mut Option<u64>, connected: bool, connection_
 #[cfg(test)]
 mod tests {
     use super::take_recenter_request;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn source_setters_retry_failed_capture_but_leave_running_capture_alone() {
+        use super::{capture_needs_restart, CaptureSource, CaptureStatus};
+        let source = CaptureSource::Display(7);
+        for status in [CaptureStatus::Starting, CaptureStatus::NoPermission, CaptureStatus::Failed] {
+            assert!(capture_needs_restart(Some(source), source, status));
+        }
+        for status in [CaptureStatus::WaitingForFrames, CaptureStatus::Capturing] {
+            assert!(!capture_needs_restart(Some(source), source, status));
+            assert!(capture_needs_restart(None, source, status));
+            assert!(capture_needs_restart(Some(source), CaptureSource::Window(8), status));
+        }
+    }
 
     #[test]
     fn recenter_request_cannot_cross_a_disconnect_or_reconnect() {
@@ -157,7 +177,10 @@ impl App {
             Ok(crate::control::Action::Status) => crate::control::success(self.control_status()),
             Ok(action) => match self.execute_control(action) {
                 Ok(result) => crate::control::success(result),
-                Err(error) => crate::control::failure(error),
+                Err(error) => {
+                    self.refresh_menus();
+                    crate::control::failure(error)
+                },
             },
             Err(error) => crate::control::failure(error),
         }
@@ -784,14 +807,17 @@ impl App {
             Command::FullscreenOn(id) => self.fullscreen_on = apply_fullscreen(&self.window, self.fullscreen_on, id),
             Command::ShowDisplay(id) => {
                 #[cfg(target_os = "macos")]
-                if self.capture.shown != CaptureSource::Display(id) {
-                    // Restarting the capture blocks briefly; fine for a menu click.
-                    match switch_source(0, CaptureSource::Display(id), !self.cli.no_cursor) {
-                        Ok(()) => {
-                            self.capture.shown = CaptureSource::Display(id);
-                            self.capture.last_display = id;
+                {
+                    let id = resolve_display_id(id);
+                    if capture_needs_restart(Some(self.capture.shown), CaptureSource::Display(id), capture_status()) {
+                        // Restarting the capture blocks briefly; fine for a menu click.
+                        match switch_source(0, CaptureSource::Display(id), !self.cli.no_cursor) {
+                            Ok(()) => {
+                                self.capture.shown = CaptureSource::Display(id);
+                                self.capture.last_display = id;
+                            }
+                            Err(e) => anyhow::bail!("couldn't switch to display {id}: {e}"),
                         }
-                        Err(e) => anyhow::bail!("couldn't switch to display {id}: {e}"),
                     }
                 }
                 #[cfg(not(target_os = "macos"))]
@@ -799,7 +825,7 @@ impl App {
             }
             Command::ShowWindow(id) => {
                 #[cfg(target_os = "macos")]
-                if self.capture.shown != CaptureSource::Window(id) {
+                if capture_needs_restart(Some(self.capture.shown), CaptureSource::Window(id), capture_status()) {
                     match switch_source(0, CaptureSource::Window(id), !self.cli.no_cursor) {
                         Ok(()) => self.capture.shown = CaptureSource::Window(id),
                         Err(e) => anyhow::bail!("couldn't switch to window {id}: {e}"),
@@ -812,22 +838,25 @@ impl App {
                 #[cfg(target_os = "macos")]
                 {
                     let source = if matches!(cmd, Command::SecondDisplay(_)) {
-                        CaptureSource::Display(id)
+                        CaptureSource::Display(resolve_display_id(id))
                     } else {
                         CaptureSource::Window(id)
                     };
-                    if self.capture.second != Some(source) {
-                        // A source change must not leave a stale image or imported surface behind.
-                        gpu.set_secondary(false);
+                    if capture_needs_restart(self.capture.second, source, capture_status_at(1)) {
                         match switch_source(1, source, !self.cli.no_cursor) {
                             Ok(()) => {
+                                // Discard old images only after accepting the new source.
+                                gpu.set_secondary(false);
                                 gpu.set_secondary(true);
                                 self.capture.second = Some(source);
                             }
                             Err(e) => {
                                 warn!("Couldn't start the second screen: {e}");
-                                stop_stream_at(1);
-                                self.capture.second = None;
+                                if !matches!(capture_status_at(1), CaptureStatus::WaitingForFrames | CaptureStatus::Capturing) {
+                                    gpu.set_secondary(false);
+                                    stop_stream_at(1);
+                                    self.capture.second = None;
+                                }
                                 anyhow::bail!("couldn't start the second screen: {e}");
                             }
                         }
@@ -921,8 +950,8 @@ impl App {
                 info!("Head-pose prediction: {} ms ahead", self.predict_lead.ms);
             }
             #[cfg(target_os = "macos")]
-            Command::ShowDisplay(id) if self.capture.shown == CaptureSource::Display(id) => {
-                settings.display = Some(id);
+            Command::ShowDisplay(id) if self.capture.shown == CaptureSource::Display(resolve_display_id(id)) => {
+                settings.display = Some(resolve_display_id(id));
                 settings.window = None;
             }
             #[cfg(target_os = "macos")]
