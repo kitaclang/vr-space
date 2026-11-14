@@ -23,6 +23,7 @@ const DISPATCH_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const DISPATCH_TIMEOUT: Duration = Duration::from_millis(80);
 const POLL: Duration = Duration::from_millis(5);
+const SHUTDOWN_REPLY_GRACE: Duration = Duration::from_millis(200);
 const MAX_SUN_PATH: usize = 103;
 
 #[derive(Debug)]
@@ -196,28 +197,42 @@ fn serve_one(
         return;
     }
     let deadline = Instant::now() + DISPATCH_TIMEOUT;
+    let mut shutdown_deadline = None;
     let mut reported_unknown = false;
     loop {
-        if stop.load(Ordering::Acquire) {
-            return;
+        let stopping = stop.load(Ordering::Acquire);
+        if stopping {
+            shutdown_deadline.get_or_insert_with(|| Instant::now() + SHUTDOWN_REPLY_GRACE);
         }
         match rx.try_recv() {
             Ok(reply) if !reported_unknown && Instant::now() < deadline => {
-                let _ = write_json(stream, &reply, stop);
+                let write_deadline = if stopping {
+                    shutdown_deadline.unwrap()
+                } else {
+                    Instant::now() + IO_TIMEOUT
+                };
+                let _ = write_json_until(stream, &reply, write_deadline, None);
                 return;
             }
             Ok(_) if !reported_unknown => {
-                let _ = write_json(
-                    stream,
-                    &error_reply(
-                        "command outcome unknown; check status before retrying".into(),
-                        "unknown",
-                    ),
-                    stop,
-                );
+                if !stopping {
+                    let _ = write_json(
+                        stream,
+                        &error_reply(
+                            "command outcome unknown; check status before retrying".into(),
+                            "unknown",
+                        ),
+                        stop,
+                    );
+                }
                 reported_unknown = true;
             }
             Ok(_) | Err(mpsc::TryRecvError::Disconnected) => return,
+            Err(mpsc::TryRecvError::Empty)
+                if stopping && Instant::now() >= shutdown_deadline.unwrap() =>
+            {
+                return
+            }
             Err(mpsc::TryRecvError::Empty) if !reported_unknown && Instant::now() >= deadline => {
                 let _ = write_json(
                     stream,
@@ -239,12 +254,21 @@ fn error_reply(error: String, outcome: &str) -> Value {
 }
 
 fn write_json(stream: &mut UnixStream, value: &Value, stop: &AtomicBool) -> io::Result<()> {
+    write_json_until(stream, value, Instant::now() + IO_TIMEOUT, Some(stop))
+}
+
+fn write_json_until(
+    stream: &mut UnixStream,
+    value: &Value,
+    deadline: Instant,
+    stop: Option<&AtomicBool>,
+) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
     if bytes.len() >= MAX_MESSAGE {
         bytes = serde_json::to_vec(&error_reply("reply exceeds 64 KiB".into(), "unknown")).unwrap();
     }
     bytes.push(b'\n');
-    write_all_until(stream, &bytes, Instant::now() + IO_TIMEOUT, Some(stop))
+    write_all_until(stream, &bytes, deadline, stop)
 }
 
 fn write_all_until(
@@ -567,6 +591,29 @@ mod tests {
             thread::sleep(POLL);
         }
         assert!(!path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ready_reply_is_flushed_when_server_stops_after_event_loop_ack() {
+        let (root, path) = test_runtime("quit-ack");
+        let (senders, replies) = mpsc::channel();
+        let server = start_server_at(path.clone(), move |_, tx| {
+            senders.send(tx).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.set_nonblocking(true).unwrap();
+        client.write_all(b"{}\n").unwrap();
+        let reply = replies.recv_timeout(Duration::from_secs(1)).unwrap();
+        reply
+            .send(json!({"version":1,"ok":true,"quit":"accepted"}))
+            .unwrap();
+        drop(server);
+        let ack =
+            read_line_until(&mut client, Instant::now() + Duration::from_secs(1), None).unwrap();
+        assert_eq!(ack["quit"], "accepted");
         let _ = fs::remove_dir_all(root);
     }
 
