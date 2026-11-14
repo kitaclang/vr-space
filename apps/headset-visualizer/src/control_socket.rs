@@ -3,7 +3,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     os::unix::{
-        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+        fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
@@ -18,7 +18,10 @@ use std::{
 
 const MAX_MESSAGE: usize = 64 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(not(test))]
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const DISPATCH_TIMEOUT: Duration = Duration::from_millis(80);
 const POLL: Duration = Duration::from_millis(5);
 const MAX_SUN_PATH: usize = 103;
 
@@ -84,21 +87,7 @@ fn start_server_at(
 ) -> anyhow::Result<Server> {
     check_path_length(&path)?;
     let dir = path.parent().unwrap();
-    if !dir.exists() {
-        fs::create_dir_all(dir)?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
-    let metadata = fs::symlink_metadata(dir)?;
-    if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != effective_uid()
-        || metadata.mode() & 0o777 != 0o700
-    {
-        anyhow::bail!(
-            "unsafe control runtime directory {} (must be an owned 0700 directory)",
-            dir.display()
-        );
-    }
+    prepare_runtime_dir(dir, true)?;
 
     let lock_path = dir.join("control.lock");
     let lock = OpenOptions::new()
@@ -119,14 +108,15 @@ fn start_server_at(
 
     clean_stale_socket(&path)?;
     let listener = UnixListener::bind(&path)?;
-    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-    let owned_meta = fs::symlink_metadata(&path)?;
+    let cleanup = SocketCleanup::new(path.clone())?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let thread = thread::Builder::new()
         .name("control-socket".into())
         .spawn(move || {
+            let _cleanup = cleanup;
             let _lock = lock;
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
@@ -139,9 +129,6 @@ fn start_server_at(
                     Err(_) => thread::sleep(POLL),
                 }
             }
-            if same_inode(&path, &owned_meta) {
-                let _ = fs::remove_file(&path);
-            }
         })?;
     Ok(Server {
         stop,
@@ -152,6 +139,8 @@ fn start_server_at(
 pub fn client(request: Value) -> Result<Value, ClientError> {
     let path = socket_path().map_err(|e| ClientError::known(e.to_string()))?;
     check_path_length(&path).map_err(|e| ClientError::known(e.to_string()))?;
+    prepare_runtime_dir(path.parent().unwrap(), false)
+        .map_err(|e| ClientError::known(e.to_string()))?;
     let mut stream = UnixStream::connect(path).map_err(|e| {
         ClientError::known(format!("cannot connect to vr-space control server: {e}"))
     })?;
@@ -206,19 +195,41 @@ fn serve_one(
         let _ = write_json(stream, &error_reply(e, "not_dispatched"), stop);
         return;
     }
-    match rx.recv_timeout(DISPATCH_TIMEOUT) {
-        Ok(reply) => {
-            let _ = write_json(stream, &reply, stop);
+    let deadline = Instant::now() + DISPATCH_TIMEOUT;
+    let mut reported_unknown = false;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return;
         }
-        Err(_) => {
-            let _ = write_json(
-                stream,
-                &error_reply(
-                    "command outcome unknown; check status before retrying".into(),
-                    "unknown",
-                ),
-                stop,
-            );
+        match rx.try_recv() {
+            Ok(reply) if !reported_unknown && Instant::now() < deadline => {
+                let _ = write_json(stream, &reply, stop);
+                return;
+            }
+            Ok(_) if !reported_unknown => {
+                let _ = write_json(
+                    stream,
+                    &error_reply(
+                        "command outcome unknown; check status before retrying".into(),
+                        "unknown",
+                    ),
+                    stop,
+                );
+                reported_unknown = true;
+            }
+            Ok(_) | Err(mpsc::TryRecvError::Disconnected) => return,
+            Err(mpsc::TryRecvError::Empty) if !reported_unknown && Instant::now() >= deadline => {
+                let _ = write_json(
+                    stream,
+                    &error_reply(
+                        "command outcome unknown; check status before retrying".into(),
+                        "unknown",
+                    ),
+                    stop,
+                );
+                reported_unknown = true;
+            }
+            Err(mpsc::TryRecvError::Empty) => thread::sleep(POLL),
         }
     }
 }
@@ -330,6 +341,62 @@ fn read_line_until(
 fn socket_path() -> anyhow::Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
     Ok(PathBuf::from(home).join("Library/Caches/vr-space/control.sock"))
+}
+
+fn prepare_runtime_dir(dir: &Path, create: bool) -> anyhow::Result<()> {
+    let caches = dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid control runtime path"))?;
+    let home = caches
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow::anyhow!("invalid control runtime path"))?;
+    for ancestor in [home, &home.join("Library"), caches] {
+        let meta = fs::symlink_metadata(ancestor)?;
+        if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != effective_uid() {
+            anyhow::bail!("unsafe control runtime ancestor {}", ancestor.display());
+        }
+    }
+    if create {
+        match fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let meta = fs::symlink_metadata(dir)?;
+    if !meta.is_dir()
+        || meta.file_type().is_symlink()
+        || meta.uid() != effective_uid()
+        || meta.mode() & 0o777 != 0o700
+    {
+        anyhow::bail!(
+            "unsafe control runtime directory {} (must be an owned 0700 directory)",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+struct SocketCleanup {
+    path: PathBuf,
+    metadata: fs::Metadata,
+}
+impl SocketCleanup {
+    fn new(path: PathBuf) -> anyhow::Result<Self> {
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_socket() || metadata.uid() != effective_uid() {
+            anyhow::bail!("refusing to own unexpected socket path {}", path.display());
+        }
+        Ok(Self { path, metadata })
+    }
+}
+impl Drop for SocketCleanup {
+    fn drop(&mut self) {
+        if same_inode(&self.path, &self.metadata) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 fn check_path_length(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::ffi::OsStrExt;
@@ -478,15 +545,7 @@ mod tests {
 
     #[test]
     fn exclusive_startup_and_stale_socket_recovery() {
-        let root = std::env::temp_dir().join(format!(
-            "vr-control-lock-{}-{}",
-            effective_uid(),
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        let path = root.join("control.sock");
+        let (root, path) = test_runtime("lock");
         let stale = UnixListener::bind(&path).unwrap();
         drop(stale);
         let handler = |_: Value, tx: SyncSender<Value>| {
@@ -509,5 +568,131 @@ mod tests {
         }
         assert!(!path.exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn partial_startup_cleanup_is_inode_guarded() {
+        let (root, path) = test_runtime("cleanup");
+        let listener = UnixListener::bind(&path).unwrap();
+        let cleanup = SocketCleanup::new(path.clone()).unwrap();
+        drop(listener);
+        drop(cleanup);
+        assert!(!path.exists());
+
+        let listener = UnixListener::bind(&path).unwrap();
+        let cleanup = SocketCleanup::new(path.clone()).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        drop(listener);
+        drop(cleanup);
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unsafe_runtime_paths_are_rejected_without_touching_socket() {
+        let (home, path) = test_runtime("unsafe");
+        fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(start_server_at(path.clone(), |_, _| Ok(())).is_err());
+        assert!(!path.exists());
+        fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir(path.parent().unwrap()).unwrap();
+        let target = home.join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&target, path.parent().unwrap()).unwrap();
+        assert!(start_server_at(path.clone(), |_, _| Ok(())).is_err());
+        fs::remove_file(path.parent().unwrap()).unwrap();
+        fs::create_dir(path.parent().unwrap()).unwrap();
+        fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&path, b"not a socket").unwrap();
+        assert!(start_server_at(path.clone(), |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"not a socket");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn timed_out_request_blocks_later_dispatch_until_sender_finishes() {
+        let (root, path) = test_runtime("bounded");
+        let (txs, rxs) = mpsc::channel();
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let count = dispatched.clone();
+        let server = start_server_at(path.clone(), move |_, tx| {
+            count.fetch_add(1, Ordering::SeqCst);
+            txs.send(tx).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let mut first = UnixStream::connect(&path).unwrap();
+        first.set_nonblocking(true).unwrap();
+        first.write_all(b"{}\n").unwrap();
+        assert_eq!(
+            read_line_until(&mut first, Instant::now() + Duration::from_secs(1), None).unwrap()
+                ["outcome"],
+            "unknown"
+        );
+        let first_reply = rxs.recv().unwrap();
+        let mut second = UnixStream::connect(&path).unwrap();
+        second.set_nonblocking(true).unwrap();
+        second.write_all(b"{}\n").unwrap();
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+        first_reply.send(json!({"late":true})).unwrap();
+        let second_reply = rxs.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(dispatched.load(Ordering::SeqCst), 2);
+        second_reply.send(json!({"ok":true})).unwrap();
+        drop(server);
+        drop((first, second));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disconnected_client_does_not_panic_when_reply_is_sent() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        client.write_all(b"{}\n").unwrap();
+        let (saved_tx, saved_rx) = mpsc::channel();
+        let task = thread::spawn(move || {
+            serve_one(&mut server, &AtomicBool::new(false), &move |_, tx| {
+                saved_tx.send(tx).unwrap();
+                Ok(())
+            });
+        });
+        let delayed = saved_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(client);
+        delayed.send(json!({"version":1,"ok":true})).unwrap();
+        task.join().unwrap();
+    }
+
+    #[test]
+    fn late_reply_is_reported_unknown_and_receiver_stays_live_until_completion() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        client.set_nonblocking(true).unwrap();
+        client.write_all(b"{}\n").unwrap();
+        let (saved_tx, saved_rx) = mpsc::channel();
+        let task = thread::spawn(move || {
+            serve_one(&mut server, &AtomicBool::new(false), &move |_, tx| {
+                saved_tx.send(tx).unwrap();
+                Ok(())
+            });
+        });
+        let reply =
+            read_line_until(&mut client, Instant::now() + Duration::from_secs(1), None).unwrap();
+        assert_eq!(reply["outcome"], "unknown");
+        let delayed = saved_rx.recv().unwrap();
+        assert!(!task.is_finished());
+        delayed.send(json!({"version":1,"ok":true})).unwrap();
+        task.join().unwrap();
+    }
+
+    fn test_runtime(name: &str) -> (PathBuf, PathBuf) {
+        let home = std::env::temp_dir().join(format!("vc{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join("Library/Caches")).unwrap();
+        let runtime = home.join("Library/Caches/vr-space");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        (home, runtime.join("control.sock"))
     }
 }
