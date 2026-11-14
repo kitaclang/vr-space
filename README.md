@@ -174,6 +174,68 @@ When the vr-space window has focus, plain keys work too:
 
 The HUD shows the current distance and height.
 
+### Live command-line controls
+
+Launch `~/Applications/vr-space.app` normally first (Finder, Spotlight, or `open ~/Applications/vr-space.app`). Its executable can then control the running app from separate terminal commands or scripts; a control invocation never launches a GUI or requires a terminal to stay open:
+
+```bash
+alias vr-space="$HOME/Applications/vr-space.app/Contents/MacOS/vr-space"
+vr-space control status --json
+vr-space control recenter
+vr-space control horizon on
+vr-space control screen bigger
+vr-space control screen curvature 0.5
+vr-space control hud on
+vr-space control prediction 10
+vr-space control copy-frames off
+```
+
+| `vr-space control …` | Effect |
+|---|---|
+| `status --json` | Read live state as formatted JSON (`status` alone prints compact JSON) |
+| `recenter` | Queue recentering when tracking is connected |
+| `horizon on\|off` | Set Keep horizon level; recenter to apply |
+| `screen bigger\|smaller\|further\|closer\|reset` | Apply the existing screen steps or reset |
+| `screen curvature <0..1>` | Set curvature immediately |
+| `roll left\|right` | Step roll trim by 0.1° |
+| `show-display <ID>` / `show-window <ID>` | Choose the primary source |
+| `second-display <ID>` / `second-window <ID>` / `second off` | Choose or disable the session-only second screen |
+| `fullscreen <ID>` / `fullscreen window` | Choose a fullscreen display or return to a window |
+| `hud on\|off` | Set HUD visibility (unavailable with startup `--no-hud`) |
+| `prediction <0..100\|on\|off\|toggle\|more\|less>` | Set prediction milliseconds, enable/disable it, toggle, or step by 5 ms |
+| `copy-frames on\|off` | Set frame copying (requires the switch to be available) |
+| `open-screen-settings` | Open Screen Recording settings |
+| `open-at-login on\|off` | Set native login registration (supported installed bundle only) |
+| `quit` | Request app shutdown |
+
+Use `vr-space --list-displays` and `vr-space --list-windows` to discover source IDs. `vr-space control --help` lists the live controls. Startup flags still configure a new app; they do not change an existing instance. Control, discovery, help, version and icon-generation invocations do not open or truncate the GUI log, even with stderr redirected.
+
+Commands are handled on the app's event-loop thread before it replies. Recenter acknowledges a request queued for the next connected render, not completed calibration. Starting a capture does not prove a frame has arrived; inspect status. Opening Screen Recording settings cannot grant permission. Quit acknowledges the request before shutdown, not that the process has already exited.
+
+Live changes use the same settings and menu updates as keyboard/menu controls. The second source and frame copying remain session-only, and `--ignore-settings` on the running app disables loading and saving as usual. Open at Login is managed by macOS, not the JSON settings file. Do not edit settings behind a running app. Pending login approval is not the same as enabled: finish approval in **System Settings > General > Login Items**; repeating an explicit on request does not unregister it.
+
+If a request times out or disconnects after dispatch, its **outcome is unknown**: it might still execute or already have executed. There are no automatic retries or exactly-once guarantees. Inspect status and prefer explicit setters; do not blindly retry steps, toggles or recentering.
+
+The socket protocol uses a versioned envelope: `{"version":1,"ok":true,"result":…}` or `{"version":1,"ok":false,"error":"…"}`. The CLI prints the result without that envelope; `status --json` exposes these live fields:
+
+| Field | Meaning |
+|---|---|
+| `source`, `second_source` | `{kind: "display"\|"window", id: number}`; absent second source is `null` |
+| `fullscreen` | `display` currently filled, and `pending_display` requested for when connected; either may be `null` |
+| `screen` | Actual `distance`, `height`, `curvature` |
+| `hud` | `available` and `enabled` |
+| `horizon` | Requested `enabled` and `awaiting_recenter` |
+| `roll_trim_degrees` | Current signed trim |
+| `prediction` | `enabled` and `lead_ms` |
+| `frame_copying` | Switch `available` and copying `enabled`; unavailable is not the same as off |
+| `tracking` | `connected` |
+| `capture` | `primary` and nullable `second`: `starting`, `no_permission`, `failed`, `waiting_for_frames`, or `capturing` |
+| `open_at_login` | `unavailable`, `not_registered`, `enabled`, `requires_approval`, or `not_found` |
+
+Exit codes: **0** means handled successfully, **1** means a known error or unavailable action, **2** means invalid CLI syntax, and **3** means an unknown outcome after dispatch. Errors include actionable stderr. Transport failures may include an `outcome` field (`not_dispatched` or `unknown`).
+
+The server uses a local per-user Unix socket, not TCP. The private runtime directory and exclusive lock prevent other users and competing app instances from taking over its socket; another app instance remains usable but logs that CLI control is unavailable for that instance. Any process running as your user can issue commands: filesystem permissions do not defend against malicious processes under the same account. No server means a clear client error, never an automatic app launch.
+
 ### Saved settings
 
 vr-space remembers what you change while it runs and starts that way next time:
