@@ -600,7 +600,13 @@ fn start_stream_at(index: usize, source: CaptureSource, show_cursor: bool) -> an
     if slot.running.load(Ordering::SeqCst) {
         return Ok(());
     }
-    let result = start_stream_inner(index, source, show_cursor);
+    let prepared = prepare_stream(source, show_cursor);
+    start_prepared_at(index, prepared)
+}
+
+fn start_prepared_at(index: usize, prepared: anyhow::Result<PreparedStream>) -> anyhow::Result<()> {
+    let slot = &CAPTURES[index];
+    let result = prepared.and_then(|prepared| start_stream_inner(index, prepared));
     let status = match &result {
         Ok(()) => STATUS_RUNNING,
         Err(_) if !has_screen_recording_permission() => STATUS_NO_PERMISSION,
@@ -610,8 +616,13 @@ fn start_stream_at(index: usize, source: CaptureSource, show_cursor: bool) -> an
     result
 }
 
-fn start_stream_inner(index: usize, source: CaptureSource, show_cursor: bool) -> anyhow::Result<()> {
-    let slot = &CAPTURES[index];
+struct PreparedStream {
+    filter: SCContentFilter,
+    config: SCStreamConfiguration,
+    watched_window: Option<(u32, u64)>,
+}
+
+fn prepare_stream(source: CaptureSource, show_cursor: bool) -> anyhow::Result<PreparedStream> {
     // Check Screen Recording permission first. If it's missing, ask macOS to show its prompt
     // (it only does so once per app; after that the user has to use System Settings).
     if !has_screen_recording_permission() {
@@ -626,7 +637,7 @@ fn start_stream_inner(index: usize, source: CaptureSource, show_cursor: bool) ->
 
     // Capture at the native pixel size. Without an explicit size ScreenCaptureKit picks its
     // own default, which does not match the display or window.
-    let (filter, (px_w, px_h)) = match source {
+    let (filter, (px_w, px_h), watched_window) = match source {
         CaptureSource::Display(display_id) => {
             let display = find_display(display_id).map_err(|e| {
                 warn!("ShareableContent/Display failed: {e}");
@@ -634,7 +645,7 @@ fn start_stream_inner(index: usize, source: CaptureSource, show_cursor: bool) ->
             })?;
             let size = display_pixel_size(&display);
             info!("Capturing display {} at {}x{} px", display.display_id(), size.0, size.1);
-            (SCContentFilter::new().with_display_excluding_windows(&display, &[]), size)
+            (SCContentFilter::new().with_display_excluding_windows(&display, &[]), size, None)
         }
         CaptureSource::Window(window_id) => {
             let content = shareable_content()?;
@@ -647,10 +658,8 @@ fn start_stream_inner(index: usize, source: CaptureSource, show_cursor: bool) ->
                 ))?;
             let size = window_pixel_size(&window, &content.displays());
             info!("Capturing window {window_id} at {}x{} px", size.0, size.1);
-            slot.watched_size.store(pack_size(size.0, size.1), Ordering::Release);
-            slot.watched_window.store(window_id, Ordering::Release);
             // Follows the window across displays and Spaces, and only shows that window.
-            (SCContentFilter::new().with_desktop_independent_window(&window), size)
+            (SCContentFilter::new().with_desktop_independent_window(&window), size, Some((window_id, pack_size(size.0, size.1))))
         }
     };
 
@@ -670,12 +679,21 @@ fn start_stream_inner(index: usize, source: CaptureSource, show_cursor: bool) ->
         .set_queue_depth(QUEUE_DEPTH)
         .map_err(|_| anyhow::anyhow!("set_queue_depth failed"))?;
 
-    let mut stream = SCStream::new(&filter, &cfg);
+    Ok(PreparedStream { filter, config: cfg, watched_window })
+}
+
+fn start_stream_inner(index: usize, prepared: PreparedStream) -> anyhow::Result<()> {
+    let slot = &CAPTURES[index];
+    let mut stream = SCStream::new(&prepared.filter, &prepared.config);
     let _handler_id = stream.add_output_handler(ScreenOutput { index, generation: slot.generation.load(Ordering::Acquire) }, SCStreamOutputType::Screen);
 
     stream.start_capture()
         .map_err(|e| anyhow::anyhow!("start_capture failed: {e:?}"))?;
 
+    if let Some((window_id, size)) = prepared.watched_window {
+        slot.watched_size.store(size, Ordering::Release);
+        slot.watched_window.store(window_id, Ordering::Release);
+    }
     slot.running.store(true, Ordering::SeqCst);
     // store stream to keep it alive
     slot.stream.get_or_init(|| Mutex::new(None))
@@ -690,9 +708,24 @@ fn start_stream_inner(index: usize, source: CaptureSource, show_cursor: bool) ->
 /// the current stream and start a new one. Blocks briefly while ScreenCaptureKit lists the
 /// displays and windows, so don't call it per frame.
 pub fn switch_source(index: usize, source: CaptureSource, show_cursor: bool) -> anyhow::Result<()> {
-    stop_stream_at(index);
-    CAPTURES[index].status.store(STATUS_STARTING, Ordering::Release);
-    start_stream_at(index, source, show_cursor)
+    switch_after_prepare(
+        prepare_stream(source, show_cursor),
+        || {
+            stop_stream_at(index);
+            CAPTURES[index].status.store(STATUS_STARTING, Ordering::Release);
+        },
+        |prepared| start_prepared_at(index, Ok(prepared)),
+    )
+}
+
+fn switch_after_prepare<T>(
+    prepared: anyhow::Result<T>,
+    stop: impl FnOnce(),
+    start: impl FnOnce(T) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let prepared = prepared?;
+    stop();
+    start(prepared)
 }
 
 /// Turn a display ID from the command line into a real one (0 means the main display).
@@ -746,6 +779,18 @@ mod tests {
 
     fn window(id: u32, app: &str, title: &str) -> WindowInfo {
         WindowInfo { id, app: app.into(), title: title.into(), width: 800, height: 600 }
+    }
+
+    #[test]
+    fn failed_preparation_does_not_stop_current_capture() {
+        let mut stopped = false;
+        let result = switch_after_prepare::<()>(
+            Err(anyhow::anyhow!("invalid capture source")),
+            || stopped = true,
+            |_| Ok(()),
+        );
+        assert!(result.is_err());
+        assert!(!stopped);
     }
 
     #[test]
