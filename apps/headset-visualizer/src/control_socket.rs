@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::os::fd::AsRawFd;
 use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
@@ -142,6 +143,7 @@ pub fn client(request: Value) -> Result<Value, ClientError> {
     check_path_length(&path).map_err(|e| ClientError::known(e.to_string()))?;
     prepare_runtime_dir(path.parent().unwrap(), false)
         .map_err(|e| ClientError::known(e.to_string()))?;
+    verify_socket(&path).map_err(|e| ClientError::known(e.to_string()))?;
     let mut stream = UnixStream::connect(path).map_err(|e| {
         ClientError::known(format!("cannot connect to vr-space control server: {e}"))
     })?;
@@ -206,12 +208,7 @@ fn serve_one(
         }
         match rx.try_recv() {
             Ok(reply) if !reported_unknown && Instant::now() < deadline => {
-                let write_deadline = if stopping {
-                    shutdown_deadline.unwrap()
-                } else {
-                    Instant::now() + IO_TIMEOUT
-                };
-                let _ = write_json_until(stream, &reply, write_deadline, None);
+                let _ = write_ready_reply(stream, &reply, stop);
                 return;
             }
             Ok(_) if !reported_unknown => {
@@ -269,6 +266,42 @@ fn write_json_until(
     }
     bytes.push(b'\n');
     write_all_until(stream, &bytes, deadline, stop)
+}
+
+fn write_ready_reply(stream: &mut UnixStream, value: &Value, stop: &AtomicBool) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
+    if bytes.len() >= MAX_MESSAGE {
+        bytes = serde_json::to_vec(&error_reply("reply exceeds 64 KiB".into(), "unknown")).unwrap();
+    }
+    bytes.push(b'\n');
+    let deadline = Instant::now() + IO_TIMEOUT;
+    let mut shutdown_deadline = None;
+    let mut written = 0;
+    while written < bytes.len() {
+        if stop.load(Ordering::Acquire) {
+            shutdown_deadline.get_or_insert_with(|| Instant::now() + SHUTDOWN_REPLY_GRACE);
+        }
+        if shutdown_deadline.is_some_and(|d| Instant::now() >= d)
+            || (shutdown_deadline.is_none() && Instant::now() >= deadline)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "reply write timed out",
+            ));
+        }
+        match stream.write(&bytes[written..]) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "socket closed")),
+            Ok(n) => written += n,
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::Interrupted =>
+            {
+                thread::sleep(POLL)
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 fn write_all_until(
@@ -436,6 +469,20 @@ fn check_path_length(path: &Path) -> anyhow::Result<()> {
 fn effective_uid() -> u32 {
     unsafe { geteuid() }
 }
+fn verify_socket(path: &Path) -> anyhow::Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.file_type().is_socket()
+        || meta.uid() != effective_uid()
+        || meta.mode() & 0o777 != 0o600
+    {
+        anyhow::bail!(
+            "unsafe control socket {} (must be an owned 0600 socket)",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 fn same_inode(path: &Path, original: &fs::Metadata) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| {
         m.dev() == original.dev() && m.ino() == original.ino() && m.file_type().is_socket()
@@ -471,7 +518,6 @@ fn clean_stale_socket(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-use std::os::fd::AsRawFd;
 const LOCK_EX: i32 = 2;
 const LOCK_NB: i32 = 4;
 unsafe extern "C" {
@@ -595,6 +641,43 @@ mod tests {
     }
 
     #[test]
+    fn start_server_at_accepts_and_replies_to_a_real_request() {
+        let (root, path) = test_runtime("request-reply");
+        let server = start_server_at(path.clone(), |request, tx| {
+            tx.send(json!({"version":1,"ok":true,"echo":request["value"]}))
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .unwrap();
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.set_nonblocking(true).unwrap();
+        client.write_all(b"{\"value\":42}\n").unwrap();
+        let reply =
+            read_line_until(&mut client, Instant::now() + Duration::from_secs(1), None).unwrap();
+        assert_eq!(reply["echo"], 42);
+        drop(server);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn client_socket_validation_rejects_wrong_types_owner_mode_and_symlinks() {
+        let (root, path) = test_runtime("socket-check");
+        fs::write(&path, b"file").unwrap();
+        assert!(verify_socket(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        verify_socket(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(verify_socket(&path).is_err());
+        let alias = path.parent().unwrap().join("alias.sock");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert!(verify_socket(&alias).is_err());
+        drop(listener);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn ready_reply_is_flushed_when_server_stops_after_event_loop_ack() {
         let (root, path) = test_runtime("quit-ack");
         let (senders, replies) = mpsc::channel();
@@ -615,6 +698,26 @@ mod tests {
             read_line_until(&mut client, Instant::now() + Duration::from_secs(1), None).unwrap();
         assert_eq!(ack["quit"], "accepted");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stalled_reply_write_observes_shutdown_grace() {
+        let (mut writer, _reader) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer_stop = stop.clone();
+        let task = thread::spawn(move || {
+            write_ready_reply(
+                &mut writer,
+                &json!({"data":"x".repeat(MAX_MESSAGE - 128)}),
+                &writer_stop,
+            )
+        });
+        thread::sleep(Duration::from_millis(30));
+        let started = Instant::now();
+        stop.store(true, Ordering::Release);
+        assert!(task.join().unwrap().is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
@@ -734,7 +837,7 @@ mod tests {
     }
 
     fn test_runtime(name: &str) -> (PathBuf, PathBuf) {
-        let home = std::env::temp_dir().join(format!("vc{}-{name}", std::process::id()));
+        let home = PathBuf::from(format!("/tmp/vc{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(home.join("Library/Caches")).unwrap();
         let runtime = home.join("Library/Caches/vr-space");
