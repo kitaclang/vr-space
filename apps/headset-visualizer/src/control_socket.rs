@@ -141,12 +141,12 @@ fn start_server_at(
 pub fn client(request: Value) -> Result<Value, ClientError> {
     let path = socket_path().map_err(|e| ClientError::known(e.to_string()))?;
     check_path_length(&path).map_err(|e| ClientError::known(e.to_string()))?;
-    prepare_runtime_dir(path.parent().unwrap(), false)
-        .map_err(|e| ClientError::known(e.to_string()))?;
-    verify_socket(&path).map_err(|e| ClientError::known(e.to_string()))?;
-    let mut stream = UnixStream::connect(path).map_err(|e| {
-        ClientError::known(format!("cannot connect to vr-space control server: {e}"))
-    })?;
+    let unavailable = |e| ClientError::known(format!(
+        "cannot reach vr-space control server: {e}. Launch vr-space first; this command does not start it."
+    ));
+    prepare_runtime_dir(path.parent().unwrap(), false).map_err(&unavailable)?;
+    verify_socket(&path).map_err(&unavailable)?;
+    let mut stream = UnixStream::connect(path).map_err(|e| unavailable(e.into()))?;
     stream
         .set_nonblocking(true)
         .map_err(|e| ClientError::known(e.to_string()))?;
