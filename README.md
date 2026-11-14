@@ -208,7 +208,7 @@ vr-space control copy-frames off
 | `open-at-login on\|off` | Set native login registration (supported installed bundle only) |
 | `quit` | Request app shutdown |
 
-Use `vr-space --list-displays` and `vr-space --list-windows` to discover source IDs. `vr-space control --help` lists the live controls. Startup flags still configure a new app; they do not change an existing instance. Control, discovery, help, version and icon-generation invocations do not open or truncate the GUI log, even with stderr redirected.
+Use `vr-space --list-displays` and `vr-space --list-windows` to discover source IDs. Live fullscreen requests require a connected display; a saved startup fullscreen target can remain pending until that display connects. `vr-space control --help` lists the live controls. Startup flags still configure a new app; they do not change an existing instance. Control, discovery, help, version and icon-generation invocations do not open or truncate the GUI log, even with stderr redirected.
 
 Commands are handled on the app's event-loop thread before it replies. Recenter acknowledges a request queued for the next connected render, not completed calibration. Starting a capture does not prove a frame has arrived; inspect status. Opening Screen Recording settings cannot grant permission. Quit acknowledges the request before shutdown, not that the process has already exited.
 
@@ -229,7 +229,7 @@ The socket protocol uses a versioned envelope: `{"version":1,"ok":true,"result":
 | `prediction` | `enabled` and `lead_ms` |
 | `frame_copying` | Switch `available` and copying `enabled`; unavailable is not the same as off |
 | `tracking` | `connected` |
-| `capture` | `primary` and nullable `second`: `starting`, `no_permission`, `failed`, `waiting_for_frames`, or `capturing` |
+| `capture` | `primary` and nullable `second`: `starting`, `no_permission`, `failed`, `waiting_for_frames`, or `capturing`; `primary_source_active` distinguishes an active stream from a failed source switch |
 | `open_at_login` | `unavailable`, `not_registered`, `enabled`, `requires_approval`, or `not_found` |
 
 Exit codes: **0** means handled successfully, **1** means a known error or unavailable action, **2** means invalid CLI syntax, and **3** means an unknown outcome after dispatch. Errors include actionable stderr. Transport failures may include an `outcome` field (`not_dispatched` or `unknown`).
