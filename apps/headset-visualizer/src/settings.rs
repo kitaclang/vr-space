@@ -28,6 +28,9 @@ pub struct Settings {
     /// Height of the virtual screen, in scene units.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screen_height: Option<f32>,
+    /// Screen curvature, from flat (0) to wrapped around the eye (1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub curve: Option<f32>,
     /// The display shown on the virtual screen (or gone back to if the window closes).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display: Option<u32>,
@@ -58,6 +61,7 @@ impl Settings {
         let positive = |v: Option<f32>| v.filter(|x| x.is_finite() && *x > 0.0);
         s.screen_distance = positive(s.screen_distance);
         s.screen_height = positive(s.screen_height);
+        s.curve = s.curve.filter(|x| (0.0..=1.0).contains(x));
         s.predict_ms = s.predict_ms.filter(|x| (0.0..=100.0).contains(x));
         s.roll_trim_tenths = s.roll_trim_tenths.filter(|x| (-450..=450).contains(x));
         if s.window.as_ref().is_some_and(|w| w.app.is_empty()) {
@@ -145,6 +149,7 @@ mod tests {
     fn round_trips_and_leaves_out_unset_values() {
         let s = Settings {
             screen_distance: Some(3.0),
+            curve: Some(0.5),
             window: Some(SavedWindow { app: "Safari".into(), title: "Docs".into() }),
             fullscreen: Some(2),
             recenter_yaw_only: Some(true),
@@ -165,6 +170,14 @@ mod tests {
         .unwrap();
         assert_eq!(s, Settings { hud: Some(false), ..Settings::default() });
         assert!(Settings::from_json("not json").is_err());
+        for curve in [0.0, 0.5, 1.0] {
+            let json = format!(r#"{{"curve": {curve}}}"#);
+            assert_eq!(Settings::from_json(&json).unwrap().curve, Some(curve));
+        }
+        for curve in [-0.1, 1.1] {
+            let json = format!(r#"{{"curve": {curve}}}"#);
+            assert_eq!(Settings::from_json(&json).unwrap().curve, None);
+        }
         assert_eq!(Settings::from_json(r#"{"predict_ms": -1}"#).unwrap().predict_ms, None);
         assert_eq!(Settings::from_json(r#"{"predict_ms": 15}"#).unwrap().predict_ms, Some(15.0));
         assert_eq!(Settings::from_json(r#"{"roll_trim_tenths": 451}"#).unwrap().roll_trim_tenths, None);

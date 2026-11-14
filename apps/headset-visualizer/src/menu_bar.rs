@@ -50,6 +50,13 @@ const LATENCY_SHORTCUTS: [(Code, Command, &str, &str); 4] = [
     (Code::KeyZ, Command::ToggleFrameCopying, "copy", "Copy frames through the CPU (slower)"),
 ];
 
+/// Fixed presets; arbitrary --curve values remain supported (none of these is checked).
+const CURVES: [(f32, &str, &str); 3] = [
+    (0.0, "curve:flat", "Flat (0)"),
+    (0.5, "curve:gentle", "Gentle (0.5)"),
+    (1.0, "curve:full", "Full (1)"),
+];
+
 pub struct MenuBar {
     _tray: TrayIcon,
     _app_menu: Menu,
@@ -59,6 +66,7 @@ pub struct MenuBar {
     fullscreen_menu: Submenu,
     hud_item: CheckMenuItem,
     horizon_item: CheckMenuItem,
+    curve_items: [CheckMenuItem; 3],
     predict_item: CheckMenuItem,
     copy_item: CheckMenuItem,
     login_item: Option<CheckMenuItem>,
@@ -89,6 +97,13 @@ impl MenuBar {
             let accel = Accelerator::new(shortcut_mods(), *code);
             screen_menu.append(&MenuItem::with_id(*id, *label, true, Some(accel)))?;
         }
+
+        let curve_menu = Submenu::new("Screen curvature", true);
+        let curve_items = CURVES.map(|(_, id, label)| CheckMenuItem::with_id(id, label, true, false, None));
+        for item in &curve_items {
+            curve_menu.append(item)?;
+        }
+        screen_menu.append(&curve_menu)?;
 
         let display_menu = Submenu::new("Show display", true);
         let window_menu = Submenu::new("Show window", true);
@@ -198,6 +213,7 @@ impl MenuBar {
             fullscreen_menu,
             hud_item,
             horizon_item,
+            curve_items,
             predict_item,
             copy_item,
             login_item,
@@ -260,6 +276,12 @@ impl MenuBar {
         if self.windows.len() > MAX_WINDOWS {
             let more = format!("{} more (use --list-windows)", self.windows.len() - MAX_WINDOWS);
             let _ = menu.append(&MenuItem::new(more, false, None));
+        }
+    }
+
+    pub fn set_curve(&mut self, curve: f32) {
+        for (item, (value, _, _)) in self.curve_items.iter().zip(CURVES) {
+            item.set_checked(curve == value);
         }
     }
 
@@ -351,6 +373,9 @@ fn command_for_menu_id(id: &str) -> Option<Command> {
     if let Some(&(_, cmd, _, _)) = SHORTCUTS.iter().chain(&LATENCY_SHORTCUTS).find(|(_, _, item, _)| *item == id) {
         return Some(cmd);
     }
+    if let Some(&(curve, _, _)) = CURVES.iter().find(|(_, item, _)| *item == id) {
+        return Some(Command::SetCurve(curve));
+    }
     match id {
         "hud" => Some(Command::ToggleHud),
         "horizon" => Some(Command::ToggleHorizon),
@@ -423,6 +448,10 @@ mod tests {
 
     #[test]
     fn menu_ids_map_to_commands() {
+        for (curve, id, _) in CURVES {
+            assert_eq!(command_for_menu_id(id), Some(Command::SetCurve(curve)));
+        }
+        assert_eq!(command_for_menu_id("curve:unknown"), None);
         assert_eq!(command_for_menu_id("quit"), Some(Command::Quit));
         assert_eq!(command_for_menu_id("horizon"), Some(Command::ToggleHorizon));
         assert_eq!(command_for_menu_id("window:123"), Some(Command::ShowWindow(123)));

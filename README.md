@@ -120,6 +120,8 @@ The glasses only track rotation (3DoF), not position, so leaning or moving in yo
 
 vr-space is a regular Mac app with a Dock icon and Command–Tab support. Its **Controls** menu and menu bar glasses icon share the controls: recenter, move and resize the screen, choose which display or window to show and which display to go fullscreen on (the glasses), show or hide the HUD, the latency switches (head-pose prediction and frame copying, under **Latency**), open Screen Recording settings, open at login (when run as vr-space.app), and quit. The display lists update when you plug in or remove a display, and the window list updates as windows open and close.
 
+**Controls > Screen > Screen curvature** offers **Flat (0)**, **Gentle (0.5)** and **Full (1)**. Changes apply immediately and are saved between runs; choose whichever feels most comfortable. `--curve` overrides the saved value at startup.
+
 **Keep horizon level** switches to yaw-only recentering. After turning it on, recenter with your head upright to set the level; later recenters only change heading. Recenter upright again after reconnecting. Switching the mode takes effect on the next recenter. The roll trim controls under **Screen** adjust the visible view; trim may need readjustment after reconnecting.
 
 These shortcuts work from any app, so you can adjust the screen while you work:
@@ -161,6 +163,7 @@ The HUD shows the current distance and height.
 vr-space remembers what you change while it runs and starts that way next time:
 
 - the screen distance and size (the arrow and `+`/`-` keys or shortcuts)
+- screen curvature
 - the display or window shown on the virtual screen
 - the display it's fullscreen on (the glasses), or that it's a window
 - whether the HUD is shown
@@ -192,7 +195,7 @@ Options:
 | `--fullscreen <id>` | off | Open fullscreen on this display (the glasses); 0 = main display |
 | `--neck-model <n>` | 1 | Neck model strength (0 = off, 1 = average head, up to 3) |
 | `--no-cursor` | off | Hide the mouse cursor on the virtual screen |
-| `--curve <0..1>` | 0 (flat) | Curve the virtual screen around you; 1 puts every part of it the same distance from your eyes, like a curved monitor wrapped around your head |
+| `--curve <0..1>` | 0 (flat) | Curve the virtual screen around you (overrides saved curvature); 1 puts every part of it the same distance from your eyes, like a curved monitor wrapped around your head |
 | `--predict-ms <ms>` | 0 (off) | Predict head movement this far ahead of when a frame is drawn, so the screen doesn't trail behind when you turn your head (up to 100; try 10 to 30). See [Latency](#latency) |
 | `--copy-frames` | off | Copy each captured frame through the CPU instead of letting the GPU read it in place (slower; for comparison, or if the screen looks wrong). The HUD shows `frames=shared` or `frames=copied` |
 | `--recenter-yaw-only` | off | Enable Keep horizon level, overriding the saved setting; first recenter upright to set level, and again after reconnecting |

@@ -41,13 +41,17 @@ If shared frames tear or flicker, the renderer is letting go of frames too early
 
 ## 3. Latency figures
 
-- [ ] With the glasses connected, the HUD's `pose->submit` line shows numbers (it's blank without glasses). Note them:
+- [x] With the glasses connected, the HUD's `pose->submit` line shows numbers (it's blank without glasses). User-provided screenshot on 2026-11-14 shows prediction off, shared frames and the figures below. The user confirmed the glasses are set to 120 Hz in macOS Display settings; render FPS alone does not establish it.
 
 | pose->submit mean / p95 / max (ms) | fps | Refresh rate of the glasses (Hz) |
 |---|---|---|
-| | | |
+| 0.83 / 1.37 / 1.62 | 120.0 | 120 |
+
+The same screenshot shows capture→submit mean / p95 / max of 4.38 / 7.79 / 31.38 ms and frame upload of 0.02 / 0.03 / 0.04 ms. These stop at GPU submission, not display illumination.
 
 ## 4. Head-pose prediction
+
+Further tuning deferred by the user on 2026-11-14; keep prediction off. The unchecked prediction-specific checks below remain unverified, not required for this testing session.
 
 Observed during testing: with the head held still, the screen slowly slides to the right in both shared and copied frame modes. It also drifts with prediction off, and the rightward slide returns after recentering. With the glasses resting untouched on a stable surface, two HUD observations showed raw fusion yaw changing from −0.731 to −0.741 rad (~0.57°), while pitch stayed at 0.253 rad and roll changed from −0.021 to −0.022 rad; prediction was off. This confirms drift in the reported tracking orientation, before rendering/prediction; the underlying cause still needs investigation.
 
@@ -76,9 +80,13 @@ If a still screen shimmers at the amount that's right for turning, the smoothing
 
 ## 5. Curved screen
 
-- [ ] Start with `--curve 1` (and again with `--curve 0.5`): the screen bends around you, and text near its left and right edges is easier to read than on the flat screen at the same size. Installed app at `--curve 1`: after being asked to inspect edge readability and seams, the user reported “everything looks great.” `0.5` comparison and explicit readability preference remain to check.
-- [ ] Turn your head along the screen: no visible seams or kinks where its 48 columns meet.
-- [ ] Recentering, moving the screen closer and further, and making it bigger and smaller still work with the curve. At `--curve 1`, user confirmed making the screen bigger/smaller and moving it closer/farther through Controls keeps it looking correct; explicit recenter verification remains to check.
+- [x] In **Controls > Screen > Screen curvature**, switch between Flat, Gentle and Full: the user confirmed immediate screen changes and correct checkmarks in the installed app. The user also confirmed Gentle is checked in the glasses menu after restart.
+- [x] Restart without `--curve`: the user confirmed Gentle remains selected and the screen stays curved after quitting and reopening normally.
+- [x] Start with `--curve 0`: the user confirmed the installed app opens flat with Flat checked, overriding the saved Gentle choice for that launch.
+
+- [x] Check curved-screen rendering and edge readability at `--curve 1` and `--curve 0.5`. Installed app at `--curve 1`: after being asked to inspect edge readability and seams, the user reported “everything looks great.” On 2026-11-14, at `--curve 0.5` with prediction off and log-confirmed gyro calibration, the user confirmed readable edge text and a normal-looking screen. Curve amount versus flat is a personal preference, not a pass/fail requirement.
+- [x] Turn your head along the screen: no visible seams or kinks where its 48 columns meet. User confirmed at `--curve 0.5` on 2026-11-14; earlier `--curve 1` inspection was also reported as looking great.
+- [x] Recentering, moving the screen closer and further, and making it bigger and smaller still work with the curve. At `--curve 1`, user confirmed making the screen bigger/smaller and moving it closer/farther through Controls keeps it looking correct. On 2026-11-14, user explicitly confirmed recentering looks correct at `--curve 0.5`.
 
 | Curve that feels best | Edges easier to read? | Seams visible? |
 |---|---|---|
@@ -99,7 +107,7 @@ The build wrapper applies the required driver patch automatically; see [patches/
 - [x] Application menus and Controls appear; Command–Tab switches to the app; **Window > Minimize**, then clicking its Dock icon restores the window (release binary). Command–Tab switching, **Window > Minimize** followed by Dock restoration, and visibility of screen and latency controls in **Controls** also passed in the installed bundle.
 - [x] Installed `~/Applications/vr-space.app` launches through Launch Services, captures frames after granting its own Screen Recording permission, and completes stationary gyro calibration. User confirmed the virtual screen looks normal after wearing and recentering.
 
-- [ ] Install with `scripts/bundle-macos.sh --install`, choose **Open at Login** in the menu, log out and back in: vr-space starts and appears in the menu bar.
+- [x] Install with `scripts/bundle-macos.sh --install`, choose **Open at Login** in the menu, log out and back in: vr-space starts and appears in the menu bar. The user confirmed Open at Login works after the guided logout/login test.
 
 ## Afterwards
 

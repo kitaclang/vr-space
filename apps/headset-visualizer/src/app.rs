@@ -340,6 +340,7 @@ impl App {
             Ok(mut bar) => {
                 bar.set_latency(self.predict_lead.ms, !self.gpu.zero_copy, self.gpu.zero_copy_available);
                 bar.set_horizon(self.cli.recenter_yaw_only);
+                bar.set_curve(self.gpu.scene.curve);
                 self.menu_bar = Some(bar);
             }
             Err(e) => warn!("Menu bar icon unavailable: {e}"),
@@ -604,6 +605,10 @@ impl App {
             Command::Bigger => gpu.scene.screen.scale_height(SCREEN_STEP),
             Command::Smaller => gpu.scene.screen.scale_height(1.0 / SCREEN_STEP),
             Command::ResetScreen => gpu.scene.screen = ScreenPlacement::from_cli(&self.cli),
+            Command::SetCurve(curve) => {
+                gpu.scene.curve = curve;
+                gpu.scene.write_quad(&gpu.queue);
+            }
             Command::ToggleFullscreen => {
                 // Fullscreen on whichever display the window is on, or back to a window.
                 let target =
@@ -700,6 +705,7 @@ impl App {
                 self.pending_fullscreen = None;
                 settings.fullscreen = self.fullscreen_on;
             }
+            Command::SetCurve(_) => settings.curve = Some(self.gpu.scene.curve),
             Command::ToggleHud => settings.hud = Some(self.gpu.hud_enabled),
             Command::ToggleHorizon => settings.recenter_yaw_only = Some(self.cli.recenter_yaw_only),
             Command::RollLeft | Command::RollRight => settings.roll_trim_tenths = Some(self.roll_trim_tenths),
@@ -724,6 +730,7 @@ impl App {
         if let Some(bar) = self.menu_bar.as_mut() {
             bar.set_state(self.capture.shown, self.fullscreen_on, self.gpu.hud_enabled);
             bar.set_horizon(self.cli.recenter_yaw_only);
+            bar.set_curve(self.gpu.scene.curve);
             bar.set_latency(self.predict_lead.ms, !self.gpu.zero_copy, self.gpu.zero_copy_available);
         }
     }

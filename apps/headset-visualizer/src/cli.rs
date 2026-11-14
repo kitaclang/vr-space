@@ -135,6 +135,7 @@ pub struct ExplicitFlags {
     pub source: bool,
     pub fullscreen: bool,
     pub predict_ms: bool,
+    pub curve: bool,
 }
 
 impl ExplicitFlags {
@@ -146,6 +147,7 @@ impl ExplicitFlags {
             source: given("display") || given("window"),
             fullscreen: given("fullscreen"),
             predict_ms: given("predict_ms"),
+            curve: given("curve"),
         }
     }
 }
@@ -170,6 +172,7 @@ pub struct StartupPlan {
     pub fullscreen: Option<u32>,
     pub hud: bool,
     pub predict_ms: f32,
+    pub curve: f32,
     pub recenter_yaw_only: bool,
 }
 
@@ -191,6 +194,7 @@ impl StartupPlan {
             fullscreen: if explicit.fullscreen { cli.fullscreen } else { saved.fullscreen },
             hud: !cli.no_hud && saved.hud.unwrap_or(true),
             predict_ms: pick(explicit.predict_ms, cli.predict_ms, saved.predict_ms),
+            curve: pick(explicit.curve, cli.curve, saved.curve),
             recenter_yaw_only: !cli.no_recenter_yaw_only && (cli.recenter_yaw_only || saved.recenter_yaw_only.unwrap_or(false)),
         }
     }
@@ -256,6 +260,7 @@ mod tests {
             fullscreen: Some(9),
             hud: Some(false),
             predict_ms: Some(25.0),
+            curve: Some(0.5),
             recenter_yaw_only: Some(true),
             roll_trim_tenths: Some(6),
         }
@@ -270,6 +275,7 @@ mod tests {
         assert_eq!(p.fullscreen, Some(9));
         assert!(!p.hud);
         assert_eq!(p.predict_ms, 25.0);
+        assert_eq!(p.curve, 0.5);
         assert!(p.recenter_yaw_only);
 
         // Nothing saved: the defaults.
@@ -278,6 +284,7 @@ mod tests {
         assert_eq!((p.display, p.window, p.fullscreen, p.hud), (0, None, None, true));
         assert_eq!(p.predict_ms, 0.0, "prediction is off by default");
         assert!(!p.recenter_yaw_only);
+        assert_eq!(p.curve, 0.0);
     }
 
     #[test]
@@ -292,6 +299,8 @@ mod tests {
         assert_eq!(p.window, Some(WindowChoice::Query("Notes".into())));
         assert_eq!(p.display, 0, "not the saved display either");
 
+        assert_eq!(plan(&["--curve", "1"], &saved_all()).curve, 1.0);
+        assert_eq!(plan(&["--curve", "0"], &saved_all()).curve, 0.0);
         // A flag set to its default value still counts as given.
         assert_eq!(plan(&["--screen-height", "1.4"], &saved_all()).screen.height, 1.4);
         assert_eq!(plan(&["--predict-ms", "0"], &saved_all()).predict_ms, 0.0, "turned off on the command line");

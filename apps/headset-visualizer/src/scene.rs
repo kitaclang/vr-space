@@ -878,6 +878,11 @@ mod tests {
         let (c_centre, c_edge) = (column_height(&curved, SIZE / 2), column_height(&curved, 1));
         assert!((c_centre - centre).abs() <= 1, "the middle is where it was: {c_centre} vs {centre} px");
         assert!(c_edge >= c_centre + 2, "curved: centre {c_centre} px, edge {c_edge} px");
+
+        // Switching back uses the same vertex buffer and restores the flat screen.
+        h.scene.curve = 0.0;
+        h.scene.write_quad(&h.queue);
+        assert_eq!(h.render(Quat::IDENTITY), flat);
     }
 
     #[test]

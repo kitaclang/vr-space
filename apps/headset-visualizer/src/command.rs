@@ -1,7 +1,7 @@
 //! What the user can ask for, from a key in the window, the menu bar or a global shortcut.
 
 /// Something the user asked for, from a key in the window, the menu bar or a global shortcut.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Command {
     Recenter,
     ToggleHorizon,
@@ -12,6 +12,8 @@ pub enum Command {
     Bigger,
     Smaller,
     ResetScreen,
+    /// Set screen curvature (0 = flat, 1 = wrapped around the eye).
+    SetCurve(f32),
     ToggleFullscreen,
     /// Go fullscreen on this display, or back to a window with `None`.
     FullscreenOn(Option<u32>),

@@ -178,6 +178,7 @@ fn main() -> anyhow::Result<()> {
     };
     let plan = StartupPlan::new(&cli, explicit, &settings);
     cli.recenter_yaw_only = plan.recenter_yaw_only;
+    cli.curve = plan.curve;
 
     // Window and event loop (winit 0.28 API)
     let mut builder = EventLoopBuilder::<Command>::with_user_event();
