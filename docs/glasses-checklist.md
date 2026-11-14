@@ -109,6 +109,33 @@ The build wrapper applies the required driver patch automatically; see [patches/
 
 - [x] Install with `scripts/bundle-macos.sh --install`, choose **Open at Login** in the menu, log out and back in: vr-space starts and appears in the menu bar. The user confirmed Open at Login works after the guided logout/login test.
 
+- [x] Signed updates retain Screen Recording permission: use `scripts/bundle-macos.sh --run` (certificate remembered after the first successful install), approve the certificate-signed installed app once if needed, then rebuild/relaunch with the same command and confirm capture works without another approval. On 2026-11-14, after permission was granted, `--run` rebuilt the bundle, signed, installed and relaunched it; the new process immediately started capture and received BGRA frames without a permission reset. The user confirmed the screen works and no Screen Recording permission prompt appeared. That first run reused the unchanged release binary. A later run on 2026-11-14 added `vr-space 0.1.0 starting` to the startup log, rebuilt, signed, installed and launched via `--run`. Executable SHA-256 changed from `0de5fca4…` to `c4876387…`; CodeDirectory hashes also differed, with the same certificate and designated requirement. New PID 57357 immediately received BGRA frames without any approval interaction or permission reset. Agent-inspected rendered-window capture showed the captured desktop and connected HUD; saved settings were byte-unchanged. Evidence: `/tmp/vr-space-signed-update/` (temporary local files).
+
+## 8. Two virtual screens
+
+Hardware testing started on 2026-11-14: the user confirmed ChatGPT and cmux windows are both visible simultaneously, and scrolling each updates independently without freezing, flickering or showing the other's content. The user also confirmed both screens keep updating normally when switching to copied frames and back. Autonomous rendered-window checks on 2026-11-14 completed the sampled size/distance overlap and latency checks below. Keep prediction off.
+
+- [x] Pick a first window under **Show window**, then a different window under **Second screen > Show window**: both appear independently, first left and second right, upright and at their own aspect ratios. Agent-inspected app-window captures on 2026-11-14 show blue landscape and red portrait test windows, correctly labelled and unmirrored, with advancing frame counters.
+- [x] Move/scroll content in each window: neither screen freezes, flickers or shows the other window's frames. Switch shared/copied frames with `⌃⌥Z` while both update. User confirmed independent scrolling and normal updates through both switches on 2026-11-14.
+- [x] Resize each captured window, including one portrait and one landscape: within about two seconds its screen follows the new aspect ratio without overlap. User confirmed both follow resized proportions without overlap on 2026-11-14.
+- [x] Switch the second source between windows and a display; the first remains unchanged. User confirmed switching the right screen to a Mac display and back to cmux leaves ChatGPT unchanged on the left on 2026-11-14. Do not capture the glasses display while the app fills it (feedback).
+- [x] Try Flat, Gentle and Full curvature; turn to read both outside edges. No overlap, seams or mirrored text; recenter works correctly. User confirmed everything looks great for these checks on 2026-11-14.
+- [x] Adjust size/distance with both screens enabled: the controls move both screens together without overlap. User confirmed they adjust together on 2026-11-14. Agent-inspected app-window captures then confirmed a visible gap at Flat/Gentle/Full curvature, with height/distance approximately 2.05/4, 2.48/3.31 and 1.69/4.84. Larger views can extend outside the viewport; no overlap was seen at these sampled settings.
+- [x] Choose **Second screen > Off**: it disappears, Off is checked and the first screen returns to the centre. Enable a second screen again successfully. User confirmed all of these on 2026-11-14. Closing the temporary TextEdit second window also passed: the user confirmed it disappears, ChatGPT recentres and Off is checked on 2026-11-14.
+- [x] Close the first captured window with a second still shown: only the first falls back to its last display. User confirmed closing the temporary TextEdit primary falls back to the previous display while cmux stays unchanged on the right on 2026-11-14.
+- [x] Quit and reopen: one screen starts (second source is intentionally not saved). On 2026-11-14, after restarting the installed app, accessibility inspection confirmed Second screen > Off is checked; a screenshot of the rendered app shows one screen and the HUD lists only display 1. Logs confirm capture starts successfully. The absent temporary TextEdit source falls back to display 1.
+- [x] Record FPS and pose/capture/upload latency with one versus two updating screens at the same refresh rate. Agent read HUD snapshots on 2026-11-14 with CoreGraphics reporting the glasses display at 120 Hz, prediction off, shared frames, uncapped rendering, Full curvature, distance 4 and height 3.30. Test windows requested 60 Hz updates; captured sizes were 640×432 and 480×672. Capture/upload statistics combine both streams.
+
+| Captures | Render FPS | Pose mean / p95 (ms) | Capture mean / p95 (ms) | Upload mean / p95 (ms) |
+|---|---:|---|---|---|
+| One, before | 421.5 | 0.78 / 1.25 | 2.52 / 6.87 | 0.02 / 0.02 |
+| Two | 267.6 | 0.84 / 1.33 | 3.80 / 9.47 | 0.02 / 0.03 |
+| One, after | 363.6 | 0.90 / 1.42 | 3.63 / 9.10 | 0.02 / 0.03 |
+
+These are illustrative rolling-window snapshots, not a controlled overhead benchmark: one-screen before/after variation is substantial. Render FPS is not display refresh or motion-to-photon latency. Local evidence: `/tmp/vr-space-verification/RESULTS.md`, screenshots and `session.log` (temporary, not committed). Test windows were stopped and original saved settings restored afterwards.
+
+- [ ] Assess continuous two-screen stutter and wearer discomfort. Still requires a suitable temporal measurement or wearer feedback; screenshots do not establish this.
+
 ## Afterwards
 
 Keep `glasses-session.log` and the filled-in tables. Out of the repository is fine, as long as they're shared with whoever (or whichever agent) picks up the fixes.

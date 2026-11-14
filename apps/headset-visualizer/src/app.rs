@@ -40,7 +40,7 @@ use crate::gpu::show_captured_frame;
 use crate::macos_app;
 #[cfg(target_os = "macos")]
 use crate::macos_capture::{
-    capture_status, open_screen_recording_settings, stop_stream, switch_source, take_latest_frame, take_window_event,
+    capture_status, capture_status_at, open_screen_recording_settings, stop_stream, stop_stream_at, switch_source, take_latest_frame, take_window_event,
     window_info, CaptureSource, CaptureStatus, CapturedWindowEvent,
 };
 #[cfg(target_os = "macos")]
@@ -61,6 +61,8 @@ pub struct Capture {
     pub shown: CaptureSource,
     /// The display to go back to if the shown window closes (a real ID, not 0).
     pub last_display: u32,
+    /// Optional right-hand screen; the primary moves to the left while this is shown.
+    pub second: Option<CaptureSource>,
 }
 
 /// Where the window is fullscreen, from the startup plan.
@@ -294,9 +296,9 @@ impl App {
             let no_cursor = self.cli.no_cursor;
             let capture = &mut self.capture;
             // The shown window was resized (restart at the new size) or closed.
-            match take_window_event() {
+            match take_window_event(0) {
                 Some(CapturedWindowEvent::Resized) => {
-                    if let Err(e) = switch_source(capture.shown, !no_cursor) {
+                    if let Err(e) = switch_source(0, capture.shown, !no_cursor) {
                         warn!("Couldn't restart the window capture: {e}");
                     }
                 }
@@ -304,11 +306,34 @@ impl App {
                     let display = capture.last_display;
                     info!("The shown window was closed; showing display {display}.");
                     capture.shown = CaptureSource::Display(display);
-                    if let Err(e) = switch_source(capture.shown, !no_cursor) {
+                    if let Err(e) = switch_source(0, capture.shown, !no_cursor) {
                         warn!("Couldn't switch to display {display}: {e}");
                     }
                 }
                 None => {}
+            }
+            if let Some(source) = capture.second {
+                let hide = match take_window_event(1) {
+                    Some(CapturedWindowEvent::Resized) => {
+                        if let Err(e) = switch_source(1, source, !no_cursor) {
+                            warn!("Couldn't restart the second window capture: {e}");
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    Some(CapturedWindowEvent::Closed) => {
+                        info!("The second window was closed; returning to one screen.");
+                        true
+                    }
+                    None => false,
+                };
+                if hide {
+                    stop_stream_at(1);
+                    capture.second = None;
+                    self.gpu.set_secondary(false);
+                    self.gpu.hud_text.clear();
+                }
             }
             // The display to go fullscreen on (the glasses) was plugged in.
             if let Some(id) = self.pending_fullscreen {
@@ -321,6 +346,7 @@ impl App {
             if let Some(bar) = self.menu_bar.as_mut() {
                 bar.refresh();
                 bar.set_state(self.capture.shown, self.fullscreen_on, self.gpu.hud_enabled);
+                bar.set_second(self.capture.second);
             }
         }
     }
@@ -438,15 +464,18 @@ impl App {
         // Show the newest screen frame (macOS only). Skips entirely when no new frame has
         // arrived.
         #[cfg(target_os = "macos")]
-        let new_frame_displayed_at = match take_latest_frame(&mut gpu.frame_seq) {
-            Some(frame) => {
-                let displayed_at = frame.displayed_at;
-                let started = Instant::now();
-                show_captured_frame(gpu, frame);
-                self.latency.upload.push_ns(started.elapsed().as_nanos() as u64);
-                Some(displayed_at)
+        let new_frames_displayed_at = {
+            let mut times = [None; 2];
+            let count = if self.capture.second.is_some() { 2 } else { 1 };
+            for (index, time) in times.iter_mut().enumerate().take(count) {
+                if let Some(frame) = take_latest_frame(index, &mut gpu.frame_seq[index]) {
+                    *time = Some(frame.displayed_at);
+                    let started = Instant::now();
+                    show_captured_frame(gpu, index, frame);
+                    self.latency.upload.push_ns(started.elapsed().as_nanos() as u64);
+                }
             }
-            None => None,
+            times
         };
 
         // Render 3D scene
@@ -461,9 +490,9 @@ impl App {
         if gpu.hud_enabled && (gpu.hud_text.is_empty() || now_ns.saturating_sub(gpu.hud_text_updated_ns) >= HUD_REFRESH_NS) {
             let dev = if has { "connected" } else { "not-found" };
             #[cfg(target_os = "macos")]
-            let screen_line = screen_status_line(gpu.scene.tex_size, self.capture.shown);
+            let screen_line = screen_status_line(gpu.scene.tex_size(), self.capture.shown, 0);
             #[cfg(not(target_os = "macos"))]
-            let screen_line = screen_status_line(gpu.scene.tex_size);
+            let screen_line = screen_status_line(gpu.scene.tex_size());
             gpu.hud_text = vec![
                 format!("device: {dev}"),
                 format!("fps: {:.1}", self.fps.fps.max(0.0)),
@@ -485,6 +514,10 @@ impl App {
                 format!("distance: {:.2}  height: {:.2}", gpu.scene.screen.distance, gpu.scene.screen.height),
                 format!("roll trim: {:.1}°", self.roll_trim_tenths as f32 / 10.0),
             ];
+            #[cfg(target_os = "macos")]
+            if let Some(source) = self.capture.second {
+                gpu.hud_text.push(format!("second {}", screen_status_line(gpu.scene.tex_size_at(1), source, 1)));
+            }
             if self.reference_dirty || (cli.recenter_yaw_only && self.upright_roll.is_none()) {
                 gpu.hud_text.push("horizon: recenter upright to set level".into());
             }
@@ -510,7 +543,8 @@ impl App {
         #[cfg(target_os = "macos")]
         let capture = capture_status();
         #[cfg(target_os = "macos")]
-        let needs_settings = matches!(capture, CaptureStatus::NoPermission | CaptureStatus::Failed);
+        let needs_settings = matches!(capture, CaptureStatus::NoPermission | CaptureStatus::Failed)
+            || (self.capture.second.is_some() && matches!(capture_status_at(1), CaptureStatus::NoPermission | CaptureStatus::Failed));
         #[cfg(not(target_os = "macos"))]
         let needs_settings = false;
         if let Some(font) = gpu.hud_font.as_ref() {
@@ -567,7 +601,7 @@ impl App {
             self.latency.pose_to_submit.push_ns(now_ns_from_start().saturating_sub(t_ns));
         }
         #[cfg(target_os = "macos")]
-        if let Some(displayed_at) = new_frame_displayed_at.filter(|&t| t != 0) {
+        for displayed_at in new_frames_displayed_at.into_iter().flatten().filter(|&t| t != 0) {
             let ns = latency::mach::ns_between(displayed_at, latency::mach::now());
             self.latency.capture_to_submit.push_ns(ns);
         }
@@ -620,7 +654,7 @@ impl App {
                 #[cfg(target_os = "macos")]
                 if self.capture.shown != CaptureSource::Display(id) {
                     // Restarting the capture blocks briefly; fine for a menu click.
-                    match switch_source(CaptureSource::Display(id), !self.cli.no_cursor) {
+                    match switch_source(0, CaptureSource::Display(id), !self.cli.no_cursor) {
                         Ok(()) => {
                             self.capture.shown = CaptureSource::Display(id);
                             self.capture.last_display = id;
@@ -634,13 +668,48 @@ impl App {
             Command::ShowWindow(id) => {
                 #[cfg(target_os = "macos")]
                 if self.capture.shown != CaptureSource::Window(id) {
-                    match switch_source(CaptureSource::Window(id), !self.cli.no_cursor) {
+                    match switch_source(0, CaptureSource::Window(id), !self.cli.no_cursor) {
                         Ok(()) => self.capture.shown = CaptureSource::Window(id),
                         Err(e) => warn!("Couldn't switch to window {id}: {e}"),
                     }
                 }
                 #[cfg(not(target_os = "macos"))]
                 let _ = id;
+            }
+            Command::SecondDisplay(id) | Command::SecondWindow(id) => {
+                #[cfg(target_os = "macos")]
+                {
+                    let source = if matches!(cmd, Command::SecondDisplay(_)) {
+                        CaptureSource::Display(id)
+                    } else {
+                        CaptureSource::Window(id)
+                    };
+                    if self.capture.second != Some(source) {
+                        // A source change must not leave a stale image or imported surface behind.
+                        gpu.set_secondary(false);
+                        match switch_source(1, source, !self.cli.no_cursor) {
+                            Ok(()) => {
+                                gpu.set_secondary(true);
+                                self.capture.second = Some(source);
+                            }
+                            Err(e) => {
+                                warn!("Couldn't start the second screen: {e}");
+                                stop_stream_at(1);
+                                self.capture.second = None;
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                let _ = id;
+            }
+            Command::HideSecondScreen => {
+                #[cfg(target_os = "macos")]
+                {
+                    stop_stream_at(1);
+                    self.capture.second = None;
+                    gpu.set_secondary(false);
+                }
             }
             Command::ToggleHud => {
                 // Only possible when the HUD font was set up (not with --no-hud).
@@ -677,13 +746,15 @@ impl App {
             self.gpu.scene.write_quad(&self.gpu.queue);
         }
         #[cfg(target_os = "macos")]
-        if matches!(cmd, Command::ToggleFullscreen | Command::FullscreenOn(_) | Command::ShowDisplay(_)) {
-            let captured_display = match self.capture.shown {
-                CaptureSource::Display(id) => Some(id),
-                CaptureSource::Window(_) => None,
-            };
+        if matches!(cmd, Command::ToggleFullscreen | Command::FullscreenOn(_) | Command::ShowDisplay(_) | Command::SecondDisplay(_)) {
             let main_id = self.window.primary_monitor().map(|m| monitor_id(&m));
-            warn_if_covering_capture(self.fullscreen_on, captured_display, main_id);
+            for source in Some(self.capture.shown).into_iter().chain(self.capture.second) {
+                let captured_display = match source {
+                    CaptureSource::Display(id) => Some(id),
+                    CaptureSource::Window(_) => None,
+                };
+                warn_if_covering_capture(self.fullscreen_on, captured_display, main_id);
+            }
         }
     }
 
@@ -729,6 +800,7 @@ impl App {
         #[cfg(target_os = "macos")]
         if let Some(bar) = self.menu_bar.as_mut() {
             bar.set_state(self.capture.shown, self.fullscreen_on, self.gpu.hud_enabled);
+            bar.set_second(self.capture.second);
             bar.set_horizon(self.cli.recenter_yaw_only);
             bar.set_curve(self.gpu.scene.curve);
             bar.set_latency(self.predict_lead.ms, !self.gpu.zero_copy, self.gpu.zero_copy_available);

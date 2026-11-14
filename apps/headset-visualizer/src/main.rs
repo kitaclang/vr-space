@@ -164,6 +164,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    info!("vr-space {} starting", env!("CARGO_PKG_VERSION"));
     info!(
         "vsync={}, invert=({},{},{}), poll_ms={}, no_hud={}, hud_size={}, max_fps={}",
         cli.vsync, cli.invert_x, cli.invert_y, cli.invert_z, cli.poll_ms, cli.no_hud, cli.hud_size, cli.max_fps
@@ -277,7 +278,7 @@ fn main() -> anyhow::Result<()> {
         proxy,
         Fullscreen { on: fullscreen_on, pending: pending_fullscreen },
         #[cfg(target_os = "macos")]
-        Capture { shown, last_display },
+        Capture { shown, last_display, second: None },
         plan.predict_ms,
         settings_store,
         settings,

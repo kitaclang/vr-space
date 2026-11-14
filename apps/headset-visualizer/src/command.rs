@@ -21,6 +21,12 @@ pub enum Command {
     ShowDisplay(u32),
     /// Capture this window instead, by window ID.
     ShowWindow(u32),
+    /// Capture a second display alongside the primary screen.
+    SecondDisplay(u32),
+    /// Capture a second window alongside the primary screen.
+    SecondWindow(u32),
+    /// Stop showing the second screen.
+    HideSecondScreen,
     ToggleHud,
     OpenScreenSettings,
     /// Turn opening at login on or off (only offered when running as vr-space.app).

@@ -63,6 +63,9 @@ pub struct MenuBar {
     _hotkeys: Option<GlobalHotKeyManager>,
     display_menu: Submenu,
     window_menu: Submenu,
+    second_display_menu: Submenu,
+    second_window_menu: Submenu,
+    second_off_item: CheckMenuItem,
     fullscreen_menu: Submenu,
     hud_item: CheckMenuItem,
     horizon_item: CheckMenuItem,
@@ -74,6 +77,7 @@ pub struct MenuBar {
     windows: Vec<WindowInfo>,
     windows_seq: u64,
     shown: CaptureSource,
+    second: Option<CaptureSource>,
     fullscreen: Option<u32>,
 }
 
@@ -107,6 +111,11 @@ impl MenuBar {
 
         let display_menu = Submenu::new("Show display", true);
         let window_menu = Submenu::new("Show window", true);
+        let second_menu = Submenu::new("Second screen", true);
+        let second_off_item = CheckMenuItem::with_id("second:off", "Off", true, true, None);
+        let second_display_menu = Submenu::new("Show display", true);
+        let second_window_menu = Submenu::new("Show window", true);
+        second_menu.append_items(&[&second_off_item, &second_display_menu, &second_window_menu])?;
         let fullscreen_menu = Submenu::new("Fullscreen on", true);
         let hud_item = CheckMenuItem::with_id("hud", "Show HUD", hud_available, hud_on, None);
 
@@ -139,13 +148,14 @@ impl MenuBar {
         let quit = MenuItem::with_id("quit", "Quit vr-space", true, None);
 
         let menu = Menu::new();
-        let items: [&dyn IsMenuItem; 11] = [
+        let items: [&dyn IsMenuItem; 12] = [
             &recenter,
             &horizon_item,
             &screen_menu,
             &PredefinedMenuItem::separator(),
             &display_menu,
             &window_menu,
+            &second_menu,
             &fullscreen_menu,
             &hud_item,
             &latency_menu,
@@ -210,6 +220,9 @@ impl MenuBar {
             _hotkeys: hotkeys,
             display_menu,
             window_menu,
+            second_display_menu,
+            second_window_menu,
+            second_off_item,
             fullscreen_menu,
             hud_item,
             horizon_item,
@@ -221,6 +234,7 @@ impl MenuBar {
             windows: Vec::new(),
             windows_seq: 0,
             shown,
+            second: None,
             fullscreen,
         };
         bar.refresh();
@@ -257,8 +271,23 @@ impl MenuBar {
         }
     }
 
+    /// Update the second-screen selection and its check marks.
+    pub fn set_second(&mut self, second: Option<CaptureSource>) {
+        if self.second == second {
+            return;
+        }
+        self.second = second;
+        self.second_off_item.set_checked(second.is_none());
+        self.rebuild_second_display_menu();
+        self.rebuild_second_window_menu();
+    }
+
     fn rebuild_window_menu(&self) {
-        let menu = &self.window_menu;
+        self.rebuild_window_submenu(&self.window_menu, "window:", Some(self.shown));
+        self.rebuild_second_window_menu();
+    }
+
+    fn rebuild_window_submenu(&self, menu: &Submenu, id_prefix: &str, shown: Option<CaptureSource>) {
         while menu.remove_at(0).is_some() {}
         if self.windows.is_empty() {
             let _ = menu.append(&MenuItem::new("No windows to show", false, None));
@@ -266,10 +295,10 @@ impl MenuBar {
         }
         for w in self.windows.iter().take(MAX_WINDOWS) {
             let _ = menu.append(&CheckMenuItem::with_id(
-                format!("window:{}", w.id),
+                format!("{id_prefix}{}", w.id),
                 shorten(&w.label(), MAX_LABEL_CHARS),
                 true,
-                self.shown == CaptureSource::Window(w.id),
+                shown == Some(CaptureSource::Window(w.id)),
                 None,
             ));
         }
@@ -277,6 +306,10 @@ impl MenuBar {
             let more = format!("{} more (use --list-windows)", self.windows.len() - MAX_WINDOWS);
             let _ = menu.append(&MenuItem::new(more, false, None));
         }
+    }
+
+    fn rebuild_second_window_menu(&self) {
+        self.rebuild_window_submenu(&self.second_window_menu, "second:window:", self.second);
     }
 
     pub fn set_curve(&mut self, curve: f32) {
@@ -327,6 +360,8 @@ impl MenuBar {
                 None,
             ));
         }
+        self.rebuild_second_display_menu();
+        self.rebuild_second_window_menu();
         let _ = self.fullscreen_menu.append(&PredefinedMenuItem::separator());
         let _ = self.fullscreen_menu.append(&CheckMenuItem::with_id(
             "fullscreen:window",
@@ -335,6 +370,20 @@ impl MenuBar {
             self.fullscreen.is_none(),
             None,
         ));
+    }
+
+    fn rebuild_second_display_menu(&self) {
+        while self.second_display_menu.remove_at(0).is_some() {}
+        let main_id = CGDisplay::main().id;
+        for &id in &self.displays {
+            let _ = self.second_display_menu.append(&CheckMenuItem::with_id(
+                format!("second:display:{id}"),
+                display_label(id, main_id),
+                true,
+                self.second == Some(CaptureSource::Display(id)),
+                None,
+            ));
+        }
     }
 }
 
@@ -383,7 +432,14 @@ fn command_for_menu_id(id: &str) -> Option<Command> {
         "login" => Some(Command::ToggleOpenAtLogin),
         "quit" => Some(Command::Quit),
         "fullscreen:window" => Some(Command::FullscreenOn(None)),
+        "second:off" => Some(Command::HideSecondScreen),
         _ => {
+            if let Some(n) = id.strip_prefix("second:display:") {
+                return n.parse().ok().map(Command::SecondDisplay);
+            } else if let Some(n) = id.strip_prefix("second:window:") {
+                return n.parse().ok().map(Command::SecondWindow);
+            }
+
             if let Some(n) = id.strip_prefix("display:") {
                 n.parse().ok().map(Command::ShowDisplay)
             } else if let Some(n) = id.strip_prefix("window:") {
@@ -456,6 +512,12 @@ mod tests {
         assert_eq!(command_for_menu_id("horizon"), Some(Command::ToggleHorizon));
         assert_eq!(command_for_menu_id("window:123"), Some(Command::ShowWindow(123)));
         assert_eq!(command_for_menu_id("display:7"), Some(Command::ShowDisplay(7)));
+        assert_eq!(command_for_menu_id("second:off"), Some(Command::HideSecondScreen));
+        assert_eq!(command_for_menu_id("second:display:7"), Some(Command::SecondDisplay(7)));
+        assert_eq!(command_for_menu_id("second:window:123"), Some(Command::SecondWindow(123)));
+        assert_eq!(command_for_menu_id("second:display:nope"), None);
+        assert_eq!(command_for_menu_id("second:window:"), None);
+        assert_eq!(command_for_menu_id("second:display:7:extra"), None);
         assert_eq!(command_for_menu_id("fullscreen:7"), Some(Command::FullscreenOn(Some(7))));
         assert_eq!(command_for_menu_id("fullscreen:window"), Some(Command::FullscreenOn(None)));
         assert_eq!(command_for_menu_id("window:abc"), None);

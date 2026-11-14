@@ -6,7 +6,7 @@
 //
 // Frames aren't copied here: the capture callback keeps a reference to the frame's pixel
 // buffer (an IOSurface the GPU can read in place, see `iosurface.rs`) and publishes it in
-// LATEST, replacing any frame the renderer hasn't taken. The renderer takes it with
+// its capture slot, replacing any frame the renderer hasn't taken. The renderer takes it with
 // `take_latest_frame`. Both sides only move a pointer under the lock, and its sequence counter
 // lets the renderer see "nothing new" with a single atomic load.
 //
@@ -55,14 +55,48 @@ const STATUS_STARTING: u8 = 0;
 const STATUS_NO_PERMISSION: u8 = 1;
 const STATUS_FAILED: u8 = 2;
 const STATUS_RUNNING: u8 = 3;
-static STATUS: AtomicU8 = AtomicU8::new(STATUS_STARTING);
+// ponytail: two fixed capture slots; generalize only when layouts need more screens.
+struct CaptureSlot {
+    status: AtomicU8,
+    latest: Latest<(u64, CapturedFrame)>,
+    generation: AtomicU64,
+    received_generation: AtomicU64,
+    running: AtomicBool,
+    stream: OnceLock<Mutex<Option<SCStream>>>,
+    watched_window: AtomicU32,
+    watched_size: AtomicU64,
+    window_event: AtomicU8,
+}
 
-/// Current capture status. Cheap (two atomic loads), safe to call every frame.
+impl CaptureSlot {
+    const fn new() -> Self {
+        Self {
+            status: AtomicU8::new(STATUS_STARTING),
+            latest: Latest::new(),
+            generation: AtomicU64::new(1),
+            received_generation: AtomicU64::new(0),
+            running: AtomicBool::new(false),
+            stream: OnceLock::new(),
+            watched_window: AtomicU32::new(0),
+            watched_size: AtomicU64::new(0),
+            window_event: AtomicU8::new(WINDOW_EVENT_NONE),
+        }
+    }
+}
+
+static CAPTURES: [CaptureSlot; 2] = [CaptureSlot::new(), CaptureSlot::new()];
+
+/// Current capture status. Atomic loads only, safe to call every frame.
 pub fn capture_status() -> CaptureStatus {
-    match STATUS.load(Ordering::Acquire) {
+    capture_status_at(0)
+}
+
+pub fn capture_status_at(index: usize) -> CaptureStatus {
+    let slot = &CAPTURES[index];
+    match slot.status.load(Ordering::Acquire) {
         STATUS_NO_PERMISSION => CaptureStatus::NoPermission,
         STATUS_FAILED => CaptureStatus::Failed,
-        STATUS_RUNNING if LATEST.seq() == 0 => CaptureStatus::WaitingForFrames,
+        STATUS_RUNNING if slot.received_generation.load(Ordering::Acquire) != slot.generation.load(Ordering::Acquire) => CaptureStatus::WaitingForFrames,
         STATUS_RUNNING => CaptureStatus::Capturing,
         _ => CaptureStatus::Starting,
     }
@@ -137,13 +171,30 @@ impl<T> Latest<T> {
     }
 
     /// Make `value` the newest, dropping one that wasn't taken (outside the lock).
+    #[cfg(test)]
     fn publish(&self, value: T) {
+        self.publish_if(value, || true);
+    }
+
+    /// Validate under the slot lock, so a late callback cannot replace a new stream's frame
+    /// after stop invalidated its generation and cleared the slot.
+    fn publish_if(&self, value: T, accept: impl FnOnce() -> bool) -> bool {
         let replaced = {
             let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+            if !accept() {
+                return false;
+            }
             let replaced = slot.replace(value);
             self.seq.fetch_add(1, Ordering::Release);
             replaced
         };
+        drop(replaced);
+        true
+    }
+
+    /// Used only when stopping a stream; release even a frame the renderer never took.
+    fn clear(&self) {
+        let replaced = self.slot.lock().unwrap_or_else(|e| e.into_inner()).take();
         drop(replaced);
     }
 
@@ -164,17 +215,10 @@ impl<T> Latest<T> {
     }
 }
 
-static LATEST: Latest<CapturedFrame> = Latest::new();
-
 /// Frames ScreenCaptureKit may have waiting for the app. The default, 3, would stall the
 /// stream: the app can hold one waiting here plus the few the renderer keeps until the GPU
 /// is done with them (see `main.rs`). 8 is the most ScreenCaptureKit allows.
 const QUEUE_DEPTH: u32 = 6;
-
-static RUNNING: AtomicBool = AtomicBool::new(false);
-
-// Stream handle kept alive while running; stored behind a Mutex in OnceLock to avoid Sync on SCStream.
-static STREAM_HANDLE: OnceLock<Mutex<Option<SCStream>>> = OnceLock::new();
 
 fn shareable_content() -> anyhow::Result<SCShareableContent> {
     SCShareableContent::get().map_err(|e| anyhow::anyhow!(
@@ -360,13 +404,9 @@ fn window_pixel_size(window: &SCWindow, displays: &[SCDisplay]) -> (u32, u32) {
 
 // The window being captured (0 = a display) and its size in pixels when the stream started,
 // packed as width << 32 | height. The watcher thread compares against them.
-static WATCHED_WINDOW: AtomicU32 = AtomicU32::new(0);
-static WATCHED_SIZE: AtomicU64 = AtomicU64::new(0);
-
 const WINDOW_EVENT_NONE: u8 = 0;
 const WINDOW_EVENT_RESIZED: u8 = 1;
 const WINDOW_EVENT_CLOSED: u8 = 2;
-static WINDOW_EVENT: AtomicU8 = AtomicU8::new(WINDOW_EVENT_NONE);
 
 /// Something happened to the captured window that needs the stream restarted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -378,8 +418,8 @@ pub enum CapturedWindowEvent {
 }
 
 /// Take the latest event about the captured window, if any. One atomic swap.
-pub fn take_window_event() -> Option<CapturedWindowEvent> {
-    match WINDOW_EVENT.swap(WINDOW_EVENT_NONE, Ordering::AcqRel) {
+pub fn take_window_event(index: usize) -> Option<CapturedWindowEvent> {
+    match CAPTURES[index].window_event.swap(WINDOW_EVENT_NONE, Ordering::AcqRel) {
         WINDOW_EVENT_RESIZED => Some(CapturedWindowEvent::Resized),
         WINDOW_EVENT_CLOSED => Some(CapturedWindowEvent::Closed),
         _ => None,
@@ -419,7 +459,9 @@ pub fn start_window_watcher() {
                         WINDOWS_SEQ.fetch_add(1, Ordering::Release);
                     }
                 }
-                check_watched_window(&content);
+                for slot in &CAPTURES {
+                    check_watched_window(&content, slot);
+                }
             }
         }
         std::thread::sleep(Duration::from_secs(2));
@@ -429,8 +471,8 @@ pub fn start_window_watcher() {
     }
 }
 
-fn check_watched_window(content: &SCShareableContent) {
-    let id = WATCHED_WINDOW.load(Ordering::Acquire);
+fn check_watched_window(content: &SCShareableContent, slot: &CaptureSlot) {
+    let id = slot.watched_window.load(Ordering::Acquire);
     if id == 0 {
         return;
     }
@@ -440,15 +482,15 @@ fn check_watched_window(content: &SCShareableContent) {
         None => WINDOW_EVENT_CLOSED,
         Some(w) => {
             let (pw, ph) = window_pixel_size(w, &content.displays());
-            if pack_size(pw, ph) == WATCHED_SIZE.load(Ordering::Acquire) {
+            if pack_size(pw, ph) == slot.watched_size.load(Ordering::Acquire) {
                 return;
             }
             WINDOW_EVENT_RESIZED
         }
     };
     // Only report it if that window is still the one being captured.
-    if WATCHED_WINDOW.load(Ordering::Acquire) == id {
-        WINDOW_EVENT.store(event, Ordering::Release);
+    if slot.watched_window.load(Ordering::Acquire) == id {
+        slot.window_event.store(event, Ordering::Release);
     }
 }
 
@@ -492,7 +534,7 @@ fn log_limited(counter: &AtomicUsize, msg: impl FnOnce()) {
     }
 }
 
-struct ScreenOutput;
+struct ScreenOutput { index: usize, generation: u64 }
 
 impl screencapturekit::stream::output_trait::SCStreamOutputTrait for ScreenOutput {
     fn did_output_sample_buffer(&self, sample_buffer: CMSampleBuffer, _of_type: SCStreamOutputType) {
@@ -537,7 +579,13 @@ impl screencapturekit::stream::output_trait::SCStreamOutputTrait for ScreenOutpu
         }
 
         // Keep the pixel buffer (a retain, not a copy) and hand it over.
-        LATEST.publish(CapturedFrame { buffer: pixel_buffer, width, height, bytes_per_row: stride, displayed_at });
+        let slot = &CAPTURES[self.index];
+        let accepted = slot.latest.publish_if(
+            (self.generation, CapturedFrame { buffer: pixel_buffer, width, height, bytes_per_row: stride, displayed_at }),
+            || slot.generation.load(Ordering::Acquire) == self.generation,
+        );
+        if !accepted { return; }
+        slot.received_generation.fetch_max(self.generation, Ordering::Release);
 
         log_limited(&FRAMES, || info!("Captured BGRA frame: {}x{} stride={}", width, height, stride));
     }
@@ -545,20 +593,26 @@ impl screencapturekit::stream::output_trait::SCStreamOutputTrait for ScreenOutpu
 
 /// Start capturing a display or window.
 pub fn start_stream(source: CaptureSource, show_cursor: bool) -> anyhow::Result<()> {
-    if RUNNING.load(Ordering::SeqCst) {
+    start_stream_at(0, source, show_cursor)
+}
+
+fn start_stream_at(index: usize, source: CaptureSource, show_cursor: bool) -> anyhow::Result<()> {
+    let slot = &CAPTURES[index];
+    if slot.running.load(Ordering::SeqCst) {
         return Ok(());
     }
-    let result = start_stream_inner(source, show_cursor);
+    let result = start_stream_inner(index, source, show_cursor);
     let status = match &result {
         Ok(()) => STATUS_RUNNING,
         Err(_) if !has_screen_recording_permission() => STATUS_NO_PERMISSION,
         Err(_) => STATUS_FAILED,
     };
-    STATUS.store(status, Ordering::Release);
+    slot.status.store(status, Ordering::Release);
     result
 }
 
-fn start_stream_inner(source: CaptureSource, show_cursor: bool) -> anyhow::Result<()> {
+fn start_stream_inner(index: usize, source: CaptureSource, show_cursor: bool) -> anyhow::Result<()> {
+    let slot = &CAPTURES[index];
     // Check Screen Recording permission first. If it's missing, ask macOS to show its prompt
     // (it only does so once per app; after that the user has to use System Settings).
     if !has_screen_recording_permission() {
@@ -594,8 +648,8 @@ fn start_stream_inner(source: CaptureSource, show_cursor: bool) -> anyhow::Resul
                 ))?;
             let size = window_pixel_size(&window, &content.displays());
             info!("Capturing window {window_id} at {}x{} px", size.0, size.1);
-            WATCHED_SIZE.store(pack_size(size.0, size.1), Ordering::Release);
-            WATCHED_WINDOW.store(window_id, Ordering::Release);
+            slot.watched_size.store(pack_size(size.0, size.1), Ordering::Release);
+            slot.watched_window.store(window_id, Ordering::Release);
             // Follows the window across displays and Spaces, and only shows that window.
             (SCContentFilter::new().with_desktop_independent_window(&window), size)
         }
@@ -618,14 +672,14 @@ fn start_stream_inner(source: CaptureSource, show_cursor: bool) -> anyhow::Resul
         .map_err(|_| anyhow::anyhow!("set_queue_depth failed"))?;
 
     let mut stream = SCStream::new(&filter, &cfg);
-    let _handler_id = stream.add_output_handler(ScreenOutput, SCStreamOutputType::Screen);
+    let _handler_id = stream.add_output_handler(ScreenOutput { index, generation: slot.generation.load(Ordering::Acquire) }, SCStreamOutputType::Screen);
 
     stream.start_capture()
         .map_err(|e| anyhow::anyhow!("start_capture failed: {e:?}"))?;
 
-    RUNNING.store(true, Ordering::SeqCst);
+    slot.running.store(true, Ordering::SeqCst);
     // store stream to keep it alive
-    STREAM_HANDLE.get_or_init(|| Mutex::new(None))
+    slot.stream.get_or_init(|| Mutex::new(None))
         .lock().unwrap_or_else(|e| e.into_inner())
         .replace(stream);
     info!("Screen capture stream started via screencapturekit.");
@@ -636,10 +690,10 @@ fn start_stream_inner(source: CaptureSource, show_cursor: bool) -> anyhow::Resul
 /// Capture a different display or window (or the same window again at its new size): stop
 /// the current stream and start a new one. Blocks briefly while ScreenCaptureKit lists the
 /// displays and windows, so don't call it per frame.
-pub fn switch_source(source: CaptureSource, show_cursor: bool) -> anyhow::Result<()> {
-    stop_stream();
-    STATUS.store(STATUS_STARTING, Ordering::Release);
-    start_stream(source, show_cursor)
+pub fn switch_source(index: usize, source: CaptureSource, show_cursor: bool) -> anyhow::Result<()> {
+    stop_stream_at(index);
+    CAPTURES[index].status.store(STATUS_STARTING, Ordering::Release);
+    start_stream_at(index, source, show_cursor)
 }
 
 /// Turn a display ID from the command line into a real one (0 means the main display).
@@ -651,16 +705,29 @@ pub fn resolve_display_id(display_id: u32) -> u32 {
 ///
 /// Returns `None` without locking when there is no new frame, and never blocks: if the
 /// capture thread is publishing at that instant, the frame is picked up on the next call.
-pub fn take_latest_frame(last_seq: &mut u64) -> Option<CapturedFrame> {
-    LATEST.take(last_seq)
+pub fn take_latest_frame(index: usize, last_seq: &mut u64) -> Option<CapturedFrame> {
+    let slot = &CAPTURES[index];
+    take_current_frame(&slot.latest, last_seq, slot.generation.load(Ordering::Acquire))
+}
+
+fn take_current_frame<T>(latest: &Latest<(u64, T)>, last_seq: &mut u64, generation: u64) -> Option<T> {
+    latest.take(last_seq).and_then(|(g, frame)| (g == generation).then_some(frame))
 }
 
 // Stop stream (optional)
 pub fn stop_stream() {
-    WATCHED_WINDOW.store(0, Ordering::Release);
-    WINDOW_EVENT.store(WINDOW_EVENT_NONE, Ordering::Release);
-    if RUNNING.swap(false, Ordering::SeqCst) {
-        if let Some(m) = STREAM_HANDLE.get() {
+    for index in 0..CAPTURES.len() {
+        stop_stream_at(index);
+    }
+}
+
+pub fn stop_stream_at(index: usize) {
+    let slot = &CAPTURES[index];
+    slot.generation.fetch_add(1, Ordering::AcqRel);
+    slot.watched_window.store(0, Ordering::Release);
+    slot.window_event.store(WINDOW_EVENT_NONE, Ordering::Release);
+    if slot.running.swap(false, Ordering::SeqCst) {
+        if let Some(m) = slot.stream.get() {
             if let Ok(mut guard) = m.lock() {
                 if let Some(stream) = guard.take() {
                     if let Err(e) = stream.stop_capture() {
@@ -669,8 +736,9 @@ pub fn stop_stream() {
                 }
             }
         }
-        info!("Screen capture stream stopped.");
+        info!("Screen capture stream {index} stopped.");
     }
+    slot.latest.clear();
 }
 
 #[cfg(test)]
@@ -740,6 +808,30 @@ mod tests {
     }
 
     #[test]
+    fn capture_slots_are_independent_and_reject_frames_from_old_streams() {
+        let left = Latest::new();
+        let right = Latest::new();
+        let (mut lseq, mut rseq) = (0, 0);
+        left.publish((1, 10));
+        right.publish((1, 20));
+        assert_eq!(take_current_frame(&left, &mut lseq, 1), Some(10));
+        assert_eq!(take_current_frame(&right, &mut rseq, 1), Some(20));
+        // An old callback can arrive after a source switch; it must never be rendered.
+        right.publish((1, 21));
+        assert_eq!(take_current_frame(&right, &mut rseq, 2), None);
+        right.publish((2, 22));
+        let seq_before_stale_callback = right.seq();
+        assert!(!right.publish_if((1, 99), || false));
+        assert_eq!(right.seq(), seq_before_stale_callback, "rejected callbacks do not publish");
+        assert_eq!(take_current_frame(&right, &mut rseq, 2), Some(22), "a late callback cannot replace the new stream's frame");
+        left.publish((1, 11));
+        right.publish((2, 23));
+        right.clear();
+        assert_eq!(take_current_frame(&right, &mut rseq, 2), None);
+        assert_eq!(take_current_frame(&left, &mut lseq, 1), Some(11));
+    }
+
+    #[test]
     fn frames_that_are_replaced_or_taken_are_not_kept() {
         use std::sync::Arc;
         // Each frame holds the capture's surface until dropped, so the handoff must not keep
@@ -754,5 +846,8 @@ mod tests {
         assert!(Arc::ptr_eq(&taken, &second));
         drop(taken);
         assert_eq!(Arc::strong_count(&second), 1, "the handoff keeps nothing it handed over");
+        latest.publish(second.clone());
+        latest.clear();
+        assert_eq!(Arc::strong_count(&second), 1, "stopping releases an untaken frame");
     }
 }

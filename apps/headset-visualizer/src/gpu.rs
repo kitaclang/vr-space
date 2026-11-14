@@ -48,12 +48,12 @@ pub struct Gpu {
     // can't write into it while the GPU may still be drawing it: the CPU runs at most a
     // couple of frames ahead of the GPU (Metal hands out three drawables), so keeping the
     // current frame and the two before it is enough.
-    pub frame_seq: u64,
+    pub frame_seq: [u64; 2],
     pub zero_copy: bool,
     // Whether the GPU can read frames in place at all (Metal, and no import has failed).
     pub zero_copy_available: bool,
     #[cfg(target_os = "macos")]
-    pub shown_frames: [Option<CapturedFrame>; 3],
+    pub shown_frames: [[Option<CapturedFrame>; 3]; 2],
 }
 
 /// wgpu 0.17's surface configuration drops pending map callbacks instead of firing them.
@@ -182,25 +182,39 @@ pub async fn init_gpu(window: &Window, cli: &Cli, vertices: &[Vertex]) -> anyhow
         show_calibrated_toast_until_ns,
         hud_text: Vec::new(),
         hud_text_updated_ns: 0,
-        frame_seq: 0,
+        frame_seq: [0; 2],
         zero_copy,
         zero_copy_available,
         #[cfg(target_os = "macos")]
-        shown_frames: [None, None, None],
+        shown_frames: [[None, None, None], [None, None, None]],
     })
 }
 
-/// Put a captured frame on the virtual screen: in place from its IOSurface when the GPU can
-/// read it, else by copying its pixels. If sharing fails once, frames are copied from then on.
+impl Gpu {
+    /// Toggle the second screen only at a menu change, not in the render loop.
+    pub fn set_secondary(&mut self, enabled: bool) {
+        if enabled == self.scene.secondary_enabled() { return; }
+        if !enabled { self.device.poll(wgpu::Maintain::Wait); }
+        self.scene.set_secondary(&self.device, &self.queue, enabled);
+        self.frame_seq[1] = 0;
+        #[cfg(target_os = "macos")]
+        { self.shown_frames[1] = [None, None, None]; }
+    }
+}
+
+/// Put a captured frame on one virtual screen: in place from its IOSurface when possible,
+/// else by copying its pixels. If sharing fails once, frames are copied from then on.
 #[cfg(target_os = "macos")]
-pub fn show_captured_frame(gpu: &mut Gpu, frame: CapturedFrame) {
+pub fn show_captured_frame(gpu: &mut Gpu, index: usize, frame: CapturedFrame) {
     let Gpu { device, queue, scene, zero_copy, zero_copy_available, shown_frames, .. } = gpu;
+    assert!(index < 2 && (index == 0 || scene.secondary_enabled()), "screen index is not enabled");
+    let shown_frames = &mut shown_frames[index];
     if *zero_copy {
         if let Some(surface) = frame.iosurface() {
             // SAFETY: `surface` belongs to `frame`, which is alive here and, once shown, kept
             // in `shown_frames` while the GPU may draw it.
             let key = u64::from(unsafe { iosurface::id(surface) });
-            let shown = scene.show_external(device, queue, key, frame.width, frame.height, || unsafe {
+            let shown = scene.show_external_at(index, device, queue, key, frame.width, frame.height, || unsafe {
                 iosurface::import(device, surface, frame.width, frame.height)
             });
             if shown != scene::FrameUpload::NotImported {
@@ -217,7 +231,7 @@ pub fn show_captured_frame(gpu: &mut Gpu, frame: CapturedFrame) {
     // place before may still be in the GPU's queue: let them go one frame at a time.
     shown_frames.rotate_right(1);
     shown_frames[0] = None;
-    frame.with_bytes(|bytes| scene.upload_frame(device, queue, frame.width, frame.height, frame.bytes_per_row, bytes));
+    frame.with_bytes(|bytes| scene.upload_frame_at(index, device, queue, frame.width, frame.height, frame.bytes_per_row, bytes));
 }
 
 #[cfg(all(test, target_os = "macos"))]

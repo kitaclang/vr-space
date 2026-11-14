@@ -123,13 +123,35 @@ struct External {
     bind_group: wgpu::BindGroup,
 }
 
-/// Which texture the screen quad draws.
+/// Resources and frame state belonging to one screen.
+struct ScreenQuad {
+    vertex_buffer: wgpu::Buffer,
+    texture: wgpu::Texture,
+    own_size: (u32, u32),
+    bind_group: wgpu::BindGroup,
+    external: Vec<External>,
+    bound: Bound,
+    tex_size: (u32, u32),
+}
+
+/// Which texture a screen quad draws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Bound {
-    /// `Scene::tex`, filled by `upload_frame`.
     Own,
-    /// `Scene::external[i]`.
     External(usize),
+}
+
+impl ScreenQuad {
+    fn new(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, screen: ScreenPlacement) -> Self {
+        let tex_size = (1, 1);
+        let (texture, bind_group) = create_screen_texture(device, bgl, sampler, 1, 1);
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("quad-vb"),
+            contents: bytemuck::cast_slice(&screen_mesh(screen, PLACEHOLDER_ASPECT, 0.0)),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        });
+        Self { vertex_buffer, texture, own_size: tex_size, bind_group, external: Vec::with_capacity(MAX_EXTERNAL), bound: Bound::Own, tex_size }
+    }
 }
 
 pub struct Scene {
@@ -143,7 +165,8 @@ pub struct Scene {
     _grid_vertices: wgpu::Buffer,
 
     quad_pipeline: wgpu::RenderPipeline,
-    quad_vb: wgpu::Buffer,
+    primary: ScreenQuad,
+    secondary: Option<ScreenQuad>,
     quad_ib: wgpu::Buffer,
     quad_index_count: u32,
     /// How much the screen bends around the eye: 0 = flat, 1 = every column the same
@@ -151,15 +174,6 @@ pub struct Scene {
     pub curve: f32,
     quad_bgl: wgpu::BindGroupLayout,
     quad_sampler: wgpu::Sampler,
-    // Screen texture for copied frames; recreated (rarely) when the frame size changes.
-    tex: wgpu::Texture,
-    tex_own_size: (u32, u32),
-    quad_bind_group: wgpu::BindGroup,
-    // Imported textures, by key, all of size `tex_size`; and which texture is drawn.
-    external: Vec<External>,
-    bound: Bound,
-    /// Size of the last frame shown, `(1, 1)` before the first, `(0, 0)` after one was rejected.
-    pub tex_size: (u32, u32),
     pub screen: ScreenPlacement,
 }
 
@@ -300,16 +314,8 @@ impl Scene {
             multiview: None,
         });
 
-        // Placeholder 1x1 screen texture (zeroed, so black) until the first frame sets the size.
-        let tex_size = (1u32, 1u32);
-        let (tex, quad_bind_group) = create_screen_texture(device, &quad_bgl, &quad_sampler, tex_size.0, tex_size.1);
-
+        let primary = ScreenQuad::new(device, &quad_bgl, &quad_sampler, screen);
         let quad_indices = screen_indices();
-        let quad_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("quad-vb"),
-            contents: bytemuck::cast_slice(&screen_mesh(screen, PLACEHOLDER_ASPECT, 0.0)),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        });
         let quad_ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("quad-ib"),
             contents: bytemuck::cast_slice(&quad_indices),
@@ -323,18 +329,13 @@ impl Scene {
             _grid_pipeline: grid_pipeline,
             _grid_vertices: grid_vertices,
             quad_pipeline,
-            quad_vb,
+            primary,
+            secondary: None,
             quad_ib,
             quad_index_count: quad_indices.len() as u32,
             curve: 0.0,
             quad_bgl,
             quad_sampler,
-            tex,
-            tex_own_size: tex_size,
-            quad_bind_group,
-            external: Vec::with_capacity(MAX_EXTERNAL),
-            bound: Bound::Own,
-            tex_size,
             screen,
         }
     }
@@ -345,125 +346,90 @@ impl Scene {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
 
-    /// Rewrite the screen quad after its placement or the frame's aspect ratio changed.
-    pub fn write_quad(&self, queue: &wgpu::Queue) {
-        let (w, h) = self.tex_size;
-        let aspect = if w > 0 && h > 0 { w as f32 / h as f32 } else { PLACEHOLDER_ASPECT };
-        let verts = screen_mesh(self.screen, aspect, self.curve);
-        queue.write_buffer(&self.quad_vb, 0, bytemuck::cast_slice(&verts));
+    /// Primary screen's last frame size, `(1, 1)` before a frame arrives.
+    pub fn tex_size(&self) -> (u32, u32) { self.primary.tex_size }
+
+    pub fn tex_size_at(&self, index: usize) -> (u32, u32) {
+        self.quad(index).tex_size
     }
 
-    /// Show a BGRA frame of `width` x `height` pixels whose rows are `bytes_per_row` apart in
-    /// `data`. A new size recreates the texture and resizes the quad to the frame's aspect.
-    pub fn upload_frame(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        width: u32,
-        height: u32,
-        bytes_per_row: u32,
-        data: &[u8],
-    ) -> FrameUpload {
+    fn quad(&self, index: usize) -> &ScreenQuad {
+        match index { 0 => &self.primary, 1 => self.secondary.as_ref().expect("secondary screen is disabled"), _ => panic!("screen index must be 0 or 1") }
+    }
+
+    fn quad_mut(&mut self, index: usize) -> &mut ScreenQuad {
+        match index { 0 => &mut self.primary, 1 => self.secondary.as_mut().expect("secondary screen is disabled"), _ => panic!("screen index must be 0 or 1") }
+    }
+
+    pub fn secondary_enabled(&self) -> bool { self.secondary.is_some() }
+
+    pub fn set_secondary(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, enabled: bool) {
+        if enabled == self.secondary.is_some() { return; }
+        self.secondary = enabled.then(|| ScreenQuad::new(device, &self.quad_bgl, &self.quad_sampler, self.screen));
+        self.write_quad(queue);
+    }
+
+    /// Rewrite screen geometry after placement, curve, or frame aspect changes.
+    pub fn write_quad(&self, queue: &wgpu::Queue) {
+        let aspect = |quad: &ScreenQuad| if quad.tex_size.0 > 0 && quad.tex_size.1 > 0 { quad.tex_size.0 as f32 / quad.tex_size.1 as f32 } else { PLACEHOLDER_ASPECT };
+        if let Some(second) = &self.secondary {
+            let (a, b) = (aspect(&self.primary), aspect(second));
+            let gap = self.screen.height * 0.05;
+            let total_width = self.screen.height * (a + b) + gap;
+            write_quad_mesh(queue, &self.primary.vertex_buffer, screen_mesh_segment(self.screen, a, self.curve, -total_width * 0.5, total_width));
+            write_quad_mesh(queue, &second.vertex_buffer, screen_mesh_segment(self.screen, b, self.curve, -total_width * 0.5 + self.screen.height * a + gap, total_width));
+        } else {
+            let verts = screen_mesh(self.screen, aspect(&self.primary), self.curve);
+            write_quad_mesh(queue, &self.primary.vertex_buffer, verts);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn upload_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32, bytes_per_row: u32, data: &[u8]) -> FrameUpload {
+        self.upload_frame_at(0, device, queue, width, height, bytes_per_row, data)
+    }
+
+    pub fn upload_frame_at(&mut self, index: usize, device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32, bytes_per_row: u32, data: &[u8]) -> FrameUpload {
         let len = bytes_per_row as usize * height as usize;
         let buffer_ok = bytes_per_row as u64 >= width as u64 * 4 && data.len() >= len;
-        if !self.check_fits(device, width, height, buffer_ok) {
-            return FrameUpload::Rejected;
-        }
-        if self.tex_own_size != (width, height) {
-            // Rare: first frame, or the display or window size changed.
-            let (tex, bg) = create_screen_texture(device, &self.quad_bgl, &self.quad_sampler, width, height);
-            self.tex = tex;
-            self.quad_bind_group = bg;
-            self.tex_own_size = (width, height);
-        }
-        self.bound = Bound::Own;
-        let resized = self.set_shown_size(queue, width, height);
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &self.tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &data[..len],
+        if !check_fits(self.quad_mut(index), device, width, height, buffer_ok) { return FrameUpload::Rejected; }
+        let replacement = (self.quad(index).own_size != (width, height)).then(|| create_screen_texture(device, &self.quad_bgl, &self.quad_sampler, width, height));
+        let q = self.quad_mut(index);
+        if let Some((tex, bg)) = replacement { q.texture = tex; q.bind_group = bg; q.own_size = (width, height); }
+        q.bound = Bound::Own;
+        let resized = set_shown_size(q, width, height);
+        queue.write_texture(wgpu::ImageCopyTexture { texture: &q.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All }, &data[..len],
             wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(bytes_per_row), rows_per_image: Some(height) },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        );
-        if resized {
-            FrameUpload::Resized
-        } else {
-            FrameUpload::Copied
-        }
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 });
+        if resized { self.write_quad(queue); FrameUpload::Resized } else { FrameUpload::Copied }
     }
 
-    /// Show a `width` x `height` BGRA texture that the GPU reads in place, identified by `key`.
-    /// The first time a key is seen (at this size), `import` makes its texture, which is then
-    /// kept, so later frames from the same surface just switch to it. If `import` fails,
-    /// nothing changes and `NotImported` says to copy the frame instead.
-    ///
-    /// The texture must stay valid to sample, and its contents unchanged, until the GPU has
-    /// drawn the frame: that's the caller's job (on macOS, keeping the frame's pixel buffer).
-    pub fn show_external(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        key: u64,
-        width: u32,
-        height: u32,
-        import: impl FnOnce() -> Option<wgpu::Texture>,
-    ) -> FrameUpload {
-        if !self.check_fits(device, width, height, true) {
-            return FrameUpload::Rejected;
-        }
-        let same_size = self.tex_size == (width, height);
-        let cached = if same_size { self.external.iter().position(|e| e.key == key) } else { None };
-        let (index, imported) = match cached {
-            Some(i) => (i, false),
+    #[cfg(test)]
+    pub fn show_external(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, key: u64, width: u32, height: u32, import: impl FnOnce() -> Option<wgpu::Texture>) -> FrameUpload {
+        self.show_external_at(0, device, queue, key, width, height, import)
+    }
+
+    pub fn show_external_at(&mut self, index: usize, device: &wgpu::Device, queue: &wgpu::Queue, key: u64, width: u32, height: u32, import: impl FnOnce() -> Option<wgpu::Texture>) -> FrameUpload {
+        if !check_fits(self.quad_mut(index), device, width, height, true) { return FrameUpload::Rejected; }
+        let same_size = self.quad(index).tex_size == (width, height);
+        let cached = if same_size { self.quad(index).external.iter().position(|e| e.key == key) } else { None };
+        let (i, imported, new_external) = match cached {
+            Some(i) => (i, false, None),
             None => {
                 let Some(texture) = import() else { return FrameUpload::NotImported };
-                if !same_size || self.external.len() >= MAX_EXTERNAL {
-                    self.external.clear();
-                }
                 let bind_group = create_bind_group(device, &self.quad_bgl, &self.quad_sampler, &texture);
-                self.external.push(External { key, _texture: texture, bind_group });
-                (self.external.len() - 1, true)
+                (0, true, Some(External { key, _texture: texture, bind_group }))
             }
         };
-        self.bound = Bound::External(index);
-        if self.set_shown_size(queue, width, height) {
-            FrameUpload::Resized
-        } else if imported {
-            FrameUpload::Imported
-        } else {
-            FrameUpload::Shared
-        }
-    }
-
-    /// Whether a frame fits the GPU's texture limit (and its buffer is long enough). Logs once
-    /// when one doesn't, until one fits again.
-    fn check_fits(&mut self, device: &wgpu::Device, width: u32, height: u32, buffer_ok: bool) -> bool {
-        let max_dim = device.limits().max_texture_dimension_2d;
-        let fits = width > 0 && height > 0 && width <= max_dim && height <= max_dim && buffer_ok;
-        if !fits && self.tex_size != (0, 0) {
-            warn!("Captured frame {width}x{height} doesn't fit the GPU texture limit {max_dim} or its buffer; not displayed");
-            self.tex_size = (0, 0);
-        }
-        fits
-    }
-
-    /// Record the size of the frame now shown; resize the quad and return true if it changed.
-    /// Imported textures of the old size are dropped then (they can't be shown again).
-    fn set_shown_size(&mut self, queue: &wgpu::Queue, width: u32, height: u32) -> bool {
-        if self.tex_size == (width, height) {
-            return false;
-        }
-        info!("Screen texture resized to {width}x{height}");
-        if self.bound == Bound::Own {
-            self.external.clear();
-        }
-        self.tex_size = (width, height);
-        self.write_quad(queue);
-        true
+        let q = self.quad_mut(index);
+        let i = if let Some(external) = new_external {
+            if !same_size || q.external.len() >= MAX_EXTERNAL { q.external.clear(); }
+            q.external.push(external);
+            q.external.len() - 1
+        } else { i };
+        q.bound = Bound::External(i);
+        let resized = set_shown_size(q, width, height);
+        if resized { self.write_quad(queue); FrameUpload::Resized } else if imported { FrameUpload::Imported } else { FrameUpload::Shared }
     }
 
     /// Clear `target` and draw the grid, then the screen on top.
@@ -480,15 +446,56 @@ impl Scene {
         rpass.execute_bundles(std::iter::once(&self.grid_bundle));
         rpass.set_pipeline(&self.quad_pipeline);
         rpass.set_bind_group(0, &self.uniform_bind_group, &[]);
-        let bind_group = match self.bound {
-            Bound::Own => &self.quad_bind_group,
-            Bound::External(i) => &self.external[i].bind_group,
-        };
-        rpass.set_bind_group(1, bind_group, &[]);
-        rpass.set_vertex_buffer(0, self.quad_vb.slice(..));
         rpass.set_index_buffer(self.quad_ib.slice(..), wgpu::IndexFormat::Uint16);
-        rpass.draw_indexed(0..self.quad_index_count, 0, 0..1);
+        for quad in std::iter::once(&self.primary).chain(self.secondary.iter()) {
+            let bind_group = match quad.bound { Bound::Own => &quad.bind_group, Bound::External(i) => &quad.external[i].bind_group };
+            rpass.set_bind_group(1, bind_group, &[]);
+            rpass.set_vertex_buffer(0, quad.vertex_buffer.slice(..));
+            rpass.draw_indexed(0..self.quad_index_count, 0, 0..1);
+        }
     }
+}
+
+fn check_fits(quad: &mut ScreenQuad, device: &wgpu::Device, width: u32, height: u32, buffer_ok: bool) -> bool {
+    let max_dim = device.limits().max_texture_dimension_2d;
+    let fits = width > 0 && height > 0 && width <= max_dim && height <= max_dim && buffer_ok;
+    if !fits && quad.tex_size != (0, 0) {
+        warn!("Captured frame {width}x{height} doesn't fit the GPU texture limit {max_dim} or its buffer; not displayed");
+        quad.tex_size = (0, 0);
+    }
+    fits
+}
+
+fn set_shown_size(quad: &mut ScreenQuad, width: u32, height: u32) -> bool {
+    if quad.tex_size == (width, height) { return false; }
+    info!("Screen texture resized to {width}x{height}");
+    if quad.bound == Bound::Own { quad.external.clear(); }
+    quad.tex_size = (width, height);
+    true
+}
+
+fn write_quad_mesh(queue: &wgpu::Queue, buffer: &wgpu::Buffer, verts: [TVertex; SCREEN_VERTICES]) {
+    queue.write_buffer(buffer, 0, bytemuck::cast_slice(&verts));
+}
+
+/// Segment of one shared screen arc. `start` is measured from the complete two-screen center.
+fn screen_mesh_segment(screen: ScreenPlacement, aspect: f32, curve: f32, start: f32, total_width: f32) -> [TVertex; SCREEN_VERTICES] {
+    let hh = screen.height * 0.5;
+    let width = screen.height * aspect;
+    let centre = CAM_POS - Vec3::Z * screen.distance;
+    let radius = if curve > 1e-4 { (screen.distance / curve).max(total_width / MAX_ARC) } else { f32::INFINITY };
+    let mut verts = [TVertex { pos: [0.0; 3], uv: [0.0; 2] }; SCREEN_VERTICES];
+    for i in 0..=SCREEN_COLUMNS {
+        let u = i as f32 / SCREEN_COLUMNS as f32;
+        let along = start + u * width;
+        let (x, z) = if radius.is_finite() {
+            let angle = along / radius;
+            (centre.x + radius * angle.sin(), centre.z + radius * (1.0 - angle.cos()))
+        } else { (centre.x + along, centre.z) };
+        verts[2 * i] = TVertex { pos: [x, centre.y + hh, z], uv: [u, 0.0] };
+        verts[2 * i + 1] = TVertex { pos: [x, centre.y - hh, z], uv: [u, 1.0] };
+    }
+    verts
 }
 
 /// Create the BGRA screen texture and its bind group. BGRA8Unorm matches ScreenCaptureKit
@@ -580,24 +587,8 @@ const MAX_ARC: f32 = 1.8 * std::f32::consts::PI;
 /// around a vertical axis in front of it, `distance / curve` away, keeping its width along
 /// the bend; at 1 that axis passes through the eye, so every column is equally far away.
 pub fn screen_mesh(screen: ScreenPlacement, aspect: f32, curve: f32) -> [TVertex; SCREEN_VERTICES] {
-    let hh = screen.height * 0.5;
     let width = screen.height * aspect;
-    let centre = CAM_POS - Vec3::Z * screen.distance;
-    let radius = if curve > 1e-4 { (screen.distance / curve).max(width / MAX_ARC) } else { f32::INFINITY };
-    let mut verts = [TVertex { pos: [0.0; 3], uv: [0.0; 2] }; SCREEN_VERTICES];
-    for i in 0..=SCREEN_COLUMNS {
-        let u = i as f32 / SCREEN_COLUMNS as f32;
-        let along = (u - 0.5) * width; // distance along the screen from its centre
-        let (x, z) = if radius.is_finite() {
-            let angle = along / radius;
-            (centre.x + radius * angle.sin(), centre.z + radius * (1.0 - angle.cos()))
-        } else {
-            (centre.x + along, centre.z)
-        };
-        verts[2 * i] = TVertex { pos: [x, centre.y + hh, z], uv: [u, 0.0] };
-        verts[2 * i + 1] = TVertex { pos: [x, centre.y - hh, z], uv: [u, 1.0] };
-    }
-    verts
+    screen_mesh_segment(screen, aspect, curve, -width * 0.5, width)
 }
 
 /// Two triangles per column of `screen_mesh`.
@@ -780,6 +771,41 @@ mod tests {
     }
 
     #[test]
+    fn two_screens_keep_independent_frames_and_disabling_recentres_primary() {
+        let Some(mut h) = Harness::new(ScreenPlacement { height: 0.5, distance: 3.0 }) else { return };
+        h.scene.set_secondary(&h.device, &h.queue, true);
+        assert_eq!(h.upload(16, 16, 64, &solid(16, 16, RED)), FrameUpload::Resized);
+        assert_eq!(h.scene.upload_frame_at(1, &h.device, &h.queue, 32, 16, 128, &solid(32, 16, GREEN)), FrameUpload::Resized);
+        assert_eq!(h.scene.tex_size_at(0), (16, 16));
+        assert_eq!(h.scene.tex_size_at(1), (32, 16));
+        let px = h.render(Quat::IDENTITY);
+        assert!(near(at(&px, SIZE / 2 - 8, SIZE / 2), RED), "left screen {:?}", at(&px, SIZE / 2 - 8, SIZE / 2));
+        assert!(near(at(&px, SIZE / 2 + 8, SIZE / 2), GREEN), "right screen {:?}", at(&px, SIZE / 2 + 8, SIZE / 2));
+
+        h.scene.upload_frame_at(1, &h.device, &h.queue, 32, 16, 128, &solid(32, 16, BLUE));
+        assert!(near(at(&h.render(Quat::IDENTITY), SIZE / 2 + 8, SIZE / 2), BLUE));
+        h.scene.set_secondary(&h.device, &h.queue, false);
+        assert!(near(at(&h.render(Quat::IDENTITY), SIZE / 2, SIZE / 2), RED), "primary recentred");
+    }
+
+    #[test]
+    fn curved_dual_layout_shares_one_bend_and_keeps_a_gap() {
+        let screen = ScreenPlacement { height: 1.0, distance: 2.0 };
+        let (left_aspect, right_aspect, gap) = (1.0, 2.0, 0.05);
+        let total = left_aspect + right_aspect + gap;
+        let left = screen_mesh_segment(screen, left_aspect, 1.0, -total * 0.5, total);
+        let right = screen_mesh_segment(screen, right_aspect, 1.0, -total * 0.5 + left_aspect + gap, total);
+        let left_edge = Vec3::from(left[SCREEN_VERTICES - 2].pos);
+        let right_edge = Vec3::from(right[0].pos);
+        assert!(left_edge.distance(right_edge) > gap * 0.9, "curved screens keep a visible gap");
+        let radius = (screen.distance).max(total / MAX_ARC);
+        for v in left.iter().chain(right.iter()) {
+            let p = Vec3::from(v.pos);
+            assert!((p.x.hypot(p.z - CAM_POS.z) - radius).abs() < 1e-3);
+        }
+    }
+
+    #[test]
     fn frames_show_upright_and_not_mirrored() {
         let Some(mut h) = Harness::new(AHEAD) else { return };
         // A 4x4 frame in quarters: red, green on top; blue, white below.
@@ -847,7 +873,7 @@ mod tests {
         let Some(mut h) = Harness::new(AHEAD) else { return };
         let too_wide = h.device.limits().max_texture_dimension_2d + 1;
         assert_eq!(h.upload(too_wide, 1, too_wide * 4, &[]), FrameUpload::Rejected);
-        assert_eq!(h.scene.tex_size, (0, 0));
+        assert_eq!(h.scene.tex_size(), (0, 0));
         // A buffer shorter than its rows, or rows narrower than the width, are rejected too.
         assert_eq!(h.upload(4, 4, 16, &solid(4, 3, RED)), FrameUpload::Rejected);
         assert_eq!(h.upload(4, 4, 8, &solid(4, 4, RED)), FrameUpload::Rejected);
@@ -947,7 +973,7 @@ mod tests {
         let mut wide = Some(wide);
         assert_eq!(h.scene.show_external(&h.device, &h.queue, 1, 32, 10, || wide.take()), FrameUpload::Resized);
         assert!(near(center(&h), MAGENTA));
-        assert_eq!(h.scene.tex_size, (32, 10));
+        assert_eq!(h.scene.tex_size(), (32, 10));
     }
 
     #[cfg(target_os = "macos")]

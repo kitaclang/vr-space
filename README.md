@@ -35,15 +35,23 @@ Build `vr-space.app` and copy it to `~/Applications`:
 scripts/bundle-macos.sh --install
 ```
 
-Then open vr-space from Finder, Spotlight or Launchpad. It appears in the Dock and Command–Tab, with standard macOS application and Window menus. Choose **Open at Login** from its menu to start it when you log in (macOS 13 or later). Without `--install`, the app is left at `target/release/vr-space.app`.
+Then open vr-space from Finder, Spotlight or Launchpad. It appears in the Dock and Command–Tab, with standard macOS application and Window menus. Choose **Open at Login** from its menu to start it when you log in (macOS 13 or later). Without `--install` or `--run`, the app is left at `target/release/vr-space.app` as build output only.
 
 Run as an app, vr-space gets the Screen Recording permission itself, so you allow **vr-space** in System Settings instead of your terminal. Its log goes to `~/Library/Logs/vr-space.log`.
 
-The script signs the app with an ad-hoc signature, which changes with every build, so macOS forgets the Screen Recording permission after you rebuild. To keep it between builds, sign with a certificate from your keychain (`security find-identity -v -p codesigning` lists them):
+For normal use, launch only `~/Applications/vr-space.app`, not the build output in `target/release`. Installation requires a signing certificate; it never silently falls back to ad-hoc signing. List certificates with `security find-identity -v -p codesigning`, then configure yours once:
 
 ```bash
-VR_SPACE_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" scripts/bundle-macos.sh --install
+VR_SPACE_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" scripts/bundle-macos.sh --run
 ```
+
+A successful install remembers the identity in `~/Library/Application Support/vr-space/signing-identity` (outside the repository). Afterwards, build, quit the old installed app, install and launch with:
+
+```bash
+scripts/bundle-macos.sh --run
+```
+
+If signing fails, the installed app is left untouched. Keeping the same certificate, bundle ID and installed path is intended to preserve Screen Recording permission across updates. Switching from ad-hoc signing may need one new approval; macOS ultimately controls permission retention. Build-only bundles can still be ad-hoc signed, but are not the normal launch location.
 
 Opened from Finder, the app starts the way you left it (see [Saved settings](#saved-settings)). The first time, use the menu bar icon to choose the display and go fullscreen on the glasses. To pass options to the app, use `open`:
 
@@ -115,6 +123,14 @@ scripts/cargo.sh run --release -p headset-visualizer -- --window Safari --fullsc
 `--window` takes a window ID from `--list-windows`, an app name, or part of a window title. The window is shown on its own, even when other windows cover it, it's minimised, or it's on another Space. If you resize it, the capture restarts at the new size within a couple of seconds. If you close it, the virtual screen goes back to the last display shown.
 
 The glasses only track rotation (3DoF), not position, so leaning or moving in your seat isn't tracked. The neck model (`--neck-model`, on by default) adds the small eye movement that comes from turning your head around your neck, which makes the screen feel more solidly placed.
+
+### Two virtual screens
+
+Choose the first display or window with **Show display** / **Show window**, then choose another under **Controls > Second screen > Show display** or **Show window** (also in the glasses menu). The first screen sits on the left and the second on the right, each keeping its source's aspect ratio. These show existing Mac displays or windows; they do not create extra macOS desktops/displays.
+
+Size, distance, curvature and recentering apply to the pair together. Resizing either captured window updates its screen within about two seconds. Closing the second window, or choosing **Second screen > Off**, removes it and centres the first screen again. Closing the first window keeps the existing fallback to its last display.
+
+The second-screen choice is session-only: launch starts with one screen. Frame sharing/copying applies to both; the HUD shows each capture's status, while capture/upload latency samples combine both streams. Two simultaneous captures use more GPU and capture resources; sampled layout and latency checks passed, while continuous stutter and wearer comfort remain unverified (see [the checklist](docs/glasses-checklist.md#8-two-virtual-screens)).
 
 ### Controls
 
