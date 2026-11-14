@@ -5,6 +5,7 @@
 pub enum Command {
     Recenter,
     ToggleHorizon,
+    SetHorizon(bool),
     RollLeft,
     RollRight,
     Further,
@@ -28,6 +29,7 @@ pub enum Command {
     /// Stop showing the second screen.
     HideSecondScreen,
     ToggleHud,
+    SetHud(bool),
     OpenScreenSettings,
     /// Turn opening at login on or off (only offered when running as vr-space.app).
     ToggleOpenAtLogin,
@@ -36,8 +38,11 @@ pub enum Command {
     /// Predict one step further ahead / less far ahead.
     PredictMore,
     PredictLess,
+    SetPrediction(f32),
+    SetPredictionEnabled(bool),
     /// Switch between the GPU reading captured frames in place and copying them.
     ToggleFrameCopying,
+    SetFrameCopying(bool),
     Quit,
 }
 

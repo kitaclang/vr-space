@@ -11,6 +11,8 @@
 //! - `run_command`, then `remember`: carry out a `Command` and save what it changed.
 
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
 use glam::Quat;
@@ -31,6 +33,13 @@ use crate::scene::{ScreenPlacement, SCREEN_STEP};
 use crate::settings::{Settings, SettingsStore};
 use crate::tracking::{now_ns_from_start, PoseAtomic, PoseCopy};
 use crate::window_placement::{apply_fullscreen, find_monitor, monitor_id};
+#[cfg(target_os = "macos")]
+use serde_json::{json, Value};
+#[cfg(target_os = "macos")]
+use crate::control_socket::Server;
+
+#[derive(Debug)]
+pub(crate) enum UserEvent { Command(Command), #[cfg(target_os = "macos")] Control(Value, SyncSender<Value>) }
 #[cfg(target_os = "macos")]
 use crate::window_placement::warn_if_covering_capture;
 
@@ -78,7 +87,7 @@ pub struct App {
     window: Window,
     gpu: Gpu,
     pose: Arc<PoseAtomic>,
-    proxy: EventLoopProxy<Command>,
+    proxy: EventLoopProxy<UserEvent>,
 
     // Calibration lives on the render thread only, so no shared state or lock is needed.
     // `calib_inv` is the inverse of the head orientation at the last recenter; applying it as a
@@ -113,6 +122,8 @@ pub struct App {
 
     settings_store: SettingsStore,
     settings: Settings,
+    #[cfg(target_os = "macos")]
+    control_server: Option<Server>,
 }
 
 fn take_recenter_request(pending: &mut Option<u64>, connected: bool, connection_id: u64) -> bool {
@@ -137,13 +148,116 @@ mod tests {
 }
 
 impl App {
+    #[cfg(target_os = "macos")]
+    pub fn set_control_server(&mut self, server: Server) { self.control_server = Some(server); }
+
+    #[cfg(target_os = "macos")]
+    fn handle_control(&mut self, request: Value) -> Value {
+        match crate::control::decode_request(request) {
+            Ok(crate::control::Action::Status) => crate::control::success(self.control_status()),
+            Ok(action) => match self.execute_control(action) {
+                Ok(result) => crate::control::success(result),
+                Err(error) => crate::control::failure(error),
+            },
+            Err(error) => crate::control::failure(error),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn execute_control(&mut self, action: crate::control::Action) -> anyhow::Result<Value> {
+        use crate::control::Action as A;
+        let command = match action {
+            A::Recenter => {
+                if !self.pose.read().3 { anyhow::bail!("head tracking is not connected; recenter was not queued"); }
+                Command::Recenter
+            }
+            A::Horizon { on } if self.cli.recenter_yaw_only != on => Command::SetHorizon(on),
+            A::Horizon { .. } => return Ok(json!({"message":"already set"})),
+            A::Further => Command::Further, A::Closer => Command::Closer,
+            A::Bigger => Command::Bigger, A::Smaller => Command::Smaller, A::ResetScreen => Command::ResetScreen,
+            A::RollLeft => Command::RollLeft, A::RollRight => Command::RollRight,
+            A::SetCurve { value } => Command::SetCurve(value),
+            A::ShowDisplay { id } => Command::ShowDisplay(id),
+            A::ShowWindow { id } if id != 0 => Command::ShowWindow(id),
+            A::ShowWindow { .. } => anyhow::bail!("window ID 0 is invalid"),
+            A::SecondDisplay { id } => Command::SecondDisplay(id),
+            A::SecondWindow { id } if id != 0 => Command::SecondWindow(id),
+            A::SecondWindow { .. } => anyhow::bail!("window ID 0 is invalid"),
+            A::HideSecondScreen => Command::HideSecondScreen,
+            A::Fullscreen { id: Some(id) } if find_monitor(&self.window, id).is_none() => {
+                anyhow::bail!("display {id} is not connected; run --list-displays and retry after it appears")
+            }
+            A::Fullscreen { id } => Command::FullscreenOn(id),
+            A::Hud { on } if !self.gpu.hud_enabled && on && self.gpu.glyph_brush.is_none() => anyhow::bail!("HUD is unavailable (disabled at startup)"),
+            A::Hud { on } if self.gpu.hud_enabled != on => Command::SetHud(on),
+            A::Hud { .. } => return Ok(json!({"message":"already set"})),
+            A::Prediction { milliseconds: Some(ms), .. } => Command::SetPrediction(ms),
+            A::Prediction { milliseconds: None, on: Some(on) } if self.predict_lead.is_on() != on => Command::SetPredictionEnabled(on),
+            A::Prediction { milliseconds: None, on: Some(_) } => return Ok(json!({"message":"already set"})),
+            A::Prediction { milliseconds: None, on: None } => Command::TogglePrediction,
+            A::PredictionMore => Command::PredictMore,
+            A::PredictionLess => Command::PredictLess,
+            A::CopyFrames { on } if !on && !self.gpu.zero_copy_available => anyhow::bail!("zero-copy frame reading is unavailable on this GPU"),
+            A::CopyFrames { on } => Command::SetFrameCopying(on),
+            A::OpenScreenSettings => Command::OpenScreenSettings,
+            A::OpenAtLogin { on } => {
+                let status = crate::macos_app::login_status();
+                if status == crate::macos_app::LoginStatus::Unavailable { anyhow::bail!("Open at Login is unavailable outside a supported vr-space.app bundle"); }
+                if on && status == crate::macos_app::LoginStatus::RequiresApproval { return Ok(json!({"message":"approval required in System Settings > General > Login Items", "status":status})); }
+                let status = crate::macos_app::set_login_enabled(on)?;
+                if on && status == crate::macos_app::LoginStatus::NotFound { anyhow::bail!("Open at Login service was not found; reinstall or relaunch vr-space.app"); }
+                if let Some(bar) = self.menu_bar.as_mut() { bar.set_open_at_login(crate::macos_app::open_at_login()); }
+                return Ok(json!({"status":status, "message":if status == crate::macos_app::LoginStatus::RequiresApproval {"approval required in System Settings > General > Login Items"} else {"updated"}}));
+            }
+            A::Quit => Command::Quit,
+            A::Status => unreachable!(),
+        };
+        self.run_command(command)?;
+        self.remember(command);
+        Ok(json!({"message":if command == Command::Recenter {"recenter queued for next render"} else if command == Command::Quit {"quit requested"} else {"updated"}}))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn control_status(&self) -> Value {
+        use crate::macos_capture::CaptureSource as S;
+        let source = |s: S| match s { S::Display(id) => json!({"kind":"display","id":id}), S::Window(id) => json!({"kind":"window","id":id}) };
+        let cap = |s| match s { CaptureStatus::Starting => "starting", CaptureStatus::NoPermission => "no_permission", CaptureStatus::Failed => "failed", CaptureStatus::WaitingForFrames => "waiting_for_frames", CaptureStatus::Capturing => "capturing" };
+        let active = |s| matches!(s, CaptureStatus::WaitingForFrames | CaptureStatus::Capturing);
+        let primary_capture = capture_status();
+        json!({
+            "source":source(self.capture.shown), "second_source":self.capture.second.map(source),
+            "fullscreen":{"display":self.fullscreen_on,"pending_display":self.pending_fullscreen},
+            "screen":{"distance":self.gpu.scene.screen.distance,"height":self.gpu.scene.screen.height,"curvature":self.gpu.scene.curve},
+            "hud":{"available":self.gpu.glyph_brush.is_some(),"enabled":self.gpu.hud_enabled},
+            "horizon":{"enabled":self.cli.recenter_yaw_only,"awaiting_recenter":self.reference_dirty || (self.cli.recenter_yaw_only && self.upright_roll.is_none())},
+            "roll_trim_degrees":self.roll_trim_tenths as f32 / 10.0,
+            "prediction":{"enabled":self.predict_lead.is_on(),"lead_ms":self.predict_lead.ms},
+            "frame_copying":{"available":self.gpu.zero_copy_available,"enabled":!self.gpu.zero_copy},
+            "tracking":{"connected":self.pose.read().3},
+            "capture":{"primary":cap(primary_capture),"primary_source_active":active(primary_capture),"second":self.capture.second.map(|_| cap(capture_status_at(1)))},
+            "open_at_login":crate::macos_app::login_status()
+        })
+    }
+
+    fn refresh_menus(&mut self) {
+        self.gpu.hud_text.clear();
+        #[cfg(target_os = "macos")]
+        if let Some(bar) = self.menu_bar.as_mut() {
+            bar.set_state(self.capture.shown, self.fullscreen_on, self.gpu.hud_enabled);
+            bar.set_second(self.capture.second);
+            bar.set_horizon(self.cli.recenter_yaw_only);
+            bar.set_curve(self.gpu.scene.curve);
+            bar.set_latency(self.predict_lead.ms, !self.gpu.zero_copy, self.gpu.zero_copy_available);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cli: Cli,
         window: Window,
         gpu: Gpu,
         pose: Arc<PoseAtomic>,
-        proxy: EventLoopProxy<Command>,
+        proxy: EventLoopProxy<UserEvent>,
         fullscreen: Fullscreen,
         #[cfg(target_os = "macos")] capture: Capture,
         predict_ms: f32,
@@ -182,10 +296,12 @@ impl App {
             predict_lead: Lead::new(predict_ms),
             settings_store,
             settings,
+            #[cfg(target_os = "macos")]
+            control_server: None,
         }
     }
 
-    pub fn handle_event(&mut self, event: Event<'_, Command>, control_flow: &mut ControlFlow) {
+    pub fn handle_event(&mut self, event: Event<'_, UserEvent>, control_flow: &mut ControlFlow) {
         // Frame pacing: only apply WaitUntil when no-vsync. With vsync enabled, let OS/VBlank
         // drive redraws via Wait and explicit request_redraw on events.
         *control_flow = if !self.cli.vsync && self.cli.max_fps > 0 {
@@ -214,12 +330,26 @@ impl App {
                 self.init();
                 None
             }
-            Event::UserEvent(cmd) => Some(cmd),
+            Event::UserEvent(UserEvent::Command(cmd)) => Some(cmd),
+            #[cfg(target_os = "macos")]
+            Event::UserEvent(UserEvent::Control(request, reply)) => {
+                let quit = matches!(crate::control::decode_request(request.clone()), Ok(crate::control::Action::Quit));
+                let response = self.handle_control(request);
+                let _ = reply.try_send(response);
+                if quit {
+                    stop_stream();
+                    *control_flow = ControlFlow::Exit;
+                }
+                None
+            }
             Event::LoopDestroyed => {
                 // Every way of quitting ends here: the menu bar, Esc, closing the window, and a
                 // Quit from macOS itself (Cmd-Q, logout), which skips Command::Quit.
                 #[cfg(target_os = "macos")]
-                stop_stream();
+                {
+                    stop_stream();
+                    drop(self.control_server.take());
+                }
                 info!("Quitting");
                 None
             }
@@ -235,13 +365,14 @@ impl App {
         // Carry out a command from a key, the menu bar or a global shortcut.
         if let Some(cmd) = command {
             if cmd == Command::Quit {
-                // Stop ScreenCaptureKit cleanly, then exit.
                 #[cfg(target_os = "macos")]
                 stop_stream();
                 *control_flow = ControlFlow::Exit;
             }
-            self.run_command(cmd);
-            self.remember(cmd);
+            match self.run_command(cmd) {
+                Ok(()) => self.remember(cmd),
+                Err(e) => { warn!("Command {cmd:?} failed: {e}"); self.refresh_menus(); }
+            }
         }
     }
 
@@ -621,7 +752,7 @@ impl App {
 
     /// Carry out a command from a key, the menu bar or a global shortcut. `Quit` is handled
     /// by `handle_event`, which owns the control flow.
-    fn run_command(&mut self, cmd: Command) {
+    fn run_command(&mut self, cmd: Command) -> anyhow::Result<()> {
         let gpu = &mut self.gpu;
         match cmd {
             Command::Quit => {}
@@ -632,6 +763,7 @@ impl App {
                 self.cli.recenter_yaw_only = !self.cli.recenter_yaw_only;
                 self.reference_dirty = true;
             }
+            Command::SetHorizon(on) => { self.cli.recenter_yaw_only = on; self.reference_dirty = true; }
             Command::RollLeft => self.roll_trim_tenths = (self.roll_trim_tenths - 1).max(-450),
             Command::RollRight => self.roll_trim_tenths = (self.roll_trim_tenths + 1).min(450),
             Command::Further => gpu.scene.screen.scale_distance(SCREEN_STEP),
@@ -659,7 +791,7 @@ impl App {
                             self.capture.shown = CaptureSource::Display(id);
                             self.capture.last_display = id;
                         }
-                        Err(e) => warn!("Couldn't switch to display {id}: {e}"),
+                        Err(e) => anyhow::bail!("couldn't switch to display {id}: {e}"),
                     }
                 }
                 #[cfg(not(target_os = "macos"))]
@@ -670,7 +802,7 @@ impl App {
                 if self.capture.shown != CaptureSource::Window(id) {
                     match switch_source(0, CaptureSource::Window(id), !self.cli.no_cursor) {
                         Ok(()) => self.capture.shown = CaptureSource::Window(id),
-                        Err(e) => warn!("Couldn't switch to window {id}: {e}"),
+                        Err(e) => anyhow::bail!("couldn't switch to window {id}: {e}"),
                     }
                 }
                 #[cfg(not(target_os = "macos"))]
@@ -696,6 +828,7 @@ impl App {
                                 warn!("Couldn't start the second screen: {e}");
                                 stop_stream_at(1);
                                 self.capture.second = None;
+                                anyhow::bail!("couldn't start the second screen: {e}");
                             }
                         }
                     }
@@ -712,34 +845,36 @@ impl App {
                 }
             }
             Command::ToggleHud => {
-                // Only possible when the HUD font was set up (not with --no-hud).
-                if gpu.glyph_brush.is_some() {
-                    gpu.hud_enabled = !gpu.hud_enabled;
-                }
+                if gpu.glyph_brush.is_some() { gpu.hud_enabled = !gpu.hud_enabled; }
+            }
+            Command::SetHud(on) => {
+                if gpu.glyph_brush.is_none() { anyhow::bail!("HUD is unavailable (disabled at startup)"); }
+                gpu.hud_enabled = on;
             }
             Command::OpenScreenSettings => {
                 #[cfg(target_os = "macos")]
-                open_screen_recording_settings();
+                open_screen_recording_settings()?;
             }
             Command::ToggleOpenAtLogin => {
                 #[cfg(target_os = "macos")]
-                if let Some(on) = macos_app::open_at_login() {
+                {
+                    let on = macos_app::open_at_login().unwrap_or(false);
                     let now = macos_app::set_open_at_login(!on);
-                    if let Some(bar) = self.menu_bar.as_mut() {
-                        bar.set_open_at_login(now);
-                    }
+                    if let Some(bar) = self.menu_bar.as_mut() { bar.set_open_at_login(now); }
                 }
             }
             Command::TogglePrediction => self.predict_lead.toggle(),
+            Command::SetPrediction(ms) => self.predict_lead.set_ms(ms),
+            Command::SetPredictionEnabled(on) => self.predict_lead.set_enabled(on),
             Command::PredictMore => self.predict_lead.more(),
             Command::PredictLess => self.predict_lead.less(),
             Command::ToggleFrameCopying => {
-                if gpu.zero_copy_available {
-                    gpu.zero_copy = !gpu.zero_copy;
-                    info!("Captured frames: {}", if gpu.zero_copy { "read in place by the GPU" } else { "copied through the CPU" });
-                } else {
-                    info!("Captured frames can only be copied here: the GPU can't read them in place");
-                }
+                if gpu.zero_copy_available { gpu.zero_copy = !gpu.zero_copy; }
+                else { info!("Captured frames can only be copied here: the GPU can't read them in place"); }
+            }
+            Command::SetFrameCopying(on) => {
+                if !on && !gpu.zero_copy_available { anyhow::bail!("zero-copy frame reading is unavailable on this GPU"); }
+                gpu.zero_copy = !on;
             }
         }
         if matches!(cmd, Command::Further | Command::Closer | Command::Bigger | Command::Smaller | Command::ResetScreen) {
@@ -756,6 +891,7 @@ impl App {
                 warn_if_covering_capture(self.fullscreen_on, captured_display, main_id);
             }
         }
+        Ok(())
     }
 
     /// Save what a command changed, for next time, and update the HUD and menu. Only what you
@@ -777,10 +913,10 @@ impl App {
                 settings.fullscreen = self.fullscreen_on;
             }
             Command::SetCurve(_) => settings.curve = Some(self.gpu.scene.curve),
-            Command::ToggleHud => settings.hud = Some(self.gpu.hud_enabled),
-            Command::ToggleHorizon => settings.recenter_yaw_only = Some(self.cli.recenter_yaw_only),
+            Command::ToggleHud | Command::SetHud(_) => settings.hud = Some(self.gpu.hud_enabled),
+            Command::ToggleHorizon | Command::SetHorizon(_) => settings.recenter_yaw_only = Some(self.cli.recenter_yaw_only),
             Command::RollLeft | Command::RollRight => settings.roll_trim_tenths = Some(self.roll_trim_tenths),
-            Command::TogglePrediction | Command::PredictMore | Command::PredictLess => {
+            Command::TogglePrediction | Command::PredictMore | Command::PredictLess | Command::SetPrediction(_) | Command::SetPredictionEnabled(_) => {
                 settings.predict_ms = Some(self.predict_lead.ms);
                 info!("Head-pose prediction: {} ms ahead", self.predict_lead.ms);
             }

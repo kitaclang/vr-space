@@ -25,7 +25,7 @@ use crate::macos_capture::{
 mod app;
 #[cfg(target_os = "macos")]
 use crate::app::Capture;
-use crate::app::{App, Fullscreen};
+use crate::app::{App, Fullscreen, UserEvent};
 
 // What the user can ask for (keys, menu bar, global shortcuts)
 mod command;
@@ -33,6 +33,9 @@ pub(crate) use crate::command::Command;
 
 // Command-line flags and how they combine with saved settings
 mod cli;
+mod control;
+#[cfg(target_os = "macos")]
+mod control_socket;
 use crate::cli::{Cli, ExplicitFlags, StartupPlan};
 #[cfg(target_os = "macos")]
 use crate::cli::WindowChoice;
@@ -92,33 +95,37 @@ use crate::settings::SettingsStore;
 // ================= Main =================
 
 fn main() -> anyhow::Result<()> {
-    // Initialize start instant for latency metrics
-    START_INSTANT.get_or_init(Instant::now);
-
-    // App logs at info; wgpu/naga logs at warn, since their info level logs every buffer it creates.
-    // RUST_LOG overrides this (for example RUST_LOG=debug).
-    let mut logger = env_logger::Builder::from_env(
-        Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn,wgpu=warn,naga=warn"),
-    );
-    // Opened from Finder or at login there's no terminal to show the log, so write it to a file.
-    #[cfg(target_os = "macos")]
-    if macos_app::in_bundle() && !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-        if let Some(file) = macos_app::log_file_path().and_then(|p| std::fs::File::create(p).ok()) {
-            logger.target(env_logger::Target::Pipe(Box::new(file)));
-        }
-    }
-    logger.init();
-
-    // Older macOS versions pass a -psn_ argument to apps opened from Finder.
+    // Parse one-shot commands before logger initialization: Finder's logger truncates its file.
     #[cfg(target_os = "macos")]
     let args = macos_app::without_psn_args(std::env::args_os());
     #[cfg(not(target_os = "macos"))]
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    // Parsed in two steps to learn which flags were actually given (they beat saved settings).
     let matches = Cli::command().get_matches_from(args);
     let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
-    cli.validate()?;
     let explicit = ExplicitFlags::from_matches(&matches);
+
+    if let Some(crate::control::TopCommand::Control(args)) = cli.command.take() {
+        #[cfg(not(target_os = "macos"))]
+        anyhow::bail!("live control is only available on macOS");
+        #[cfg(target_os = "macos")]
+        {
+        let action = args.command.action()?;
+        let response = crate::control_socket::client(crate::control::request(action));
+        match response {
+            Ok(value) if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) => {
+                if matches!(args.command, crate::control::ControlCommand::Status { json: true }) {
+                    println!("{}", serde_json::to_string_pretty(value.get("result").unwrap_or(&value))?);
+                } else if let Some(result) = value.get("result") {
+                    println!("{}", serde_json::to_string(result)?);
+                }
+                return Ok(());
+            }
+            Ok(value) => { eprintln!("{}", value.get("error").and_then(serde_json::Value::as_str).unwrap_or("control command failed")); std::process::exit(1); }
+            Err(e) => { eprintln!("{e}"); std::process::exit(e.exit_code()); }
+        }
+        }
+    }
+    cli.validate()?;
 
     if let Some(dir) = &cli.write_iconset {
         icon::write_iconset(dir)?;
@@ -164,6 +171,19 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // One-shot paths above must not create/truncate the Finder log file.
+    let mut logger = env_logger::Builder::from_env(
+        Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn,wgpu=warn,naga=warn"),
+    );
+    #[cfg(target_os = "macos")]
+    if macos_app::in_bundle() && !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        if let Some(file) = macos_app::log_file_path().and_then(|p| std::fs::File::create(p).ok()) {
+            logger.target(env_logger::Target::Pipe(Box::new(file)));
+        }
+    }
+    logger.init();
+    START_INSTANT.get_or_init(Instant::now);
+
     info!("vr-space {} starting", env!("CARGO_PKG_VERSION"));
     info!(
         "vsync={}, invert=({},{},{}), poll_ms={}, no_hud={}, hud_size={}, max_fps={}",
@@ -182,7 +202,7 @@ fn main() -> anyhow::Result<()> {
     cli.curve = plan.curve;
 
     // Window and event loop (winit 0.28 API)
-    let mut builder = EventLoopBuilder::<Command>::with_user_event();
+    let mut builder = EventLoopBuilder::<UserEvent>::with_user_event();
     // A regular Mac app: Dock, Command-Tab and an application menu.
     #[cfg(target_os = "macos")]
     {
@@ -283,5 +303,16 @@ fn main() -> anyhow::Result<()> {
         settings_store,
         settings,
     );
+    #[cfg(target_os = "macos")]
+    {
+        let proxy = event_loop.create_proxy();
+        match control_socket::start_server(move |request, reply| {
+            proxy.send_event(UserEvent::Control(request, reply)).map_err(|e| format!("app event loop is unavailable: {e}"))?;
+            Ok(())
+        }) {
+            Ok(server) => app.set_control_server(server),
+            Err(e) => warn!("CLI control server unavailable: {e}"),
+        }
+    }
     event_loop.run(move |event, _, control_flow| app.handle_event(event, control_flow));
 }

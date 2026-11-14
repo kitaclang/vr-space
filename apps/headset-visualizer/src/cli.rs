@@ -11,6 +11,9 @@ use crate::scene::ScreenPlacement;
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Headset pose visualizer (wgpu + winit, Metal on macOS)")]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<crate::control::TopCommand>,
+
     /// Enable vsync (off by default for lowest latency)
     #[arg(long, default_value_t = false)]
     pub vsync: bool,

@@ -125,6 +125,16 @@ impl Lead {
         (f64::from(self.ms) * 1e6) as u64
     }
 
+    pub fn set_enabled(&mut self, on: bool) {
+        if on && !self.is_on() { self.ms = self.restore_ms; }
+        if !on && self.is_on() { self.restore_ms = self.ms; self.ms = 0.0; }
+    }
+
+    pub fn set_ms(&mut self, ms: f32) {
+        self.ms = ms.clamp(0.0, Self::MAX_MS);
+        if self.ms > 0.0 { self.restore_ms = self.ms; }
+    }
+
     pub fn toggle(&mut self) {
         if self.is_on() {
             self.restore_ms = self.ms;
@@ -298,6 +308,19 @@ mod tests {
         assert_eq!(lead.ms, Lead::MAX_MS);
         assert_eq!(Lead::new(500.0).ms, Lead::MAX_MS);
         assert_eq!(Lead::new(20.0).ns(), 20_000_000);
+    }
+
+    #[test]
+    fn explicit_enabled_setter_preserves_and_restores_the_lead() {
+        let mut lead = Lead::new(35.0);
+        lead.set_enabled(false);
+        assert_eq!(lead.ms, 0.0);
+        lead.set_enabled(false);
+        lead.set_enabled(true);
+        assert_eq!(lead.ms, 35.0);
+        lead.set_ms(0.0);
+        lead.set_enabled(true);
+        assert_eq!(lead.ms, 35.0);
     }
 
     #[test]

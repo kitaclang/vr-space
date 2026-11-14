@@ -110,12 +110,11 @@ pub fn has_screen_recording_permission() -> bool {
 }
 
 /// Open System Settings at Privacy & Security > Screen Recording.
-pub fn open_screen_recording_settings() {
+pub fn open_screen_recording_settings() -> anyhow::Result<()> {
     const URL: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
-    match std::process::Command::new("open").arg(URL).spawn() {
-        Ok(_) => info!("Opened System Settings > Privacy & Security > Screen Recording"),
-        Err(e) => warn!("Couldn't open System Settings: {e}"),
-    }
+    std::process::Command::new("open").arg(URL).spawn()
+        .map(|_| info!("Opened System Settings > Privacy & Security > Screen Recording"))
+        .map_err(|e| anyhow::anyhow!("couldn't open Screen Recording settings: {e}"))
 }
 
 /// A captured BGRA frame. Holding it keeps its pixels (and its IOSurface) unchanged:

@@ -18,6 +18,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use winit::event_loop::EventLoopProxy;
 
 use crate::macos_capture::{windows_if_changed, CaptureSource, WindowInfo};
+use crate::app::UserEvent;
 use crate::Command;
 
 /// Longest window label in the menu; longer titles are cut with an ellipsis.
@@ -89,7 +90,7 @@ impl MenuBar {
     /// fullscreen on.
     /// `open_at_login` is `None` when that setting isn't available (not running as an app).
     pub fn new(
-        proxy: EventLoopProxy<Command>,
+        proxy: EventLoopProxy<UserEvent>,
         shown: CaptureSource,
         fullscreen: Option<u32>,
         hud_on: bool,
@@ -207,7 +208,7 @@ impl MenuBar {
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             if let Some(cmd) = command_for_menu_id(&event.id.0) {
                 if let Ok(p) = menu_proxy.lock() {
-                    let _ = p.send_event(cmd);
+                    let _ = p.send_event(UserEvent::Command(cmd));
                 }
             }
         }));
@@ -387,7 +388,7 @@ impl MenuBar {
     }
 }
 
-fn register_shortcuts(proxy: EventLoopProxy<Command>) -> Option<GlobalHotKeyManager> {
+fn register_shortcuts(proxy: EventLoopProxy<UserEvent>) -> Option<GlobalHotKeyManager> {
     let manager = match GlobalHotKeyManager::new() {
         Ok(m) => m,
         Err(e) => {
@@ -411,7 +412,7 @@ fn register_shortcuts(proxy: EventLoopProxy<Command>) -> Option<GlobalHotKeyMana
         }
         if let Some(&(_, cmd)) = bindings.iter().find(|(id, _)| *id == event.id) {
             if let Ok(p) = proxy.lock() {
-                let _ = p.send_event(cmd);
+                let _ = p.send_event(UserEvent::Command(cmd));
             }
         }
     }));
