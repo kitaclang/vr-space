@@ -138,7 +138,7 @@ fn set_login_enabled_with(
     mut current_status: impl FnMut() -> LoginStatus,
 ) -> Result<LoginStatus> {
     match (on, status) {
-        (true, LoginStatus::NotRegistered) => register()?,
+        (true, LoginStatus::NotRegistered | LoginStatus::NotFound) => register()?,
         (false, LoginStatus::Enabled | LoginStatus::RequiresApproval) => unregister()?,
         // In particular, don't re-register while approval is pending.
         _ => return Ok(status),
@@ -279,6 +279,24 @@ mod tests {
                 status,
             );
         }
+    }
+
+    #[test]
+    fn missing_login_registration_is_retried() {
+        let mut registered = false;
+        let status = set_login_enabled_with(
+            true,
+            LoginStatus::NotFound,
+            || {
+                registered = true;
+                Ok(())
+            },
+            || panic!("unregister called"),
+            || LoginStatus::RequiresApproval,
+        )
+        .unwrap();
+        assert!(registered);
+        assert_eq!(status, LoginStatus::RequiresApproval);
     }
 
     #[test]
